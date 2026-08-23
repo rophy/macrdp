@@ -153,7 +153,7 @@ optional = true
 
 [dev-dependencies.tokio]
 version = "1"
-features = ["sync"]
+features = ["sync", "macros", "rt", "net", "io-util"]
 
 [lints.clippy]
 alloc_instead_of_core = "warn"

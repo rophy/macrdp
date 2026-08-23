@@ -8,6 +8,8 @@ members = [
     "crates/macrdp-encode",
     "crates/macrdp-audio",
     "crates/macrdp-clipboard",
+    "crates/ironrdp-server-gfx",
+    "crates/ironrdp-acceptor-patched",
 ]
 
 [patch.crates-io]

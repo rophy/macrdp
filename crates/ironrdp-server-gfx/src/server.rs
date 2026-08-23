@@ -438,7 +438,7 @@ impl RdpServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let listener = TcpListener::bind(self.opts.addr).await?;
+        let listener = Arc::new(TcpListener::bind(self.opts.addr).await?);
         let local_addr = listener.local_addr()?;
 
         debug!("Listening for connections on {local_addr}");
@@ -468,6 +468,25 @@ impl RdpServer {
                 Ok((stream, peer)) = listener.accept() => {
                     debug!(?peer, "Received connection");
                     drop(ev_receiver);
+
+                    // Reject new connections while this session is active
+                    // (macrdp currently supports only one concurrent session)
+                    let reject_listener = Arc::clone(&listener);
+                    let reject_task = tokio::spawn(async move {
+                        loop {
+                            match reject_listener.accept().await {
+                                Ok((stream, peer)) => {
+                                    warn!(?peer, "Rejecting connection: another session is active");
+                                    tokio::spawn(reject_connection(stream));
+                                }
+                                Err(e) => {
+                                    debug!("Accept error in reject loop: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
                     if let Err(error) = self.run_connection(stream).await {
                         let err_str = format!("{error:#}");
                         if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
@@ -476,6 +495,8 @@ impl RdpServer {
                             error!(?error, "Connection error");
                         }
                     }
+
+                    reject_task.abort();
                     info!("Ready for next connection");
                     self.static_channels = StaticChannelSet::new();
                 }
@@ -1251,5 +1272,173 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
         Self {
             writer: Rc::new(Mutex::new(writer)),
         }
+    }
+}
+
+/// Send an RDP Negotiation Failure to a rejected connection, then close it.
+/// Waits for the client's Connection Request before responding so the client
+/// gets a proper protocol-level error instead of a silent TCP reset.
+async fn reject_connection(mut stream: TcpStream) {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{timeout, Duration};
+
+    let peer = stream.peer_addr().ok();
+
+    // Read the client's X.224 Connection Request (with a timeout to avoid leaking tasks)
+    let read_result = timeout(Duration::from_secs(5), async {
+        let mut hdr = [0u8; 4];
+        stream.read_exact(&mut hdr).await?;
+        if hdr[0] != 0x03 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not TPKT"));
+        }
+        let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+        if len < 4 || len > 1024 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad TPKT length"));
+        }
+        let mut rest = vec![0u8; len - 4];
+        stream.read_exact(&mut rest).await?;
+        Ok(())
+    })
+    .await;
+
+    if read_result.is_err() || read_result.as_ref().unwrap().is_err() {
+        debug!(?peer, "Rejected connection: failed to read Connection Request");
+        let _ = stream.shutdown().await;
+        return;
+    }
+
+    // Send RDP Negotiation Failure (undefined code signals "server busy")
+    let failure = X224(nego::ConnectionConfirm::Failure {
+        code: nego::FailureCode::from(0x0Au32),
+    });
+    if let Ok(response) = encode_vec(&failure) {
+        let _ = stream.write_all(&response).await;
+        let _ = stream.flush().await;
+    }
+    let _ = stream.shutdown().await;
+    debug!(?peer, "Rejected connection with RDP Negotiation Failure");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn encode_connection_request() -> Vec<u8> {
+        let req = X224(nego::ConnectionRequest {
+            nego_data: None,
+            flags: nego::RequestFlags::empty(),
+            protocol: nego::SecurityProtocol::HYBRID,
+        });
+        encode_vec(&req).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reject_connection_sends_negotiation_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&encode_connection_request()).await.unwrap();
+
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        reject_connection(server_stream).await;
+
+        let response = client_task.await.unwrap();
+        assert!(!response.is_empty(), "should send a failure PDU, not just close");
+
+        // Decode: TPKT header (4 bytes) + X.224 CC header + Negotiation Failure
+        assert_eq!(response[0], 0x03, "TPKT version");
+        let pdu: X224<nego::ConnectionConfirm> = decode(&response).unwrap();
+        match pdu.0 {
+            nego::ConnectionConfirm::Failure { code } => {
+                assert_eq!(u32::from(code), 0x0A);
+            }
+            nego::ConnectionConfirm::Response { .. } => {
+                panic!("expected Failure, got Response");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_connection_handles_non_tpkt_gracefully() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf).await;
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        reject_connection(server_stream).await;
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_connection_handles_immediate_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_task = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            drop(stream);
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        reject_connection(server_stream).await;
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_connection_handles_bad_tpkt_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // Valid TPKT version but length=2 (below minimum of 4)
+            stream.write_all(&[0x03, 0x00, 0x00, 0x02]).await.unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        reject_connection(server_stream).await;
+
+        let response = client_task.await.unwrap();
+        assert!(response.is_empty(), "should not send a response on bad TPKT length");
+    }
+
+    #[tokio::test]
+    async fn reject_connection_handles_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // Send only 2 bytes of the 4-byte TPKT header, then stall
+            stream.write_all(&[0x03, 0x00]).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        });
+
+        // reject_connection has a 5s timeout — should return well before 10s
+        let start = tokio::time::Instant::now();
+        let (server_stream, _) = listener.accept().await.unwrap();
+        reject_connection(server_stream).await;
+        let elapsed = start.elapsed();
+
+        assert!(elapsed.as_secs() < 8, "should timeout within ~5s, took {elapsed:?}");
+        client_task.abort();
     }
 }
