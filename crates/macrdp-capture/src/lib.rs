@@ -351,29 +351,33 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
 }
 
 /// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
+/// Find the SCK dimensions of the main display (matching CGDisplay::main().id).
+/// Falls back to the first SCK display if no match is found.
+fn find_main_sc_display_size() -> Result<(u32, u32)> {
+    use core_graphics::display::CGDisplay;
+    let main_id = CGDisplay::main().id;
+    let content = SCShareableContent::get()
+        .context("Failed to get shareable content")?;
+    let displays = content.displays();
+    let display = displays.iter()
+        .find(|d| d.display_id() == main_id)
+        .or_else(|| displays.first())
+        .context("No display found")?;
+    Ok((display.width() as u32, display.height() as u32))
+}
+
 pub fn detect_display_scale() -> Result<u32> {
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
-    let display = content.displays().into_iter().next()
-        .context("No display found")?;
-    let logical_w = display.width();
+    let (logical_w, _) = find_main_sc_display_size()?;
     let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
     Ok(scale.max(1))
 }
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
-    let display = content
-        .displays()
-        .into_iter()
-        .next()
-        .context("No display found")?;
-    Ok((display.width() as u32, display.height() as u32))
+    find_main_sc_display_size()
 }
 
 /// Query the main display's logical bounds from CoreGraphics.
@@ -405,11 +409,16 @@ impl ScreenCapturer {
             .await?
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .context("No display found")?;
+        let main_id = core_graphics::display::CGDisplay::main().id;
+        let mut displays = content.displays();
+        let main_idx = displays.iter()
+            .position(|d| d.display_id() == main_id)
+            .unwrap_or(0);
+        let display = if displays.is_empty() {
+            anyhow::bail!("No display found");
+        } else {
+            displays.swap_remove(main_idx)
+        };
 
         let actual_width = if config.width == 0 {
             display.width() as u32
