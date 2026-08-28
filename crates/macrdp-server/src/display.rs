@@ -22,6 +22,13 @@ const TILE_SIZE: u16 = 64;
 /// 65536 pixels ≈ 256×256 rect ≈ 256 KB of raw BGRA data.
 const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
 
+/// Dirty area below this fraction of total pixels = "low activity" (0.5%).
+const LOW_ACTIVITY_FRACTION: f64 = 0.005;
+/// After this many consecutive low-activity frames, start reducing FPS.
+const LOW_ACTIVITY_RAMP_FRAMES: u32 = 60;
+/// Minimum FPS during sustained low activity.
+const LOW_ACTIVITY_MIN_FPS: u32 = 5;
+
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
     let bgra = match frame.data.as_bgra_bytes() {
@@ -204,6 +211,8 @@ impl RdpServerDisplay for MacDisplay {
             skip_next_frame: false,
             overload_count: 0,
             perf_stats: self.perf_stats.clone(),
+            low_activity_frames: 0,
+            current_fps: self.frame_rate,
         }))
     }
 }
@@ -221,6 +230,10 @@ struct MacDisplayUpdates {
     overload_count: u64,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
+    /// Consecutive frames with tiny dirty area (activity-based FPS reduction).
+    low_activity_frames: u32,
+    /// Current capture FPS (to avoid redundant set_frame_rate calls).
+    current_fps: u32,
 }
 
 #[async_trait::async_trait]
@@ -276,12 +289,56 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Reduce capture FPS when dirty area is consistently tiny, restore instantly on activity.
+    fn adjust_fps_for_activity(&mut self, frame: &CapturedFrame) {
+        let total_pixels = frame.width as u64 * frame.height as u64;
+        if total_pixels == 0 || frame.dirty_rects.is_empty() {
+            return;
+        }
+
+        let dirty_pixels: u64 = frame.dirty_rects.iter()
+            .map(|r| r.width as u64 * r.height as u64)
+            .sum();
+        let dirty_frac = dirty_pixels as f64 / total_pixels as f64;
+
+        if dirty_frac < LOW_ACTIVITY_FRACTION {
+            self.low_activity_frames = self.low_activity_frames.saturating_add(1);
+
+            if self.low_activity_frames == LOW_ACTIVITY_RAMP_FRAMES
+                && self.current_fps != LOW_ACTIVITY_MIN_FPS
+            {
+                tracing::info!(
+                    from_fps = self.current_fps,
+                    to_fps = LOW_ACTIVITY_MIN_FPS,
+                    "Low screen activity — reducing capture FPS"
+                );
+                let _ = self.capturer.set_frame_rate(LOW_ACTIVITY_MIN_FPS);
+                self.current_fps = LOW_ACTIVITY_MIN_FPS;
+            }
+        } else if self.low_activity_frames >= LOW_ACTIVITY_RAMP_FRAMES {
+            let target_fps = self.capture_config.frame_rate;
+            tracing::info!(
+                from_fps = self.current_fps,
+                to_fps = target_fps,
+                "Screen activity resumed — restoring capture FPS"
+            );
+            let _ = self.capturer.set_frame_rate(target_fps);
+            self.current_fps = target_fps;
+            self.low_activity_frames = 0;
+        } else {
+            self.low_activity_frames = 0;
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
             self.skip_next_frame = false;
             return Ok(Some(DisplayUpdate::DefaultPointer));
         }
+
+        // Activity-based FPS reduction
+        self.adjust_fps_for_activity(&frame);
 
         // Check GFX state and AVC444 negotiation
         let (gfx_ready, use_444) = {
