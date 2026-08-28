@@ -14,6 +14,7 @@ mod display;
 mod encoder;
 pub mod gfx;
 mod handler;
+mod zgfx;
 #[cfg(feature = "helper")]
 mod helper;
 mod server;

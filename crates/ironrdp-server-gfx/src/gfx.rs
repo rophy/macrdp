@@ -48,35 +48,27 @@ unsafe impl Send for RawGfxPdu {}
 
 /// Wrap raw GFX PDU bytes in RDP_SEGMENTED_DATA (ZGFX) format.
 /// MS-RDPEGFX Section 2.2.5: ALL GFX PDUs must be ZGFX-wrapped before DVC transport.
-/// Using uncompressed mode (descriptor 0xE0/0xE1, compression type 0x04).
 fn wrap_zgfx(data: &[u8]) -> Vec<u8> {
     const SINGLE: u8 = 0xE0;
     const MULTIPART: u8 = 0xE1;
-    const UNCOMPRESSED: u8 = 0x04;
-    // Max data per segment = 65534 bytes. The segmentSize field includes the
-    // 1-byte compression type, so segmentSize = data_len + 1 ≤ 65535 (0xFFFF).
     const MAX_SEG_DATA: usize = 65534;
 
     if data.len() <= MAX_SEG_DATA {
-        // Single segment: descriptor(1) + compression_type(1) + data
-        let mut out = Vec::with_capacity(2 + data.len());
+        let segment = crate::zgfx::compress(data);
+        let mut out = Vec::with_capacity(1 + segment.len());
         out.push(SINGLE);
-        out.push(UNCOMPRESSED);
-        out.extend_from_slice(data);
+        out.extend_from_slice(&segment);
         out
     } else {
-        // Multipart: descriptor(1) + seg_count(2) + uncompressed_size(4) + segments
         let seg_count = data.len().div_ceil(MAX_SEG_DATA);
         let mut out = Vec::with_capacity(7 + data.len() + seg_count * 5);
         out.push(MULTIPART);
         out.extend_from_slice(&(seg_count as u16).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         for chunk in data.chunks(MAX_SEG_DATA) {
-            // segmentSize = compression_type(1) + chunk data
-            let seg_size = (chunk.len() + 1) as u32;
-            out.extend_from_slice(&seg_size.to_le_bytes());
-            out.push(UNCOMPRESSED);
-            out.extend_from_slice(chunk);
+            let segment = crate::zgfx::compress(chunk);
+            out.extend_from_slice(&(segment.len() as u32).to_le_bytes());
+            out.extend_from_slice(&segment);
         }
         out
     }
