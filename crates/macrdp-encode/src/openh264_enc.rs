@@ -371,6 +371,13 @@ pub fn encode_rect_h264(
     if rw == 0 || rh == 0 {
         anyhow::bail!("zero-size rect");
     }
+    let frame_h = bgra.len() / stride;
+    if rx as usize + rw as usize > stride / 4 || ry as usize + rh as usize > frame_h {
+        anyhow::bail!(
+            "rect ({rx},{ry} {rw}x{rh}) exceeds frame bounds ({}x{frame_h})",
+            stride / 4,
+        );
+    }
     // OpenH264 needs dimensions aligned to 16 for macroblocks
     let enc_w = ((rw + 15) & !15).max(16);
     let enc_h = ((rh + 15) & !15).max(16);
@@ -485,6 +492,18 @@ mod tests {
         let encoded = encode_rect_h264(&bgra, stride, 0, 0, w, h).unwrap();
         assert!(!encoded.data.is_empty());
         assert!(encoded.is_keyframe);
+    }
+
+    #[test]
+    fn test_encode_rect_h264_out_of_bounds() {
+        let w = 100u32;
+        let h = 100u32;
+        let stride = w as usize * 4;
+        let bgra = vec![128u8; h as usize * stride];
+        // Rect extends past right edge
+        assert!(encode_rect_h264(&bgra, stride, 90, 0, 20, 10).is_err());
+        // Rect extends past bottom edge
+        assert!(encode_rect_h264(&bgra, stride, 0, 95, 10, 10).is_err());
     }
 
     #[test]

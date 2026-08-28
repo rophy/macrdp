@@ -23,6 +23,9 @@ const TILE_SIZE: u16 = 64;
 /// Covers most UI interactions (menus, buttons, tooltips, text cursor blinks).
 const UNCOMPRESSED_MAX_PIXELS: u32 = 262144;
 
+/// Max dirty rects to encode individually before falling back to full-frame H.264.
+const DIRTY_RECT_MAX_COUNT: usize = 16;
+
 /// Dirty area below this fraction of total pixels = "low activity" (0.5%).
 const LOW_ACTIVITY_FRACTION: f64 = 0.005;
 /// After this many consecutive low-activity frames, start reducing FPS.
@@ -538,7 +541,9 @@ impl MacDisplayUpdates {
                     .map(|r| r.width * r.height)
                     .sum();
 
-                if total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS {
+                if total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS
+                    && frame.dirty_rects.len() <= DIRTY_RECT_MAX_COUNT
+                {
                     if let Some(bgra) = frame.data.as_bgra_bytes() {
                         let t0 = std::time::Instant::now();
                         let mut h264_rects: Vec<H264Rect> = Vec::new();
