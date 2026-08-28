@@ -30,6 +30,13 @@ const LOW_ACTIVITY_RAMP_FRAMES: u32 = 60;
 /// Minimum FPS during sustained low activity.
 const LOW_ACTIVITY_MIN_FPS: u32 = 5;
 
+/// Dirty area above this fraction triggers progressive rendering (30%).
+const PROGRESSIVE_TRIGGER_FRACTION: f64 = 0.30;
+/// Number of frames to ramp quality back to full after a scene change.
+const PROGRESSIVE_RAMP_FRAMES: u32 = 5;
+/// Initial bitrate fraction on scene change (25% of adaptive bitrate).
+const PROGRESSIVE_INITIAL_QUALITY: f32 = 0.25;
+
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
     let bgra = match frame.data.as_bgra_bytes() {
@@ -226,6 +233,7 @@ impl RdpServerDisplay for MacDisplay {
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
             last_applied_bitrate: self.base_bitrate,
+            progressive_ramp_remaining: 0,
         }))
     }
 }
@@ -255,6 +263,8 @@ struct MacDisplayUpdates {
     cursor_initialized: bool,
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
     last_applied_bitrate: u32,
+    /// Progressive rendering: frames remaining in the quality ramp (0 = inactive)
+    progressive_ramp_remaining: u32,
 }
 
 #[async_trait::async_trait]
@@ -386,6 +396,49 @@ impl MacDisplayUpdates {
         }
     }
 
+    fn apply_progressive_bitrate(&mut self, frame: &CapturedFrame) {
+        let encoder = match &mut self.encoder {
+            Some(e) => e,
+            None => return,
+        };
+
+        let total_pixels = frame.width as u64 * frame.height as u64;
+        if total_pixels == 0 {
+            return;
+        }
+
+        let dirty_pixels: u64 = frame.dirty_rects.iter()
+            .map(|r| r.width as u64 * r.height as u64)
+            .sum();
+        let dirty_frac = dirty_pixels as f64 / total_pixels as f64;
+
+        if dirty_frac >= PROGRESSIVE_TRIGGER_FRACTION && self.progressive_ramp_remaining == 0 {
+            self.progressive_ramp_remaining = PROGRESSIVE_RAMP_FRAMES;
+            let reduced = (self.last_applied_bitrate as f32 * PROGRESSIVE_INITIAL_QUALITY) as u32;
+            encoder.set_bitrate(reduced.max(500_000));
+            encoder.force_keyframe();
+            tracing::info!(
+                dirty_pct = format!("{:.0}", dirty_frac * 100.0),
+                reduced_mbps = reduced as f64 / 1_000_000.0,
+                "Progressive: scene change detected, starting quality ramp"
+            );
+            return;
+        }
+
+        if self.progressive_ramp_remaining > 0 {
+            self.progressive_ramp_remaining -= 1;
+            if self.progressive_ramp_remaining == 0 {
+                encoder.set_bitrate(self.last_applied_bitrate);
+                tracing::debug!("Progressive: ramp complete, restored full bitrate");
+            } else {
+                let progress = 1.0 - (self.progressive_ramp_remaining as f32 / PROGRESSIVE_RAMP_FRAMES as f32);
+                let factor = PROGRESSIVE_INITIAL_QUALITY + (1.0 - PROGRESSIVE_INITIAL_QUALITY) * progress;
+                let ramped = (self.last_applied_bitrate as f32 * factor) as u32;
+                encoder.set_bitrate(ramped.max(500_000));
+            }
+        }
+    }
+
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
@@ -426,6 +479,9 @@ impl MacDisplayUpdates {
                     self.last_applied_bitrate = adaptive;
                 }
             }
+
+            // Progressive rendering: detect scene change and apply quality ramp
+            self.apply_progressive_bitrate(&frame);
 
             // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
             if !frame.dirty_rects.is_empty() {
