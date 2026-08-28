@@ -19,8 +19,9 @@ const TILE_SIZE: u16 = 64;
 
 /// Maximum total dirty area (in pixels) for the uncompressed GFX path.
 /// Below this threshold, raw pixels are sent instead of H.264 encoding.
-/// 65536 pixels ≈ 256×256 rect ≈ 256 KB of raw BGRA data.
-const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
+/// 262144 pixels ≈ 512×512 rect ≈ 1 MB of raw BGRA data.
+/// Covers most UI interactions (menus, buttons, tooltips, text cursor blinks).
+const UNCOMPRESSED_MAX_PIXELS: u32 = 262144;
 
 /// Dirty area below this fraction of total pixels = "low activity" (0.5%).
 const LOW_ACTIVITY_FRACTION: f64 = 0.005;
@@ -224,6 +225,7 @@ impl RdpServerDisplay for MacDisplay {
             cursor_interval,
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
+            last_applied_bitrate: self.base_bitrate,
         }))
     }
 }
@@ -251,6 +253,8 @@ struct MacDisplayUpdates {
     last_cursor_pos: (u16, u16),
     /// Whether the initial DefaultPointer has been sent
     cursor_initialized: bool,
+    /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
+    last_applied_bitrate: u32,
 }
 
 #[async_trait::async_trait]
@@ -403,6 +407,26 @@ impl MacDisplayUpdates {
         };
 
         if gfx_ready {
+            // Adaptive bitrate: adjust encoder bitrate based on network conditions
+            if let Some(encoder) = &mut self.encoder {
+                let adaptive = {
+                    let state = self.gfx_state.lock().unwrap();
+                    state.adaptive_bitrate(self.base_bitrate)
+                };
+                if adaptive != self.last_applied_bitrate
+                    && (adaptive as f64 - self.last_applied_bitrate as f64).abs()
+                        > self.base_bitrate as f64 * 0.1
+                {
+                    tracing::info!(
+                        from_mbps = self.last_applied_bitrate as f64 / 1_000_000.0,
+                        to_mbps = adaptive as f64 / 1_000_000.0,
+                        "Adaptive bitrate adjustment"
+                    );
+                    encoder.set_bitrate(adaptive);
+                    self.last_applied_bitrate = adaptive;
+                }
+            }
+
             // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
             if !frame.dirty_rects.is_empty() {
                 let total_area: u32 = frame.dirty_rects.iter()
