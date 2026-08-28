@@ -380,6 +380,25 @@ pub fn detect_display_size() -> Result<(u32, u32)> {
     find_main_sc_display_size()
 }
 
+/// Read the current mouse cursor position in CG logical coordinates.
+/// Uses CGEventCreate(NULL) which works without Accessibility permission.
+pub fn get_cursor_position() -> (u16, u16) {
+    extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *mut c_void;
+        fn CGEventGetLocation(event: *const c_void) -> core_graphics::geometry::CGPoint;
+        fn CFRelease(cf: *const c_void);
+    }
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return (0, 0);
+        }
+        let point = CGEventGetLocation(event);
+        CFRelease(event);
+        (point.x.round() as u16, point.y.round() as u16)
+    }
+}
+
 /// Query the main display's logical bounds from CoreGraphics.
 /// This is the coordinate system CGEvent uses, and MUST be used for mouse mapping.
 /// May differ from SCDisplay dimensions on non-standard scaling modes.

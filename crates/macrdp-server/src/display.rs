@@ -2,11 +2,11 @@ use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
-    PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
-    UncompressedRect, gfx::GfxState,
+    PixelFormat as RdpPixelFormat, PointerPositionAttribute, RdpServerDisplay,
+    RdpServerDisplayUpdates, UncompressedRect, gfx::GfxState,
 };
 use macrdp_audio::SharedAudioTx;
-use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
+use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer, get_cursor_position};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
@@ -200,6 +200,14 @@ impl RdpServerDisplay for MacDisplay {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
         }
 
+        let cursor_interval = if !self.show_cursor {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            Some(interval)
+        } else {
+            None
+        };
+
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
@@ -213,6 +221,9 @@ impl RdpServerDisplay for MacDisplay {
             perf_stats: self.perf_stats.clone(),
             low_activity_frames: 0,
             current_fps: self.frame_rate,
+            cursor_interval,
+            last_cursor_pos: (0, 0),
+            cursor_initialized: false,
         }))
     }
 }
@@ -234,23 +245,73 @@ struct MacDisplayUpdates {
     low_activity_frames: u32,
     /// Current capture FPS (to avoid redundant set_frame_rate calls).
     current_fps: u32,
+    /// Separate cursor channel: poll interval for reading cursor position
+    cursor_interval: Option<tokio::time::Interval>,
+    /// Last cursor position sent via PointerPosition PDU
+    last_cursor_pos: (u16, u16),
+    /// Whether the initial DefaultPointer has been sent
+    cursor_initialized: bool,
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        // Drain stale frames — always use the latest available frame.
-        // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
-        // which works at the display level (including lock screen).
-        let frame = loop {
+        // Send initial DefaultPointer when cursor channel is active
+        if self.cursor_interval.is_some() && !self.cursor_initialized {
+            self.cursor_initialized = true;
+            let (x, y) = get_cursor_position();
+            self.last_cursor_pos = (x, y);
+            tracing::info!("Cursor channel active — sending initial pointer at ({x}, {y})");
+            return Ok(Some(DisplayUpdate::DefaultPointer));
+        }
+
+        if self.cursor_interval.is_none() {
+            let frame = match self.next_frame().await {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            return self.encode_and_send(frame);
+        }
+
+        loop {
+            // Take interval out to avoid borrowing self through it during select!
+            let mut cursor_iv = self.cursor_interval.take().unwrap();
+            let result = tokio::select! {
+                biased;
+                _ = cursor_iv.tick() => {
+                    self.cursor_interval = Some(cursor_iv);
+                    let (x, y) = get_cursor_position();
+                    if (x, y) != self.last_cursor_pos {
+                        self.last_cursor_pos = (x, y);
+                        return Ok(Some(DisplayUpdate::PointerPosition(
+                            PointerPositionAttribute { x, y }
+                        )));
+                    }
+                    continue;
+                }
+                frame_result = self.next_frame() => {
+                    self.cursor_interval = Some(cursor_iv);
+                    frame_result
+                }
+            };
+            return match result {
+                Some(frame) => self.encode_and_send(frame),
+                None => Ok(None),
+            };
+        }
+    }
+}
+
+impl MacDisplayUpdates {
+    /// Wait for the next video frame, handling SCK recovery and frame draining.
+    async fn next_frame(&mut self) -> Option<CapturedFrame> {
+        loop {
             let event = match self.capturer.next_frame().await {
                 Some(e) => e,
                 None => {
-                    // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
                     tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
                     let fallback = CgFallbackCapturer::new(&self.capture_config);
                     loop {
-                        // Try to restore SCK (faster, has dirty rects)
                         match ScreenCapturer::new(self.capture_config.clone(), None).await {
                             Ok(new_capturer) => {
                                 tracing::info!("SCStream recovered — switching back from CoreGraphics");
@@ -258,37 +319,28 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                                 break;
                             }
                             Err(_) => {
-                                // SCK still unavailable — use CGDisplayCreateImage
                                 if let Some(cg_frame) = fallback.capture_frame() {
-                                    // Send this fallback frame through the normal encoding path
-                                    return self.encode_and_send(cg_frame);
+                                    return Some(cg_frame);
                                 }
                                 tokio::time::sleep(fallback.frame_interval()).await;
                             }
                         }
                     }
-                    continue; // retry next_frame with restored SCK capturer
+                    continue;
                 }
             };
-            // Handle CaptureEvent — extract frame or skip idle
             let frame = match event {
                 macrdp_capture::CaptureEvent::Frame(f) => f,
                 macrdp_capture::CaptureEvent::Idle => continue,
             };
-            // If another frame is already buffered, skip this one and grab the newer one
-            // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
                 Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue,
-                Some(macrdp_capture::CaptureEvent::Idle) => break frame,
-                None => break frame,
+                Some(macrdp_capture::CaptureEvent::Idle) => return Some(frame),
+                None => return Some(frame),
             }
-        };
-
-        self.encode_and_send(frame)
+        }
     }
-}
 
-impl MacDisplayUpdates {
     /// Reduce capture FPS when dirty area is consistently tiny, restore instantly on activity.
     fn adjust_fps_for_activity(&mut self, frame: &CapturedFrame) {
         let total_pixels = frame.width as u64 * frame.height as u64;

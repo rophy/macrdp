@@ -200,7 +200,15 @@ async fn main() -> Result<()> {
     };
 
     // Create display with shared GFX state
-    let show_cursor = config.show_cursor.unwrap_or(true);
+    let cursor_channel = config.cursor_channel.unwrap_or(true);
+    let show_cursor = if cursor_channel {
+        false // cursor removed from video frames when cursor channel is active
+    } else {
+        config.show_cursor.unwrap_or(true)
+    };
+    if cursor_channel {
+        tracing::info!("Cursor channel enabled — cursor sent via RDP pointer PDUs");
+    }
     let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone());
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;

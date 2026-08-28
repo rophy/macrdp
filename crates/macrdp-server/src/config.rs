@@ -94,8 +94,12 @@ pub struct ServerConfig {
     /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")
     #[serde(alias = "hidpi_scale")]
     pub resolution: Option<String>,
-    /// Show cursor in capture (default: true)
+    /// Show cursor in capture (default: true when cursor_channel is off)
     pub show_cursor: Option<bool>,
+    /// Send cursor position via separate RDP pointer PDUs (default: true)
+    /// When enabled, cursor is removed from video frames and sent as lightweight
+    /// PointerPosition updates at ~60Hz, giving zero-latency cursor movement.
+    pub cursor_channel: Option<bool>,
     /// Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
     /// Override this to force a specific bitrate, e.g. 50 for 50 Mbps.
     pub bitrate_mbps: Option<u32>,
@@ -132,6 +136,7 @@ impl Default for ServerConfig {
             chroma_mode: None,
             resolution: None,
             show_cursor: None,
+            cursor_channel: None,
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,
