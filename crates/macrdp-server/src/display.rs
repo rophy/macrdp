@@ -1,13 +1,13 @@
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
-    PixelFormat as RdpPixelFormat, PointerPositionAttribute, RdpServerDisplay,
-    RdpServerDisplayUpdates, UncompressedRect, gfx::GfxState,
+    BitmapUpdate, DesktopSize, DisplayUpdate, GfxDirtyH264Update, GfxFrameUpdate,
+    H264Rect, PixelFormat as RdpPixelFormat, PointerPositionAttribute, RdpServerDisplay,
+    RdpServerDisplayUpdates, gfx::GfxState,
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer, get_cursor_position};
-use macrdp_encode::{self, Quality, VideoEncoder};
+use macrdp_encode::{self, Quality, VideoEncoder, encode_rect_h264};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,9 @@ const TILE_SIZE: u16 = 64;
 /// 262144 pixels ≈ 512×512 rect ≈ 1 MB of raw BGRA data.
 /// Covers most UI interactions (menus, buttons, tooltips, text cursor blinks).
 const UNCOMPRESSED_MAX_PIXELS: u32 = 262144;
+
+/// Max dirty rects to encode individually before falling back to full-frame H.264.
+const DIRTY_RECT_MAX_COUNT: usize = 16;
 
 /// Dirty area below this fraction of total pixels = "low activity" (0.5%).
 const LOW_ACTIVITY_FRACTION: f64 = 0.005;
@@ -83,6 +86,7 @@ impl ProgressiveRamp {
         ProgressiveAction::None
     }
 
+    #[cfg(test)]
     fn is_ramping(&self) -> bool {
         self.remaining > 0
     }
@@ -530,68 +534,77 @@ impl MacDisplayUpdates {
             // Progressive rendering: detect scene change and apply quality ramp
             self.apply_progressive_bitrate(&frame);
 
-            // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
+            // GFX dirty-rect path — for small dirty regions, encode each rect
+            // independently with OpenH264 instead of full-frame H.264
             if !frame.dirty_rects.is_empty() {
                 let total_area: u32 = frame.dirty_rects.iter()
                     .map(|r| r.width * r.height)
                     .sum();
 
-                if total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS {
+                if total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS
+                    && frame.dirty_rects.len() <= DIRTY_RECT_MAX_COUNT
+                {
                     if let Some(bgra) = frame.data.as_bgra_bytes() {
-                        let rects: Vec<UncompressedRect> = frame.dirty_rects.iter()
-                            .filter(|r| r.width > 0 && r.height > 0)
-                            .filter_map(|r| {
-                                // Clamp to frame bounds
-                                let x = r.x.min(frame.width.saturating_sub(1));
-                                let y = r.y.min(frame.height.saturating_sub(1));
-                                let w = r.width.min(frame.width - x);
-                                let h = r.height.min(frame.height - y);
-                                if w == 0 || h == 0 { return None; }
+                        let t0 = std::time::Instant::now();
+                        let mut h264_rects: Vec<H264Rect> = Vec::new();
+                        let mut encode_failed = false;
 
-                                let bpp = 4usize;
-                                let row_bytes = w as usize * bpp;
-                                let mut pixels = Vec::with_capacity(h as usize * row_bytes);
-                                for row in 0..h as usize {
-                                    let src_y = y as usize + row;
-                                    let offset = src_y * frame.stride + x as usize * bpp;
-                                    let end = offset + row_bytes;
-                                    if end <= bgra.len() {
-                                        pixels.extend_from_slice(&bgra[offset..end]);
-                                    }
+                        for r in frame.dirty_rects.iter().filter(|r| r.width > 0 && r.height > 0) {
+                            let x = r.x.min(frame.width.saturating_sub(1));
+                            let y = r.y.min(frame.height.saturating_sub(1));
+                            let w = r.width.min(frame.width - x);
+                            let h = r.height.min(frame.height - y);
+                            if w == 0 || h == 0 { continue; }
+
+                            match encode_rect_h264(bgra, frame.stride, x, y, w, h) {
+                                Ok(encoded) => {
+                                    h264_rects.push(H264Rect {
+                                        x: x as u16,
+                                        y: y as u16,
+                                        width: w as u16,
+                                        height: h as u16,
+                                        enc_width: encoded.width as u16,
+                                        enc_height: encoded.height as u16,
+                                        h264_data: encoded.data,
+                                    });
                                 }
-                                Some(UncompressedRect {
-                                    x: x as u16,
-                                    y: y as u16,
-                                    width: w as u16,
-                                    height: h as u16,
-                                    pixel_data: Bytes::from(pixels),
-                                })
-                            })
-                            .collect();
+                                Err(e) => {
+                                    tracing::warn!(
+                                        rect_x = r.x, rect_y = r.y,
+                                        rect_w = w, rect_h = h,
+                                        "Dirty-rect H.264 encode failed: {e:#}, falling back to full frame"
+                                    );
+                                    encode_failed = true;
+                                    break;
+                                }
+                            }
+                        }
 
-                        if !rects.is_empty() {
+                        if !encode_failed && !h264_rects.is_empty() {
                             self.display_frame_count += 1;
-                            let total_bytes: usize = rects.iter().map(|r| r.pixel_data.len()).sum();
+                            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            let total_h264: usize = h264_rects.iter().map(|r| r.h264_data.len()).sum();
                             {
                                 let mut st = self.gfx_state.lock().unwrap();
-                                st.last_encode_ms = 0.0; // zero encode time
-                                st.last_frame_bytes = total_bytes as u32;
+                                st.last_encode_ms = encode_ms;
+                                st.last_frame_bytes = total_h264 as u32;
                             }
                             tracing::debug!(
                                 display_frame = self.display_frame_count,
-                                rects = rects.len(),
+                                rects = h264_rects.len(),
                                 total_pixels = total_area,
-                                total_bytes,
-                                "Display: sending GFX uncompressed dirty rects"
+                                h264_bytes = total_h264,
+                                encode_ms = format!("{:.1}", encode_ms),
+                                "Display: sending GFX dirty-rect H.264"
                             );
-                            return Ok(Some(DisplayUpdate::GfxUncompressed(GfxUncompressedUpdate {
-                                rects,
+                            return Ok(Some(DisplayUpdate::GfxDirtyH264(GfxDirtyH264Update {
+                                rects: h264_rects,
                                 width: frame.width as u16,
                                 height: frame.height as u16,
                             })));
                         }
                     }
-                    // PixelBuffer frames or extraction failure — fall through to H.264
+                    // PixelBuffer frames or encode failure — fall through to full-frame H.264
                 }
             }
 

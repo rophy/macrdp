@@ -630,6 +630,38 @@ impl RdpServer {
             }
         }
 
+        // Handle GFX dirty-rect H.264 updates through the DVC channel
+        if let DisplayUpdate::GfxDirtyH264(ref dirty_h264) = update {
+            let mut state = gfx_state.lock().unwrap();
+            if state.is_ready() {
+                if let Some(drdynvc_id) = drdynvc_channel_id {
+                    let channel_id = state.channel_id.unwrap();
+                    let pdu_data = GfxHandler::create_dirty_h264_pdu(&mut state, dirty_h264);
+                    drop(state);
+
+                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let svc_messages = dvc::encode_dvc_messages(
+                        channel_id,
+                        dvc_messages,
+                        ChannelFlags::SHOW_PROTOCOL,
+                    ).context("Failed to encode DVC messages")?;
+
+                    let data = server_encode_svc_messages(
+                        svc_messages.into(),
+                        drdynvc_id,
+                        user_channel_id,
+                    )?;
+                    writer.write_all(&data).await
+                        .context("failed to write GFX dirty H.264 frame")?;
+
+                    return Ok((RunState::Continue, encoder));
+                }
+            } else {
+                drop(state);
+                trace!("GFX not ready for dirty H.264, falling back to bitmap path");
+            }
+        }
+
         let mut encoder_iter = encoder.update(update);
         loop {
             let Some(fragmenter) = encoder_iter.next().await else {

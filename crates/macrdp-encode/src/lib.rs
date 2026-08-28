@@ -11,7 +11,7 @@ mod videotoolbox;
 use anyhow::Result;
 use bytes::Bytes;
 
-pub use openh264_enc::OpenH264Encoder;
+pub use openh264_enc::{OpenH264Encoder, encode_rect_h264};
 #[cfg(target_os = "macos")]
 pub use videotoolbox::VtEncoder;
 

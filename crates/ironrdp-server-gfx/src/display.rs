@@ -24,6 +24,8 @@ pub enum DisplayUpdate {
     GfxFrame(GfxFrameUpdate),
     /// GFX uncompressed dirty rect update (small changes, zero encode latency)
     GfxUncompressed(GfxUncompressedUpdate),
+    /// GFX H.264 dirty rect update (small changes encoded per-rect with OpenH264)
+    GfxDirtyH264(GfxDirtyH264Update),
     PointerPosition(PointerPositionAttribute),
     ColorPointer(ColorPointer),
     RGBAPointer(RGBAPointer),
@@ -69,6 +71,29 @@ pub struct GfxUncompressedUpdate {
     /// Surface width (for first-frame setup)
     pub width: u16,
     /// Surface height (for first-frame setup)
+    pub height: u16,
+}
+
+/// A single H.264-encoded dirty rectangle
+#[derive(Debug, Clone)]
+pub struct H264Rect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Encoder-aligned width (may differ from width due to H.264 alignment)
+    pub enc_width: u16,
+    /// Encoder-aligned height
+    pub enc_height: u16,
+    /// H.264 NAL units (Annex B, AVC420 IDR)
+    pub h264_data: Bytes,
+}
+
+/// GFX dirty-rect H.264 update — per-rect H.264 for small changed regions
+#[derive(Debug, Clone)]
+pub struct GfxDirtyH264Update {
+    pub rects: Vec<H264Rect>,
+    pub width: u16,
     pub height: u16,
 }
 

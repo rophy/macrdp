@@ -18,7 +18,7 @@ use ironrdp_pdu::{decode, PduResult};
 type DvcMessage = ironrdp_dvc::DvcMessage;
 use tracing::{debug, info};
 
-use crate::display::{GfxFrameUpdate, GfxUncompressedUpdate};
+use crate::display::{GfxDirtyH264Update, GfxFrameUpdate, GfxUncompressedUpdate};
 
 /// GFX channel name as defined by RDP spec
 pub const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
@@ -561,6 +561,119 @@ impl GfxHandler {
             rects = update.rects.len(),
             raw_bytes = total_bytes,
             "GFX uncompressed frame PDU created",
+        );
+
+        wrap_zgfx(&raw_pdus)
+    }
+
+    /// Create a ZGFX-wrapped buffer for dirty-rect H.264 updates.
+    /// Each rect is sent as its own WireToSurface1 with AVC420 codec.
+    pub fn create_dirty_h264_pdu(state: &mut GfxState, update: &GfxDirtyH264Update) -> Vec<u8> {
+        let mut raw_pdus = Vec::new();
+
+        if state.surface_created
+            && (state.width != update.width || state.height != update.height)
+        {
+            state.width = update.width;
+            state.height = update.height;
+            state.surface_created = false;
+        }
+
+        if !state.surface_created {
+            if let Ok(data) = encode_vec(&ServerPdu::ResetGraphics(ResetGraphicsPdu {
+                width: state.width as u32,
+                height: state.height as u32,
+                monitors: vec![Monitor {
+                    left: 0,
+                    top: 0,
+                    right: state.width as i32 - 1,
+                    bottom: state.height as i32 - 1,
+                    flags: MonitorFlags::PRIMARY,
+                }],
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
+
+            if let Ok(data) = encode_vec(&ServerPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 0,
+                width: update.width,
+                height: update.height,
+                pixel_format: GfxPixelFormat::XRgb,
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
+
+            if let Ok(data) = encode_vec(&ServerPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: 0,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            })) {
+                raw_pdus.extend_from_slice(&data);
+            }
+
+            state.surface_created = true;
+            info!("GFX surface created (dirty H.264): {}x{}", update.width, update.height);
+        }
+
+        let frame_id = state.next_frame_id();
+
+        if let Ok(data) = encode_vec(&ServerPdu::StartFrame(StartFramePdu {
+            timestamp: Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id,
+        })) {
+            raw_pdus.extend_from_slice(&data);
+        }
+
+        let mut total_h264_bytes = 0usize;
+        for rect in &update.rects {
+            let avc_stream = Avc420BitmapStream {
+                rectangles: vec![InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: rect.width,
+                    bottom: rect.height,
+                }],
+                quant_qual_vals: vec![QuantQuality {
+                    quantization_parameter: 22,
+                    progressive: false,
+                    quality: 100,
+                }],
+                data: &rect.h264_data,
+            };
+
+            if let Ok(avc_data) = encode_vec(&avc_stream) {
+                if let Ok(data) = encode_vec(&ServerPdu::WireToSurface1(WireToSurface1Pdu {
+                    surface_id: 0,
+                    codec_id: Codec1Type::Avc420,
+                    pixel_format: GfxPixelFormat::XRgb,
+                    destination_rectangle: InclusiveRectangle {
+                        left: rect.x,
+                        top: rect.y,
+                        right: rect.x + rect.width,
+                        bottom: rect.y + rect.height,
+                    },
+                    bitmap_data: avc_data,
+                })) {
+                    total_h264_bytes += rect.h264_data.len();
+                    raw_pdus.extend_from_slice(&data);
+                }
+            }
+        }
+
+        if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
+            raw_pdus.extend_from_slice(&data);
+        }
+
+        debug!(
+            frame_id,
+            rects = update.rects.len(),
+            h264_bytes = total_h264_bytes,
+            "GFX dirty H.264 frame PDU created",
         );
 
         wrap_zgfx(&raw_pdus)
