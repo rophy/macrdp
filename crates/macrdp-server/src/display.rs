@@ -30,12 +30,71 @@ const LOW_ACTIVITY_RAMP_FRAMES: u32 = 60;
 /// Minimum FPS during sustained low activity.
 const LOW_ACTIVITY_MIN_FPS: u32 = 5;
 
-/// Dirty area above this fraction triggers progressive rendering (30%).
-const PROGRESSIVE_TRIGGER_FRACTION: f64 = 0.30;
-/// Number of frames to ramp quality back to full after a scene change.
-const PROGRESSIVE_RAMP_FRAMES: u32 = 5;
-/// Initial bitrate fraction on scene change (25% of adaptive bitrate).
-const PROGRESSIVE_INITIAL_QUALITY: f32 = 0.25;
+/// Progressive rendering: on scene changes (large dirty area), temporarily reduce
+/// encoder bitrate for fast initial delivery, then ramp quality back over several frames.
+#[derive(Debug)]
+struct ProgressiveRamp {
+    trigger_fraction: f64,
+    ramp_frames: u32,
+    initial_quality: f32,
+    remaining: u32,
+}
+
+impl ProgressiveRamp {
+    fn new() -> Self {
+        Self {
+            trigger_fraction: 0.30,
+            ramp_frames: 5,
+            initial_quality: 0.25,
+            remaining: 0,
+        }
+    }
+
+    /// Evaluate a frame and return the bitrate action to take.
+    fn evaluate(&mut self, dirty_pixels: u64, total_pixels: u64, base_bitrate: u32) -> ProgressiveAction {
+        if total_pixels == 0 {
+            return ProgressiveAction::None;
+        }
+
+        let dirty_frac = dirty_pixels as f64 / total_pixels as f64;
+
+        if dirty_frac >= self.trigger_fraction && self.remaining == 0 {
+            self.remaining = self.ramp_frames;
+            let reduced = (base_bitrate as f32 * self.initial_quality) as u32;
+            return ProgressiveAction::SceneChange {
+                bitrate: reduced.max(500_000),
+                dirty_pct: dirty_frac * 100.0,
+            };
+        }
+
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                return ProgressiveAction::RampComplete { bitrate: base_bitrate };
+            }
+            let progress = 1.0 - (self.remaining as f32 / self.ramp_frames as f32);
+            let factor = self.initial_quality + (1.0 - self.initial_quality) * progress;
+            let ramped = (base_bitrate as f32 * factor) as u32;
+            return ProgressiveAction::Ramp {
+                bitrate: ramped.max(500_000),
+            };
+        }
+
+        ProgressiveAction::None
+    }
+
+    fn is_ramping(&self) -> bool {
+        self.remaining > 0
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ProgressiveAction {
+    None,
+    SceneChange { bitrate: u32, dirty_pct: f64 },
+    Ramp { bitrate: u32 },
+    RampComplete { bitrate: u32 },
+}
 
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
@@ -233,7 +292,7 @@ impl RdpServerDisplay for MacDisplay {
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
             last_applied_bitrate: self.base_bitrate,
-            progressive_ramp_remaining: 0,
+            progressive: ProgressiveRamp::new(),
         }))
     }
 }
@@ -263,8 +322,7 @@ struct MacDisplayUpdates {
     cursor_initialized: bool,
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
     last_applied_bitrate: u32,
-    /// Progressive rendering: frames remaining in the quality ramp (0 = inactive)
-    progressive_ramp_remaining: u32,
+    progressive: ProgressiveRamp,
 }
 
 #[async_trait::async_trait]
@@ -403,39 +461,28 @@ impl MacDisplayUpdates {
         };
 
         let total_pixels = frame.width as u64 * frame.height as u64;
-        if total_pixels == 0 {
-            return;
-        }
-
         let dirty_pixels: u64 = frame.dirty_rects.iter()
             .map(|r| r.width as u64 * r.height as u64)
             .sum();
-        let dirty_frac = dirty_pixels as f64 / total_pixels as f64;
 
-        if dirty_frac >= PROGRESSIVE_TRIGGER_FRACTION && self.progressive_ramp_remaining == 0 {
-            self.progressive_ramp_remaining = PROGRESSIVE_RAMP_FRAMES;
-            let reduced = (self.last_applied_bitrate as f32 * PROGRESSIVE_INITIAL_QUALITY) as u32;
-            encoder.set_bitrate(reduced.max(500_000));
-            encoder.force_keyframe();
-            tracing::info!(
-                dirty_pct = format!("{:.0}", dirty_frac * 100.0),
-                reduced_mbps = reduced as f64 / 1_000_000.0,
-                "Progressive: scene change detected, starting quality ramp"
-            );
-            return;
-        }
-
-        if self.progressive_ramp_remaining > 0 {
-            self.progressive_ramp_remaining -= 1;
-            if self.progressive_ramp_remaining == 0 {
-                encoder.set_bitrate(self.last_applied_bitrate);
-                tracing::debug!("Progressive: ramp complete, restored full bitrate");
-            } else {
-                let progress = 1.0 - (self.progressive_ramp_remaining as f32 / PROGRESSIVE_RAMP_FRAMES as f32);
-                let factor = PROGRESSIVE_INITIAL_QUALITY + (1.0 - PROGRESSIVE_INITIAL_QUALITY) * progress;
-                let ramped = (self.last_applied_bitrate as f32 * factor) as u32;
-                encoder.set_bitrate(ramped.max(500_000));
+        match self.progressive.evaluate(dirty_pixels, total_pixels, self.last_applied_bitrate) {
+            ProgressiveAction::SceneChange { bitrate, dirty_pct } => {
+                encoder.set_bitrate(bitrate);
+                encoder.force_keyframe();
+                tracing::info!(
+                    dirty_pct = format!("{:.0}", dirty_pct),
+                    reduced_mbps = bitrate as f64 / 1_000_000.0,
+                    "Progressive: scene change detected, starting quality ramp"
+                );
             }
+            ProgressiveAction::Ramp { bitrate } => {
+                encoder.set_bitrate(bitrate);
+            }
+            ProgressiveAction::RampComplete { bitrate } => {
+                encoder.set_bitrate(bitrate);
+                tracing::debug!("Progressive: ramp complete, restored full bitrate");
+            }
+            ProgressiveAction::None => {}
         }
     }
 
@@ -854,5 +901,120 @@ mod tests {
 
         let updates = frame_to_bitmap_updates(&frame, 64);
         assert_eq!(updates.len(), 2);
+    }
+
+    #[test]
+    fn test_progressive_no_trigger_below_threshold() {
+        let mut ramp = ProgressiveRamp::new();
+        // 20% dirty — below 30% threshold
+        let action = ramp.evaluate(200, 1000, 8_000_000);
+        assert_eq!(action, ProgressiveAction::None);
+        assert!(!ramp.is_ramping());
+    }
+
+    #[test]
+    fn test_progressive_triggers_on_scene_change() {
+        let mut ramp = ProgressiveRamp::new();
+        // 50% dirty — above threshold
+        let action = ramp.evaluate(500, 1000, 8_000_000);
+        match action {
+            ProgressiveAction::SceneChange { bitrate, .. } => {
+                // 8M * 0.25 = 2M
+                assert_eq!(bitrate, 2_000_000);
+            }
+            other => panic!("Expected SceneChange, got {:?}", other),
+        }
+        assert!(ramp.is_ramping());
+    }
+
+    #[test]
+    fn test_progressive_ramp_sequence() {
+        let mut ramp = ProgressiveRamp::new();
+        let base = 10_000_000u32;
+
+        // Trigger scene change
+        let action = ramp.evaluate(1000, 1000, base);
+        assert!(matches!(action, ProgressiveAction::SceneChange { .. }));
+
+        // Ramp frames 1..4 should produce increasing bitrates
+        let mut prev_bitrate = 0u32;
+        for i in 0..4 {
+            let action = ramp.evaluate(0, 1000, base);
+            match action {
+                ProgressiveAction::Ramp { bitrate } => {
+                    assert!(bitrate > prev_bitrate, "frame {i}: {bitrate} should be > {prev_bitrate}");
+                    assert!(bitrate < base, "frame {i}: {bitrate} should be < base {base}");
+                    prev_bitrate = bitrate;
+                }
+                other => panic!("frame {i}: expected Ramp, got {:?}", other),
+            }
+        }
+
+        // Frame 5 should complete the ramp and restore base bitrate
+        let action = ramp.evaluate(0, 1000, base);
+        assert_eq!(action, ProgressiveAction::RampComplete { bitrate: base });
+        assert!(!ramp.is_ramping());
+    }
+
+    #[test]
+    fn test_progressive_no_retrigger_during_ramp() {
+        let mut ramp = ProgressiveRamp::new();
+        // Trigger
+        ramp.evaluate(1000, 1000, 8_000_000);
+        // Another scene change during ramp should NOT re-trigger
+        let action = ramp.evaluate(1000, 1000, 8_000_000);
+        assert!(matches!(action, ProgressiveAction::Ramp { .. }));
+    }
+
+    #[test]
+    fn test_progressive_retrigger_after_ramp_complete() {
+        let mut ramp = ProgressiveRamp::new();
+        let base = 8_000_000;
+        // Complete a full ramp
+        ramp.evaluate(1000, 1000, base);
+        for _ in 0..5 {
+            ramp.evaluate(0, 1000, base);
+        }
+        assert!(!ramp.is_ramping());
+
+        // Should be able to trigger again
+        let action = ramp.evaluate(1000, 1000, base);
+        assert!(matches!(action, ProgressiveAction::SceneChange { .. }));
+    }
+
+    #[test]
+    fn test_progressive_minimum_bitrate_floor() {
+        let mut ramp = ProgressiveRamp::new();
+        // Very low base bitrate: 1 Mbps * 0.25 = 250 Kbps, should clamp to 500 Kbps
+        let action = ramp.evaluate(1000, 1000, 1_000_000);
+        match action {
+            ProgressiveAction::SceneChange { bitrate, .. } => {
+                assert_eq!(bitrate, 500_000);
+            }
+            other => panic!("Expected SceneChange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_progressive_zero_total_pixels() {
+        let mut ramp = ProgressiveRamp::new();
+        let action = ramp.evaluate(0, 0, 8_000_000);
+        assert_eq!(action, ProgressiveAction::None);
+    }
+
+    #[test]
+    fn test_progressive_exact_threshold() {
+        let mut ramp = ProgressiveRamp::new();
+        // Exactly 30% should trigger
+        let action = ramp.evaluate(300, 1000, 8_000_000);
+        assert!(matches!(action, ProgressiveAction::SceneChange { .. }));
+    }
+
+    #[test]
+    fn test_progressive_just_below_threshold() {
+        let mut ramp = ProgressiveRamp::new();
+        // 29.9% should not trigger
+        let action = ramp.evaluate(299, 1000, 8_000_000);
+        assert_eq!(action, ProgressiveAction::None);
     }
 }
