@@ -360,6 +360,81 @@ impl VideoEncoder for OpenH264Encoder {
     }
 }
 
+/// Encode a sub-rectangle of a BGRA frame as H.264 using a temporary OpenH264 encoder.
+/// `bgra` is the full frame, `stride` is its row pitch. The rect at (rx, ry, rw, rh) is
+/// extracted and encoded independently. Returns AVC420 NAL units + the aligned encoder size.
+pub fn encode_rect_h264(
+    bgra: &[u8],
+    stride: usize,
+    rx: u32, ry: u32, rw: u32, rh: u32,
+) -> Result<EncodedFrame> {
+    if rw == 0 || rh == 0 {
+        anyhow::bail!("zero-size rect");
+    }
+    // OpenH264 needs dimensions aligned to 16 for macroblocks
+    let enc_w = ((rw + 15) & !15).max(16);
+    let enc_h = ((rh + 15) & !15).max(16);
+
+    let config = EncoderConfig::new()
+        .bitrate(openh264::encoder::BitRate::from_bps(2_000_000))
+        .max_frame_rate(openh264::encoder::FrameRate::from_hz(30.0))
+        .rate_control_mode(openh264::encoder::RateControlMode::Quality)
+        .background_detection(false)
+        .adaptive_quantization(false)
+        .skip_frames(false)
+        .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
+        .complexity(openh264::encoder::Complexity::Low)
+        .num_threads(1);
+
+    let mut encoder = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+        .context("Failed to create OpenH264 rect encoder")?;
+
+    let yuv_size = (enc_w * enc_h * 3 / 2) as usize;
+    let mut yuv_buf = vec![0u8; yuv_size];
+    // Fill UV planes with neutral chroma
+    let y_size = (enc_w * enc_h) as usize;
+    yuv_buf[y_size..].fill(128);
+
+    // Extract sub-rect BGRA and convert to YUV420
+    let bpp = 4usize;
+    for row in 0..rh as usize {
+        let src_y = ry as usize + row;
+        for col in 0..rw as usize {
+            let src_off = src_y * stride + (rx as usize + col) * bpp;
+            if src_off + 2 >= bgra.len() { continue; }
+            let b = bgra[src_off] as i32;
+            let g = bgra[src_off + 1] as i32;
+            let r = bgra[src_off + 2] as i32;
+
+            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            yuv_buf[row * enc_w as usize + col] = y.clamp(0, 255) as u8;
+
+            if row % 2 == 0 && col % 2 == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let uv_w = enc_w as usize / 2;
+                let uv_idx = (row / 2) * uv_w + (col / 2);
+                yuv_buf[y_size + uv_idx] = u.clamp(0, 255) as u8;
+                yuv_buf[y_size + (enc_w as usize / 2) * (enc_h as usize / 2) + uv_idx] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    let yuv = YUVBuffer::from_vec(yuv_buf, enc_w as usize, enc_h as usize);
+    let bitstream = encoder.encode(&yuv)
+        .map_err(|e| anyhow::anyhow!("OpenH264 rect encode ({enc_w}x{enc_h}) failed: {e}"))?;
+
+    let mut nal_data = Vec::new();
+    bitstream.write_vec(&mut nal_data);
+
+    Ok(EncodedFrame {
+        data: Bytes::from(nal_data),
+        is_keyframe: true,
+        width: enc_w,
+        height: enc_h,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +446,45 @@ mod tests {
         let frame = encoder.encode_bgra(&bgra, 64, 64, 64 * 4).unwrap();
         assert!(!frame.data.is_empty());
         assert!(frame.is_keyframe);
+    }
+
+    #[test]
+    fn test_encode_rect_h264_small_rect() {
+        let w = 200u32;
+        let h = 100u32;
+        let stride = w as usize * 4;
+        let bgra = vec![100u8; h as usize * stride];
+        let encoded = encode_rect_h264(&bgra, stride, 10, 5, 50, 30).unwrap();
+        assert!(!encoded.data.is_empty());
+        assert!(encoded.is_keyframe);
+        assert!(encoded.width >= 50);
+        assert!(encoded.height >= 30);
+        // H.264 should be much smaller than raw BGRA (50*30*4 = 6000 bytes)
+        assert!(encoded.data.len() < 6000, "H.264 {} bytes should be < 6000 raw", encoded.data.len());
+    }
+
+    #[test]
+    fn test_encode_rect_h264_odd_dimensions() {
+        let w = 100u32;
+        let h = 100u32;
+        let stride = w as usize * 4;
+        let bgra = vec![128u8; h as usize * stride];
+        // Odd dimensions get aligned to even
+        let encoded = encode_rect_h264(&bgra, stride, 0, 0, 31, 17).unwrap();
+        assert!(!encoded.data.is_empty());
+        assert_eq!(encoded.width % 2, 0);
+        assert_eq!(encoded.height % 2, 0);
+    }
+
+    #[test]
+    fn test_encode_rect_h264_full_frame_as_rect() {
+        let w = 64u32;
+        let h = 64u32;
+        let stride = w as usize * 4;
+        let bgra = vec![200u8; h as usize * stride];
+        let encoded = encode_rect_h264(&bgra, stride, 0, 0, w, h).unwrap();
+        assert!(!encoded.data.is_empty());
+        assert!(encoded.is_keyframe);
     }
 
     #[test]
