@@ -899,3 +899,133 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn make_gfx_state() -> GfxState {
+        let mut gs = GfxState::new(1920, 1080, false);
+        gs.channel_id = Some(2);
+        gs.surface_created = true;
+        gs.caps_confirmed = true;
+        gs.avc420_supported = true;
+        gs.rtt_ewma_ms = 45.0;
+        gs.network_quality = 0.8;
+        gs.last_encode_ms = 12.0;
+        gs.target_bitrate = Some(50_000_000);
+        gs.peer_addr = Some("192.168.1.100".parse().unwrap());
+        gs
+    }
+
+    fn make_keyframe() -> GfxFrameUpdate {
+        GfxFrameUpdate {
+            h264_data: Bytes::from(vec![0u8; 1024]),
+            width: 1920,
+            height: 1080,
+            enc_width: 1920,
+            enc_height: 1088,
+            is_keyframe: true,
+            h264_aux: None,
+        }
+    }
+
+    #[test]
+    fn reset_for_reconnect_preserves_network_stats() {
+        let mut gs = make_gfx_state();
+        gs.reset_for_reconnect(1920, 1080, false);
+
+        // Preserved
+        assert_eq!(gs.rtt_ewma_ms, 45.0);
+        assert_eq!(gs.network_quality, 0.8);
+        assert_eq!(gs.last_encode_ms, 12.0);
+        assert_eq!(gs.target_bitrate, Some(50_000_000));
+        assert!(gs.peer_addr.is_some());
+    }
+
+    #[test]
+    fn reset_for_reconnect_clears_protocol_state() {
+        let mut gs = make_gfx_state();
+        gs.frame_id = 100;
+        gs.pending_acks = 5;
+        gs.total_bytes_sent = 999_999;
+
+        gs.reset_for_reconnect(1920, 1080, false);
+
+        assert!(gs.channel_id.is_none());
+        assert!(!gs.surface_created);
+        assert!(!gs.caps_confirmed);
+        assert!(!gs.avc420_supported);
+        assert_eq!(gs.frame_id, 0);
+        assert_eq!(gs.pending_acks, 0);
+        assert_eq!(gs.total_bytes_sent, 0);
+        assert!(gs.start_time.is_none());
+        assert!(gs.pending_resize.is_none());
+    }
+
+    #[test]
+    fn reset_for_reconnect_preserves_last_keyframe() {
+        let mut gs = make_gfx_state();
+        gs.last_keyframe = Some(make_keyframe());
+
+        gs.reset_for_reconnect(1920, 1080, false);
+
+        assert!(gs.last_keyframe.is_some());
+        assert_eq!(gs.last_keyframe.as_ref().unwrap().width, 1920);
+    }
+
+    #[test]
+    fn create_frame_pdu_caches_keyframe() {
+        let mut gs = GfxState::new(1920, 1080, false);
+        gs.channel_id = Some(2);
+        gs.caps_confirmed = true;
+        gs.avc420_supported = true;
+
+        let frame = make_keyframe();
+        let _ = GfxHandler::create_frame_pdu(&mut gs, &frame);
+
+        assert!(gs.last_keyframe.is_some());
+        assert!(gs.last_keyframe.as_ref().unwrap().is_keyframe);
+    }
+
+    #[test]
+    fn create_frame_pdu_does_not_cache_non_keyframe() {
+        let mut gs = GfxState::new(1920, 1080, false);
+        gs.channel_id = Some(2);
+        gs.caps_confirmed = true;
+        gs.avc420_supported = true;
+
+        let mut frame = make_keyframe();
+        frame.is_keyframe = false;
+        let _ = GfxHandler::create_frame_pdu(&mut gs, &frame);
+
+        assert!(gs.last_keyframe.is_none());
+    }
+
+    #[test]
+    fn create_frame_pdu_updates_cached_keyframe() {
+        let mut gs = GfxState::new(1920, 1080, false);
+        gs.channel_id = Some(2);
+        gs.caps_confirmed = true;
+        gs.avc420_supported = true;
+
+        let frame1 = GfxFrameUpdate {
+            h264_data: Bytes::from(vec![1u8; 512]),
+            is_keyframe: true,
+            ..make_keyframe()
+        };
+        let _ = GfxHandler::create_frame_pdu(&mut gs, &frame1);
+
+        let frame2 = GfxFrameUpdate {
+            h264_data: Bytes::from(vec![2u8; 2048]),
+            is_keyframe: true,
+            ..make_keyframe()
+        };
+        let _ = GfxHandler::create_frame_pdu(&mut gs, &frame2);
+
+        let cached = gs.last_keyframe.as_ref().unwrap();
+        assert_eq!(cached.h264_data.len(), 2048);
+        assert_eq!(cached.h264_data[0], 2);
+    }
+}
