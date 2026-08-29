@@ -1,9 +1,9 @@
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, GfxDirtyH264Update, GfxFrameUpdate,
-    H264Rect, PixelFormat as RdpPixelFormat, PointerPositionAttribute, RdpServerDisplay,
-    RdpServerDisplayUpdates, gfx::GfxState,
+    BitmapUpdate, DesktopSize, DisplayControlMonitorLayout, DisplayUpdate, GfxDirtyH264Update,
+    GfxFrameUpdate, H264Rect, PixelFormat as RdpPixelFormat, PointerPositionAttribute,
+    RdpServerDisplay, RdpServerDisplayUpdates, gfx::GfxState,
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer, get_cursor_position};
@@ -217,6 +217,25 @@ impl RdpServerDisplay for MacDisplay {
         DesktopSize { width: self.width, height: self.height }
     }
 
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        if self.fixed_resolution {
+            tracing::debug!("Ignoring DisplayControl layout — resolution is fixed by config");
+            return;
+        }
+        let primary = layout.monitors().iter().find(|m| m.is_primary());
+        let Some(monitor) = primary else {
+            tracing::warn!("DisplayControl layout has no primary monitor");
+            return;
+        };
+        let (w, h) = monitor.dimensions();
+        let (w, h) = (w as u16, h as u16);
+        if w == self.width && h == self.height {
+            return;
+        }
+        self.request_resize(w, h);
+        self.gfx_state.lock().unwrap().pending_resize = Some((self.width, self.height));
+    }
+
     fn request_resize(&mut self, width: u16, height: u16) {
         if self.fixed_resolution {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
@@ -332,6 +351,10 @@ struct MacDisplayUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        if let Some((w, h)) = self.gfx_state.lock().unwrap().pending_resize.take() {
+            return Ok(Some(DisplayUpdate::Resize(DesktopSize { width: w, height: h })));
+        }
+
         // Send initial DefaultPointer when cursor channel is active
         if self.cursor_interval.is_some() && !self.cursor_initialized {
             self.cursor_initialized = true;

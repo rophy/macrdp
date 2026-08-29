@@ -2,7 +2,7 @@ use core::num::{NonZeroU16, NonZeroUsize};
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+pub use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_graphics::diff;
 pub use ironrdp_pdu::pointer::PointerPositionAttribute;
 use tracing::{debug, warn};

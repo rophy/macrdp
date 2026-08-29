@@ -1,8 +1,8 @@
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, PixelFormat as RdpPixelFormat,
-    RdpServerDisplay, RdpServerDisplayUpdates,
+    BitmapUpdate, DesktopSize, DisplayControlMonitorLayout, DisplayUpdate, GfxFrameUpdate,
+    PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
     gfx::GfxState,
 };
 use macrdp_audio::SharedAudioTx;
@@ -153,6 +153,25 @@ impl RdpServerDisplay for MacDisplay {
         DesktopSize { width: self.width, height: self.height }
     }
 
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        if self.fixed_resolution {
+            tracing::debug!("Ignoring DisplayControl layout — resolution is fixed by config");
+            return;
+        }
+        let primary = layout.monitors().iter().find(|m| m.is_primary());
+        let Some(monitor) = primary else {
+            tracing::warn!("DisplayControl layout has no primary monitor");
+            return;
+        };
+        let (w, h) = monitor.dimensions();
+        let (w, h) = (w as u16, h as u16);
+        if w == self.width && h == self.height {
+            return;
+        }
+        self.apply_resize(w, h, "displaycontrol");
+        self.gfx_state.lock().unwrap().pending_resize = Some((self.width, self.height));
+    }
+
     fn request_resize(&mut self, width: u16, height: u16) {
         if self.fixed_resolution {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
@@ -271,6 +290,10 @@ struct MacDisplayUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        if let Some((w, h)) = self.gfx_state.lock().unwrap().pending_resize.take() {
+            return Ok(Some(DisplayUpdate::Resize(DesktopSize { width: w, height: h })));
+        }
+
         // Drain stale frames — always use the latest available frame.
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).

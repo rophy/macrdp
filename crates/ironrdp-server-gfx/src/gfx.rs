@@ -176,6 +176,8 @@ pub struct GfxState {
     pub encoder_pref: Option<String>,
     /// Hot-updatable: chroma mode (set via ConfigUpdate)
     pub chroma_mode: Option<String>,
+    /// Pending resize from DisplayControl channel (consumed by next_update)
+    pub pending_resize: Option<(u16, u16)>,
 }
 
 impl GfxState {
@@ -210,6 +212,7 @@ impl GfxState {
             resolution: None,
             encoder_pref: None,
             chroma_mode: None,
+            pending_resize: None,
         }
     }
 
