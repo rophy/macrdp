@@ -178,6 +178,8 @@ pub struct GfxState {
     pub chroma_mode: Option<String>,
     /// Pending resize from DisplayControl channel (consumed by next_update)
     pub pending_resize: Option<(u16, u16)>,
+    /// Last keyframe — replayed on reconnect for instant image
+    pub last_keyframe: Option<GfxFrameUpdate>,
 }
 
 impl GfxState {
@@ -213,7 +215,36 @@ impl GfxState {
             encoder_pref: None,
             chroma_mode: None,
             pending_resize: None,
+            last_keyframe: None,
         }
+    }
+
+    /// Reset protocol-facing state for a new connection while preserving
+    /// network quality stats (RTT, bitrate), hot-config fields, and last keyframe.
+    pub fn reset_for_reconnect(&mut self, width: u16, height: u16, avc444_enabled: bool) {
+        self.channel_id = None;
+        self.surface_created = false;
+        self.caps_confirmed = false;
+        self.frame_id = 0;
+        self.avc420_supported = false;
+        self.avc444_supported = false;
+        self.avc444_enabled = avc444_enabled;
+        self.confirmed_cap = None;
+        self.width = width;
+        self.height = height;
+        self.pending_acks = 0;
+        self.last_ack_frame = 0;
+        self.frame_send_times.clear();
+        self.last_frame_bytes = 0;
+        self.total_bytes_sent = 0;
+        self.start_time = None;
+        self.bitrate_samples.clear();
+        self.bitrate_max = 0.0;
+        self.bitrate_min = f64::MAX;
+        self.last_frame_time = None;
+        self.pending_resize = None;
+        // Preserved: rtt_ewma_ms, network_quality, last_encode_ms,
+        //            target_bitrate, show_cursor, resolution, encoder_pref, chroma_mode, peer_addr
     }
 
     pub fn next_frame_id(&mut self) -> u32 {
@@ -449,6 +480,10 @@ impl GfxHandler {
         // EndFrame
         if let Ok(data) = encode_vec(&ServerPdu::EndFrame(EndFramePdu { frame_id })) {
             raw_pdus.extend_from_slice(&data);
+        }
+
+        if frame.is_keyframe {
+            state.last_keyframe = Some(frame.clone());
         }
 
         debug!(

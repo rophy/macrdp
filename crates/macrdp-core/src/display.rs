@@ -92,6 +92,10 @@ pub struct MacDisplay {
     shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
+    /// Shared encoder slot — returned here when a connection ends, reused on reconnect
+    encoder_cache: Arc<std::sync::Mutex<Option<Box<dyn macrdp_encode::VideoEncoder>>>>,
+    /// Resolution the cached encoder was created for
+    cached_encoder_dims: (u16, u16),
 }
 
 impl MacDisplay {
@@ -122,6 +126,8 @@ impl MacDisplay {
             coord_mapper,
             shared_audio_tx,
             perf_stats,
+            encoder_cache: Arc::new(std::sync::Mutex::new(None)),
+            cached_encoder_dims: (0, 0),
         }
     }
 }
@@ -202,16 +208,28 @@ impl RdpServerDisplay for MacDisplay {
             .and_then(|shared| shared.lock().unwrap().clone());
         let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
 
-        // Create H.264 encoder with configured quality and encoder preference
-        let encoder = macrdp_encode::create_encoder(
-            self.width as u32,
-            self.height as u32,
-            self.frame_rate as f32,
-            self.quality,
-            self.encoder_pref,
-            self.mode_444,
-            self.base_bitrate,
-        ).ok();
+        // Reuse cached encoder if resolution hasn't changed, otherwise create new one
+        let encoder = if self.cached_encoder_dims == (self.width, self.height) {
+            let cached = self.encoder_cache.lock().unwrap().take();
+            if let Some(mut enc) = cached {
+                tracing::info!("Reusing cached H.264 encoder from previous connection");
+                enc.force_keyframe();
+                Some(enc)
+            } else {
+                macrdp_encode::create_encoder(
+                    self.width as u32, self.height as u32,
+                    self.frame_rate as f32, self.quality, self.encoder_pref,
+                    self.mode_444, self.base_bitrate,
+                ).ok()
+            }
+        } else {
+            macrdp_encode::create_encoder(
+                self.width as u32, self.height as u32,
+                self.frame_rate as f32, self.quality, self.encoder_pref,
+                self.mode_444, self.base_bitrate,
+            ).ok()
+        };
+        self.cached_encoder_dims = (self.width, self.height);
 
         if encoder.is_some() {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
@@ -231,6 +249,7 @@ impl RdpServerDisplay for MacDisplay {
             capturer,
             capture_config,
             encoder,
+            encoder_cache: Arc::clone(&self.encoder_cache),
             gfx_state: Arc::clone(&self.gfx_state),
             base_bitrate: self.base_bitrate,
             mode_444: self.mode_444,
@@ -243,6 +262,7 @@ impl RdpServerDisplay for MacDisplay {
             bitrate_ctrl,
             last_applied_fps: initial_fps,
             has_pending_submit: false,
+            keyframe_replayed: self.gfx_state.lock().unwrap().last_keyframe.is_none(),
             pending_frame_time: None,
             perf_stats: self.perf_stats.clone(),
         }))
@@ -262,6 +282,8 @@ struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
     encoder: Option<Box<dyn VideoEncoder>>,
+    /// Shared slot to return encoder on drop for reuse across connections
+    encoder_cache: Arc<std::sync::Mutex<Option<Box<dyn VideoEncoder>>>>,
     gfx_state: Arc<Mutex<GfxState>>,
     base_bitrate: u32,
     mode_444: bool,
@@ -281,10 +303,20 @@ struct MacDisplayUpdates {
     last_applied_fps: u32,
     /// Whether a pipelined encode has been submitted and not yet collected.
     has_pending_submit: bool,
+    /// Whether the cached keyframe has been replayed on reconnect
+    keyframe_replayed: bool,
     /// Timestamp of the pending pipelined submit (for encode-time measurement).
     pending_frame_time: Option<Instant>,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
+}
+
+impl Drop for MacDisplayUpdates {
+    fn drop(&mut self) {
+        if let Some(enc) = self.encoder.take() {
+            *self.encoder_cache.lock().unwrap() = Some(enc);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -292,6 +324,19 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         if let Some((w, h)) = self.gfx_state.lock().unwrap().pending_resize.take() {
             return Ok(Some(DisplayUpdate::Resize(DesktopSize { width: w, height: h })));
+        }
+
+        // Replay cached keyframe on reconnect for instant image
+        if !self.keyframe_replayed {
+            let gs = self.gfx_state.lock().unwrap();
+            if gs.is_ready() {
+                self.keyframe_replayed = true;
+                if let Some(frame) = gs.last_keyframe.clone() {
+                    drop(gs);
+                    tracing::info!("Replaying cached keyframe for instant reconnect image");
+                    return Ok(Some(DisplayUpdate::GfxFrame(frame)));
+                }
+            }
         }
 
         // Drain stale frames — always use the latest available frame.

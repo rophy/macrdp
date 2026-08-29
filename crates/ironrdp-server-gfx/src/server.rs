@@ -351,14 +351,14 @@ impl RdpServer {
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         let framed = TokioFramed::new(stream);
 
-        // Reset GFX state for new connection, preserving peer IP and hot-updated resolution
+        // Reset protocol state for new connection, preserving network stats and hot-config
         let pending_resolution = {
             let mut gs = self.gfx_state.lock().unwrap();
             let w = gs.width;
             let h = gs.height;
             let avc444_enabled = gs.avc444_enabled;
             let res = gs.resolution.take();
-            *gs = GfxState::new(w, h, avc444_enabled);
+            gs.reset_for_reconnect(w, h, avc444_enabled);
             gs.peer_addr = peer_ip;
             res
         };
