@@ -1077,8 +1077,10 @@ impl RdpServer {
                         info!(
                             client_w = client_size.width, client_h = client_size.height,
                             server_w = display_size.width, server_h = display_size.height,
-                            "Client requested different resolution (server size wins)"
+                            "Client bitmap capability differs from server — scheduling deferred resize"
                         );
+                        self.display.lock().await.request_resize(client_size.width, client_size.height);
+                        self.gfx_state.lock().unwrap().pending_resize = Some((client_size.width, client_size.height));
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {
