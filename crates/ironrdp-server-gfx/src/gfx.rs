@@ -1101,4 +1101,67 @@ mod tests {
         assert_eq!(cached.h264_data.len(), 2048);
         assert_eq!(cached.h264_data[0], 2);
     }
+
+    #[test]
+    fn multi_monitor_layout_two_monitors() {
+        use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+
+        let primary = MonitorLayoutEntry::new_primary(1920, 1080).unwrap();
+        let secondary = MonitorLayoutEntry::new_secondary(1920, 1080)
+            .unwrap()
+            .with_position(1920, 0)
+            .unwrap();
+        let layout = DisplayControlMonitorLayout::new(&[primary, secondary]).unwrap();
+
+        assert_eq!(layout.monitors().len(), 2);
+        assert!(layout.monitors()[0].is_primary());
+        assert!(!layout.monitors()[1].is_primary());
+        assert_eq!(layout.monitors()[1].position(), Some((1920, 0)));
+    }
+
+    #[test]
+    fn multi_monitor_layout_primary_dimensions() {
+        use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+
+        let primary = MonitorLayoutEntry::new_primary(2560, 1440).unwrap();
+        let secondary = MonitorLayoutEntry::new_secondary(1920, 1080)
+            .unwrap()
+            .with_position(2560, 0)
+            .unwrap();
+        let layout = DisplayControlMonitorLayout::new(&[primary, secondary]).unwrap();
+
+        let primary_mon = layout.monitors().iter().find(|m| m.is_primary()).unwrap();
+        assert_eq!(primary_mon.dimensions(), (2560, 1440));
+    }
+
+    #[test]
+    fn pending_resize_from_multi_monitor_uses_primary() {
+        let gs = Arc::new(Mutex::new(GfxState::new(1920, 1080, false)));
+
+        use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+
+        let primary = MonitorLayoutEntry::new_primary(2560, 1440).unwrap();
+        let secondary = MonitorLayoutEntry::new_secondary(1920, 1080)
+            .unwrap()
+            .with_position(2560, 0)
+            .unwrap();
+        let layout = DisplayControlMonitorLayout::new(&[primary, secondary]).unwrap();
+
+        let primary_mon = layout.monitors().iter().find(|m| m.is_primary()).unwrap();
+        let (w, h) = primary_mon.dimensions();
+        let (w, h) = (w as u16, h as u16);
+
+        {
+            let state = gs.lock().unwrap();
+            assert_ne!((w, h), (state.width, state.height));
+        }
+
+        {
+            let mut state = gs.lock().unwrap();
+            state.pending_resize = Some((w, h));
+        }
+
+        let state = gs.lock().unwrap();
+        assert_eq!(state.pending_resize, Some((2560, 1440)));
+    }
 }

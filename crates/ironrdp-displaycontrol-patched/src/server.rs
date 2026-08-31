@@ -62,3 +62,64 @@ impl DvcProcessor for DisplayControlServer {
 }
 
 impl DvcServerProcessor for DisplayControlServer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestHandler;
+    impl DisplayControlHandler for TestHandler {}
+
+    #[test]
+    fn default_max_monitors_is_one() {
+        let mut server = DisplayControlServer::new(Box::new(TestHandler));
+        let messages = server.start(1).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        let encoded = ironrdp_core::encode_vec(messages[0].as_ref()).unwrap();
+        let pdu: DisplayControlPdu = decode(&encoded).unwrap();
+        match pdu {
+            DisplayControlPdu::Caps(caps) => {
+                assert_eq!(caps.max_monitor_area(), 3840 * 2400);
+            }
+            _ => panic!("expected Caps PDU"),
+        }
+    }
+
+    #[test]
+    fn with_max_monitors_changes_caps() {
+        let mut server = DisplayControlServer::new(Box::new(TestHandler))
+            .with_max_monitors(4);
+        let messages = server.start(1).unwrap();
+        let encoded = ironrdp_core::encode_vec(messages[0].as_ref()).unwrap();
+        let pdu: DisplayControlPdu = decode(&encoded).unwrap();
+        match pdu {
+            DisplayControlPdu::Caps(caps) => {
+                assert_eq!(caps.max_monitor_area(), 3840 * 2400 * 4);
+            }
+            _ => panic!("expected Caps PDU"),
+        }
+    }
+
+    #[test]
+    fn channel_name_is_display_control() {
+        let server = DisplayControlServer::new(Box::new(TestHandler));
+        assert_eq!(server.channel_name(), CHANNEL_NAME);
+    }
+
+    #[test]
+    fn process_monitor_layout_calls_handler() {
+        use crate::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+        use ironrdp_core::encode_vec;
+
+        let primary = MonitorLayoutEntry::new_primary(1920, 1080).unwrap();
+        let layout = DisplayControlMonitorLayout::new(&[primary]).unwrap();
+        let pdu = DisplayControlPdu::MonitorLayout(layout);
+        let payload = encode_vec(&pdu).unwrap();
+
+        let mut server = DisplayControlServer::new(Box::new(TestHandler));
+        let result = server.process(1, &payload);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+}

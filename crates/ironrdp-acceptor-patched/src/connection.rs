@@ -800,3 +800,92 @@ fn create_gcc_blocks(
         multi_transport_channel: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcc_blocks_always_include_dynamic_dst_supported() {
+        let blocks = create_gcc_blocks(1003, vec![], SecurityProtocol::SSL, false);
+        let flags = blocks.core.optional_data.early_capability_flags.unwrap();
+        assert!(flags.contains(gcc::ServerEarlyCapabilityFlags::DYNAMIC_DST_SUPPORTED));
+    }
+
+    #[test]
+    fn gcc_blocks_skip_channel_join_flag() {
+        let blocks = create_gcc_blocks(1003, vec![], SecurityProtocol::SSL, true);
+        let flags = blocks.core.optional_data.early_capability_flags.unwrap();
+        assert!(flags.contains(gcc::ServerEarlyCapabilityFlags::DYNAMIC_DST_SUPPORTED));
+        assert!(flags.contains(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED));
+    }
+
+    #[test]
+    fn gcc_blocks_no_skip_channel_join_when_false() {
+        let blocks = create_gcc_blocks(1003, vec![], SecurityProtocol::SSL, false);
+        let flags = blocks.core.optional_data.early_capability_flags.unwrap();
+        assert!(!flags.contains(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED));
+    }
+
+    #[test]
+    fn set_monitors_overrides_default_layout() {
+        let size = DesktopSize { width: 1920, height: 1080 };
+        let caps = vec![];
+        let mut acceptor = Acceptor::new(SecurityProtocol::SSL, size, caps, None);
+
+        let monitors = vec![
+            gcc::Monitor {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+                flags: gcc::MonitorFlags::PRIMARY,
+            },
+            gcc::Monitor {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+                flags: gcc::MonitorFlags::empty(),
+            },
+        ];
+        acceptor.set_monitors(monitors.clone());
+        assert_eq!(acceptor.monitors.as_ref().unwrap().len(), 2);
+        assert_eq!(acceptor.monitors.as_ref().unwrap()[1].left, 1920);
+    }
+
+    #[test]
+    fn default_monitors_is_none() {
+        let size = DesktopSize { width: 1920, height: 1080 };
+        let acceptor = Acceptor::new(SecurityProtocol::SSL, size, vec![], None);
+        assert!(acceptor.monitors.is_none());
+    }
+
+    #[test]
+    fn deactivation_reactivation_preserves_monitors() {
+        let size = DesktopSize { width: 1920, height: 1080 };
+        let mut acceptor = Acceptor::new(SecurityProtocol::SSL, size, vec![], None);
+        acceptor.set_monitors(vec![
+            gcc::Monitor {
+                left: 0, top: 0, right: 1920, bottom: 1080,
+                flags: gcc::MonitorFlags::PRIMARY,
+            },
+        ]);
+
+        // Simulate state needed for deactivation-reactivation
+        acceptor.saved_for_reactivation = AcceptorState::CapabilitiesSendServer {
+            early_capability: None,
+            channels: vec![],
+        };
+
+        let new_size = DesktopSize { width: 2560, height: 1440 };
+        let reactivated = Acceptor::new_deactivation_reactivation(
+            acceptor,
+            StaticChannelSet::new(),
+            new_size,
+        ).unwrap();
+
+        assert!(reactivated.monitors.is_some());
+        assert_eq!(reactivated.monitors.as_ref().unwrap().len(), 1);
+    }
+}
