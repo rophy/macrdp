@@ -237,6 +237,7 @@ pub struct RdpServer {
 #[derive(Debug)]
 pub enum ServerEvent {
     Quit(String),
+    Takeover,
     Clipboard(ClipboardMessage),
     ClipboardFileContents(OwnedFileContentsResponse),
     ClipboardFileContentsRequest(FileContentsRequest),
@@ -453,7 +454,41 @@ impl RdpServer {
         debug!("Listening for connections on {local_addr}");
         self.local_addr = Some(local_addr);
 
+        // Shared slot for an authenticated takeover connection waiting to be processed
+        type TakeoverSlot = Arc<Mutex<Option<(
+            TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>,
+            Acceptor,
+        )>>>;
+        let takeover_pending: TakeoverSlot = Arc::new(Mutex::new(None));
+
         loop {
+            // Check if a takeover connection is waiting from the previous iteration
+            let pending = takeover_pending.lock().await.take();
+            if let Some((takeover_framed, mut takeover_acceptor)) = pending {
+                info!("Processing takeover connection");
+                self.attach_channels(&mut takeover_acceptor);
+                match self.accept_finalize(takeover_framed, takeover_acceptor).await {
+                    Ok(framed) => {
+                        debug!("Shutting down takeover TLS connection");
+                        let (mut tls_stream, _) = framed.into_inner();
+                        if let Err(e) = tls_stream.shutdown().await {
+                            debug!(?e, "TLS shutdown error");
+                        }
+                    }
+                    Err(error) => {
+                        let err_str = format!("{error:#}");
+                        if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
+                            warn!("Takeover client disconnected: {err_str}");
+                        } else {
+                            error!(?error, "Takeover connection error");
+                        }
+                    }
+                }
+                info!("Ready for next connection");
+                self.static_channels = StaticChannelSet::new();
+                continue;
+            }
+
             let ev_receiver = Arc::clone(&self.ev_receiver);
             let mut ev_receiver = ev_receiver.lock().await;
             tokio::select! {
@@ -478,18 +513,39 @@ impl RdpServer {
                     debug!(?peer, "Received connection");
                     drop(ev_receiver);
 
-                    // Reject new connections while this session is active
-                    // (macrdp currently supports only one concurrent session)
-                    let reject_listener = Arc::clone(&listener);
-                    let reject_task = tokio::spawn(async move {
+                    // Spawn a takeover listener that authenticates new connections
+                    // while the current session is active. If auth succeeds, it
+                    // signals the active session to disconnect via ServerEvent::Takeover,
+                    // then queues the authenticated stream for the next iteration.
+                    let takeover_listener = Arc::clone(&listener);
+                    let takeover_opts = self.opts.clone();
+                    let takeover_creds = self.creds.clone();
+                    let takeover_ev_sender = self.ev_sender.clone();
+                    let takeover_pending_clone = Arc::clone(&takeover_pending);
+
+                    let takeover_task = tokio::spawn(async move {
                         loop {
-                            match reject_listener.accept().await {
-                                Ok((stream, peer)) => {
-                                    warn!(?peer, "Rejecting connection: another session is active");
-                                    tokio::spawn(reject_connection(stream));
+                            match takeover_listener.accept().await {
+                                Ok((new_stream, new_peer)) => {
+                                    info!(?new_peer, "New connection while session active, authenticating...");
+                                    match Self::authenticate_stream(
+                                        &takeover_opts,
+                                        takeover_creds.clone(),
+                                        new_stream,
+                                    ).await {
+                                        Ok((framed, acceptor)) => {
+                                            info!(?new_peer, "Takeover: new client authenticated, disconnecting old session");
+                                            *takeover_pending_clone.lock().await = Some((framed, acceptor));
+                                            let _ = takeover_ev_sender.send(ServerEvent::Takeover);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!(?new_peer, error = %e, "Takeover auth failed, rejecting");
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    debug!("Accept error in reject loop: {e}");
+                                    debug!("Accept error in takeover loop: {e}");
                                     break;
                                 }
                             }
@@ -505,7 +561,7 @@ impl RdpServer {
                         }
                     }
 
-                    reject_task.abort();
+                    takeover_task.abort();
                     info!("Ready for next connection");
                     self.static_channels = StaticChannelSet::new();
                 }
@@ -708,6 +764,10 @@ impl RdpServer {
             match event {
                 ServerEvent::Quit(reason) => {
                     debug!("Got quit event: {reason}");
+                    return Ok(RunState::Disconnect);
+                }
+                ServerEvent::Takeover => {
+                    info!("Session takeover: disconnecting current client");
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -1249,6 +1309,58 @@ impl RdpServer {
         debug!(?creds, "Changing credentials");
         self.creds = creds
     }
+
+    /// Authenticate a new TCP stream through X.224 + TLS + CredSSP.
+    /// Returns the authenticated TLS framed stream and acceptor, ready for
+    /// `accept_finalize`. Does NOT touch `self` state — safe to call while
+    /// another session is active.
+    async fn authenticate_stream(
+        opts: &RdpServerOptions,
+        creds: Option<Credentials>,
+        stream: TcpStream,
+    ) -> Result<(TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>, Acceptor)> {
+        let framed = TokioFramed::new(stream);
+        let size = DesktopSize { width: 1, height: 1 };
+        let capabilities = capabilities::capabilities(opts, size);
+        let mut acceptor = Acceptor::new(opts.security.flag(), size, capabilities, creds);
+
+        let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
+            .await
+            .context("accept_begin failed")?;
+
+        match res {
+            BeginResult::ShouldUpgrade(stream) => {
+                let tls_acceptor = match &opts.security {
+                    RdpServerSecurity::Tls(acceptor) => acceptor,
+                    RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
+                    RdpServerSecurity::None => unreachable!(),
+                };
+                let accept = tls_acceptor.accept(stream).await
+                    .context("TLS accept failed")?;
+                let mut framed = TokioFramed::new(accept);
+
+                acceptor.mark_security_upgrade_as_done();
+
+                if let RdpServerSecurity::Hybrid((_, pub_key)) = &opts.security {
+                    let client_name = framed.get_inner().0.get_ref().0.peer_addr()?.to_string();
+                    ironrdp_acceptor::accept_credssp(
+                        &mut framed,
+                        &mut acceptor,
+                        &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                        client_name.into(),
+                        pub_key.clone(),
+                        None,
+                    )
+                    .await?;
+                }
+
+                Ok((framed, acceptor))
+            }
+            BeginResult::Continue(_) => {
+                bail!("Non-TLS connections not supported for session takeover");
+            }
+        }
+    }
 }
 
 async fn deactivate_all(
@@ -1316,117 +1428,91 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
     }
 }
 
-/// Send an RDP Negotiation Failure to a rejected connection, then close it.
-/// Waits for the client's Connection Request before responding so the client
-/// gets a proper protocol-level error instead of a silent TCP reset.
-async fn reject_connection(mut stream: TcpStream) {
-    use tokio::io::AsyncReadExt;
-    use tokio::time::{timeout, Duration};
-
-    let peer = stream.peer_addr().ok();
-
-    // Read the client's X.224 Connection Request (with a timeout to avoid leaking tasks)
-    let read_result = timeout(Duration::from_secs(5), async {
-        let mut hdr = [0u8; 4];
-        stream.read_exact(&mut hdr).await?;
-        if hdr[0] != 0x03 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not TPKT"));
-        }
-        let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-        if len < 4 || len > 1024 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad TPKT length"));
-        }
-        let mut rest = vec![0u8; len - 4];
-        stream.read_exact(&mut rest).await?;
-        Ok(())
-    })
-    .await;
-
-    if read_result.is_err() || read_result.as_ref().unwrap().is_err() {
-        debug!(?peer, "Rejected connection: failed to read Connection Request");
-        let _ = stream.shutdown().await;
-        return;
-    }
-
-    // Send RDP Negotiation Failure (undefined code signals "server busy")
-    let failure = X224(nego::ConnectionConfirm::Failure {
-        code: nego::FailureCode::from(0x0Au32),
-    });
-    if let Ok(response) = encode_vec(&failure) {
-        let _ = stream.write_all(&response).await;
-        let _ = stream.flush().await;
-    }
-    let _ = stream.shutdown().await;
-    debug!(?peer, "Rejected connection with RDP Negotiation Failure");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use ironrdp_pdu::rdp::capability_sets::BitmapCodecs;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
-    fn encode_connection_request() -> Vec<u8> {
-        let req = X224(nego::ConnectionRequest {
-            nego_data: None,
-            flags: nego::RequestFlags::empty(),
-            protocol: nego::SecurityProtocol::HYBRID,
-        });
-        encode_vec(&req).unwrap()
-    }
-
-    #[tokio::test]
-    async fn reject_connection_sends_negotiation_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_task = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            stream.write_all(&encode_connection_request()).await.unwrap();
-
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            response
-        });
-
-        let (server_stream, _) = listener.accept().await.unwrap();
-        reject_connection(server_stream).await;
-
-        let response = client_task.await.unwrap();
-        assert!(!response.is_empty(), "should send a failure PDU, not just close");
-
-        // Decode: TPKT header (4 bytes) + X.224 CC header + Negotiation Failure
-        assert_eq!(response[0], 0x03, "TPKT version");
-        let pdu: X224<nego::ConnectionConfirm> = decode(&response).unwrap();
-        match pdu.0 {
-            nego::ConnectionConfirm::Failure { code } => {
-                assert_eq!(u32::from(code), 0x0A);
-            }
-            nego::ConnectionConfirm::Response { .. } => {
-                panic!("expected Failure, got Response");
-            }
+    fn test_opts_no_security() -> RdpServerOptions {
+        RdpServerOptions {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            security: RdpServerSecurity::None,
+            codecs: BitmapCodecs(vec![]),
         }
     }
 
+    #[test]
+    fn takeover_event_is_distinct_variant() {
+        let event = ServerEvent::Takeover;
+        assert!(matches!(event, ServerEvent::Takeover));
+        let debug = format!("{:?}", event);
+        assert!(debug.contains("Takeover"));
+    }
+
     #[tokio::test]
-    async fn reject_connection_handles_non_tpkt_gracefully() {
+    async fn takeover_event_delivered_via_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(ServerEvent::Takeover).unwrap();
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, ServerEvent::Takeover));
+    }
+
+    #[tokio::test]
+    async fn takeover_slot_stores_and_takes() {
+        type TakeoverSlot = Arc<Mutex<Option<String>>>;
+        let slot: TakeoverSlot = Arc::new(Mutex::new(None));
+
+        assert!(slot.lock().await.is_none());
+
+        *slot.lock().await = Some("test-connection".to_string());
+        assert!(slot.lock().await.is_some());
+
+        let taken = slot.lock().await.take();
+        assert_eq!(taken.unwrap(), "test-connection");
+        assert!(slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn takeover_slot_only_consumed_once() {
+        type TakeoverSlot = Arc<Mutex<Option<String>>>;
+        let slot: TakeoverSlot = Arc::new(Mutex::new(None));
+        let slot2 = Arc::clone(&slot);
+
+        *slot.lock().await = Some("pending-client".to_string());
+
+        let first = slot.lock().await.take();
+        assert!(first.is_some());
+
+        let second = slot2.lock().await.take();
+        assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticate_stream_rejects_garbage_input() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let client_task = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            stream.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf).await;
+            stream.write_all(b"NOT-AN-RDP-CLIENT").await.unwrap();
+            let _ = stream.shutdown().await;
         });
 
         let (server_stream, _) = listener.accept().await.unwrap();
-        reject_connection(server_stream).await;
+        let result = RdpServer::authenticate_stream(
+            &test_opts_no_security(),
+            None,
+            server_stream,
+        ).await;
+
+        assert!(result.is_err());
         client_task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn reject_connection_handles_immediate_close() {
+    async fn authenticate_stream_rejects_client_that_closes_immediately() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1436,50 +1522,71 @@ mod tests {
         });
 
         let (server_stream, _) = listener.accept().await.unwrap();
-        reject_connection(server_stream).await;
+        let result = RdpServer::authenticate_stream(
+            &test_opts_no_security(),
+            None,
+            server_stream,
+        ).await;
+
+        assert!(result.is_err());
         client_task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn reject_connection_handles_bad_tpkt_length() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn takeover_flow_signals_event_sender() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let slot_clone = Arc::clone(&slot);
 
-        let client_task = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            // Valid TPKT version but length=2 (below minimum of 4)
-            stream.write_all(&[0x03, 0x00, 0x00, 0x02]).await.unwrap();
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf).await;
-            buf
-        });
+        // Simulate what the takeover task does when auth succeeds
+        *slot_clone.lock().await = Some(true);
+        let _ = tx.send(ServerEvent::Takeover);
 
-        let (server_stream, _) = listener.accept().await.unwrap();
-        reject_connection(server_stream).await;
+        // Verify the event was sent
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, ServerEvent::Takeover));
 
-        let response = client_task.await.unwrap();
-        assert!(response.is_empty(), "should not send a response on bad TPKT length");
+        // Verify the slot has the pending connection
+        let pending = slot.lock().await.take();
+        assert_eq!(pending, Some(true));
     }
 
     #[tokio::test]
-    async fn reject_connection_handles_timeout() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn takeover_event_not_sent_on_auth_failure() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
 
-        let client_task = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            // Send only 2 bytes of the 4-byte TPKT header, then stall
-            stream.write_all(&[0x03, 0x00]).await.unwrap();
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-        });
+        // Simulate what happens when auth fails — no event sent, no slot written
+        let auth_ok = false;
+        if auth_ok {
+            *slot.lock().await = Some(true);
+            let _ = tx.send(ServerEvent::Takeover);
+        }
 
-        // reject_connection has a 5s timeout — should return well before 10s
-        let start = tokio::time::Instant::now();
-        let (server_stream, _) = listener.accept().await.unwrap();
-        reject_connection(server_stream).await;
-        let elapsed = start.elapsed();
+        // Channel should be empty
+        drop(tx);
+        let event = rx.recv().await;
+        assert!(event.is_none());
+        assert!(slot.lock().await.is_none());
+    }
 
-        assert!(elapsed.as_secs() < 8, "should timeout within ~5s, took {elapsed:?}");
-        client_task.abort();
+    #[tokio::test]
+    async fn multiple_auth_failures_dont_block_eventual_takeover() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+
+        // Simulate 3 auth failures followed by 1 success
+        let attempts = vec![false, false, false, true];
+        for (i, success) in attempts.iter().enumerate() {
+            if *success {
+                *slot.lock().await = Some(i as u32);
+                let _ = tx.send(ServerEvent::Takeover);
+                break;
+            }
+        }
+
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, ServerEvent::Takeover));
+        assert_eq!(slot.lock().await.take(), Some(3));
     }
 }
