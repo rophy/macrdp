@@ -1077,11 +1077,7 @@ impl RdpServer {
                         info!(
                             client_w = client_size.width, client_h = client_size.height,
                             server_w = display_size.width, server_h = display_size.height,
-                            "Client requested different resolution"
-                        );
-                        // Adopt client resolution via request_resize
-                        self.display.lock().await.request_resize(
-                            client_size.width, client_size.height,
+                            "Client requested different resolution (server size wins)"
                         );
                     }
                 }
