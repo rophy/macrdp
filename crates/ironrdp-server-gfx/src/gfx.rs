@@ -904,6 +904,7 @@ impl DvcServerProcessor for GfxHandler {}
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 
     fn make_gfx_state() -> GfxState {
         let mut gs = GfxState::new(1920, 1080, false);
@@ -1001,6 +1002,78 @@ mod tests {
         let _ = GfxHandler::create_frame_pdu(&mut gs, &frame);
 
         assert!(gs.last_keyframe.is_none());
+    }
+
+    #[test]
+    fn pending_resize_set_when_layout_differs() {
+        let gs = Arc::new(Mutex::new(GfxState::new(1920, 1080, false)));
+
+        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(
+            2560, 1440, None, None,
+        ).expect("valid layout");
+
+        // Simulate the request_layout pattern from macrdp display implementations:
+        // find primary monitor, compare dimensions, set pending_resize if different
+        {
+            let primary = layout.monitors().iter().find(|m| m.is_primary());
+            let monitor = primary.expect("has primary");
+            let (w, h) = monitor.dimensions();
+            let (w, h) = (w as u16, h as u16);
+            let mut state = gs.lock().expect("lock");
+            assert_ne!((w, h), (state.width, state.height));
+            state.width = w;
+            state.height = h;
+            state.pending_resize = Some((w, h));
+        }
+
+        let state = gs.lock().expect("lock");
+        assert_eq!(state.pending_resize, Some((2560, 1440)));
+        assert_eq!(state.width, 2560);
+        assert_eq!(state.height, 1440);
+    }
+
+    #[test]
+    fn pending_resize_not_set_when_layout_matches() {
+        let gs = Arc::new(Mutex::new(GfxState::new(1920, 1080, false)));
+
+        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(
+            1920, 1080, None, None,
+        ).expect("valid layout");
+
+        {
+            let primary = layout.monitors().iter().find(|m| m.is_primary());
+            let monitor = primary.expect("has primary");
+            let (w, h) = monitor.dimensions();
+            let (w, h) = (w as u16, h as u16);
+            let state = gs.lock().expect("lock");
+            // Same dimensions — no resize needed
+            assert_eq!((w, h), (state.width, state.height));
+        }
+
+        let state = gs.lock().expect("lock");
+        assert!(state.pending_resize.is_none());
+    }
+
+    #[test]
+    fn pending_resize_consumed_after_read() {
+        let mut gs = GfxState::new(1920, 1080, false);
+        gs.pending_resize = Some((2560, 1440));
+
+        let resize = gs.pending_resize.take();
+        assert_eq!(resize, Some((2560, 1440)));
+        assert!(gs.pending_resize.is_none());
+    }
+
+    #[test]
+    fn display_control_layout_roundtrip() {
+        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(
+            3840, 2160, None, None,
+        ).expect("valid 4K layout");
+
+        let monitors = layout.monitors();
+        assert_eq!(monitors.len(), 1);
+        assert!(monitors[0].is_primary());
+        assert_eq!(monitors[0].dimensions(), (3840, 2160));
     }
 
     #[test]
