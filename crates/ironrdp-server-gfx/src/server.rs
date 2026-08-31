@@ -523,6 +523,7 @@ impl RdpServer {
                     let takeover_creds = self.creds.clone();
                     let takeover_ev_sender = self.ev_sender.clone();
                     let takeover_pending_clone = Arc::clone(&takeover_pending);
+                    let takeover_desktop_size = self.display.lock().await.size().await;
 
                     let takeover_task = tokio::spawn(async move {
                         loop {
@@ -533,6 +534,7 @@ impl RdpServer {
                                         &takeover_opts,
                                         takeover_creds.clone(),
                                         new_stream,
+                                        takeover_desktop_size,
                                     ).await {
                                         Ok((framed, acceptor)) => {
                                             info!(?new_peer, "Takeover: new client authenticated, disconnecting old session");
@@ -1352,9 +1354,10 @@ impl RdpServer {
         opts: &RdpServerOptions,
         creds: Option<Credentials>,
         stream: TcpStream,
+        desktop_size: DesktopSize,
     ) -> Result<(TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>, Acceptor)> {
         let framed = TokioFramed::new(stream);
-        let size = DesktopSize { width: 1, height: 1 };
+        let size = desktop_size;
         let capabilities = capabilities::capabilities(opts, size);
         let mut acceptor = Acceptor::new(opts.security.flag(), size, capabilities, creds);
 
@@ -1606,6 +1609,7 @@ mod tests {
             &test_opts_no_security(),
             None,
             server_stream,
+            DesktopSize { width: 1920, height: 1080 },
         ).await;
 
         assert!(result.is_err());
@@ -1627,6 +1631,7 @@ mod tests {
             &test_opts_no_security(),
             None,
             server_stream,
+            DesktopSize { width: 1920, height: 1080 },
         ).await;
 
         assert!(result.is_err());
