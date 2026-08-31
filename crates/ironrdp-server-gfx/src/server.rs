@@ -1047,6 +1047,36 @@ impl RdpServer {
             .await?;
         }
 
+        // Check bitmap capability for resolution mismatch BEFORE starting
+        // channels. If the client wants a different size, resize the display
+        // and trigger deactivation-reactivation so the client gets a new
+        // Demand Active with the correct desktop size.
+        if !result.reactivation {
+            for c in &result.capabilities {
+                if let CapabilitySet::Bitmap(b) = c {
+                    let client_size = DesktopSize {
+                        width: b.desktop_width,
+                        height: b.desktop_height,
+                    };
+                    let display_size = self.display.lock().await.size().await;
+
+                    if client_size.width != display_size.width || client_size.height != display_size.height {
+                        info!(
+                            client_w = client_size.width, client_h = client_size.height,
+                            server_w = display_size.width, server_h = display_size.height,
+                            "Client resolution mismatch — resize and reactivate before DVC setup"
+                        );
+                        self.display.lock().await.request_resize(client_size.width, client_size.height);
+                        let new_size = self.display.lock().await.size().await;
+                        self.static_channels = result.static_channels;
+                        deactivate_all(result.io_channel_id, result.user_channel_id, writer).await?;
+                        return Ok(RunState::DeactivationReactivation { desktop_size: new_size });
+                    }
+                    break;
+                }
+            }
+        }
+
         self.static_channels = result.static_channels;
         if !self.channels_started {
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
@@ -1071,15 +1101,8 @@ impl RdpServer {
                         bail!("Fastpath output not supported!");
                     }
                 }
-                CapabilitySet::Bitmap(b) => {
-                    let display_size = self.display.lock().await.size().await;
-                    if b.desktop_width != display_size.width || b.desktop_height != display_size.height {
-                        info!(
-                            client_w = b.desktop_width, client_h = b.desktop_height,
-                            server_w = display_size.width, server_h = display_size.height,
-                            "Client requested different resolution — server size wins (physical display)"
-                        );
-                    }
+                CapabilitySet::Bitmap(_) => {
+                    // Handled above before channel start
                 }
                 CapabilitySet::SurfaceCommands(c) => {
                     surface_flags = c.flags;
