@@ -881,7 +881,21 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = self.display.lock().await.updates().await?;
+        let display_updates_result = self.display.lock().await.updates().await;
+        let mut display_updates = match display_updates_result {
+            Ok(updates) => updates,
+            Err(e) => {
+                let err_str = format!("{e:#}");
+                if err_str.contains("Screen Recording") || err_str.contains("declined TCCs") || err_str.contains("shareable content") {
+                    warn!("Screen capture permission denied, sending error to client");
+                    let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+                        rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
+                    );
+                    let _ = send_error_info(io_channel_id, user_channel_id, writer, error_info).await;
+                }
+                return Err(e);
+            }
+        };
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -1363,6 +1377,36 @@ impl RdpServer {
     }
 }
 
+async fn send_error_info(
+    io_channel_id: u16,
+    user_channel_id: u16,
+    writer: &mut impl FramedWrite,
+    error_info: rdp::server_error_info::ErrorInfo,
+) -> Result<(), anyhow::Error> {
+    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(
+        rdp::server_error_info::ServerSetErrorInfoPdu(error_info),
+    );
+    let pdu = rdp::headers::ShareControlHeader {
+        share_id: 0,
+        pdu_source: io_channel_id,
+        share_control_pdu: ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+            share_data_pdu: pdu,
+            stream_priority: rdp::headers::StreamPriority::Low,
+            compression_flags: rdp::headers::CompressionFlags::empty(),
+            compression_type: rdp::client_info::CompressionType::K8,
+        }),
+    };
+    let user_data = encode_vec(&pdu)?.into();
+    let pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: io_channel_id,
+        user_data,
+    };
+    let msg = encode_vec(&X224(pdu))?;
+    writer.write_all(&msg).await?;
+    Ok(())
+}
+
 async fn deactivate_all(
     io_channel_id: u16,
     user_channel_id: u16,
@@ -1588,5 +1632,26 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert!(matches!(event, ServerEvent::Takeover));
         assert_eq!(slot.lock().await.take(), Some(3));
+    }
+
+    #[test]
+    fn error_info_pdu_encodes_correctly() {
+        let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+            rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
+        );
+        let pdu = rdp::server_error_info::ServerSetErrorInfoPdu(error_info);
+        let encoded = encode_vec(&pdu).unwrap();
+        // ErrorInfo is a u32 = 0x00000009
+        assert_eq!(encoded, [0x09, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn error_info_description_is_meaningful() {
+        let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+            rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
+        );
+        let desc = error_info.description();
+        assert!(desc.contains("insufficient") || desc.contains("privileges"),
+            "description should mention privileges: {desc}");
     }
 }
