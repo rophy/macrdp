@@ -231,6 +231,7 @@ pub struct RdpServer {
     local_addr: Option<SocketAddr>,
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
+    max_monitors: u32,
 }
 
 #[derive(Debug)]
@@ -289,6 +290,7 @@ impl RdpServer {
             local_addr: None,
             gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false))),
             gfx_enabled: true,
+            max_monitors: 1,
         }
     }
 
@@ -305,6 +307,10 @@ impl RdpServer {
     /// Enable or disable GFX H.264 channel
     pub fn set_gfx_enabled(&mut self, enabled: bool) {
         self.gfx_enabled = enabled;
+    }
+
+    pub fn set_max_monitors(&mut self, max: u32) {
+        self.max_monitors = max;
     }
 
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
@@ -335,7 +341,10 @@ impl RdpServer {
             .with_dynamic_channel(AInputHandler {
                 handler: Arc::clone(&self.handler),
             })
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+            .with_dynamic_channel(
+                DisplayControlServer::new(Box::new(dcs_backend))
+                    .with_max_monitors(self.max_monitors),
+            );
 
         // Only register GFX channel if GFX frame sending is enabled
         if self.gfx_enabled {

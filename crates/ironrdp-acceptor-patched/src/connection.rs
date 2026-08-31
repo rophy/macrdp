@@ -35,6 +35,7 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     reactivation: bool,
+    monitors: Option<Vec<gcc::Monitor>>,
 }
 
 #[derive(Debug)]
@@ -65,6 +66,7 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             reactivation: false,
+            monitors: None,
         }
     }
 
@@ -106,6 +108,7 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             reactivation: true,
+            monitors: consumed.monitors,
         })
     }
 
@@ -114,6 +117,10 @@ impl Acceptor {
         T: SvcServerProcessor + 'static,
     {
         self.static_channels.insert(channel);
+    }
+
+    pub fn set_monitors(&mut self, monitors: Vec<gcc::Monitor>) {
+        self.monitors = Some(monitors);
     }
 
     pub fn reached_security_upgrade(&self) -> Option<SecurityProtocol> {
@@ -643,15 +650,19 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::MonitorLayoutSend { channels } => {
+                let monitors = self.monitors.clone().unwrap_or_else(|| {
+                    vec![gcc::Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(self.desktop_size.width),
+                        bottom: i32::from(self.desktop_size.height),
+                        flags: gcc::MonitorFlags::PRIMARY,
+                    }]
+                });
+
                 let monitor_layout =
                     rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
-                        monitors: vec![gcc::Monitor {
-                            left: 0,
-                            top: 0,
-                            right: i32::from(self.desktop_size.width),
-                            bottom: i32::from(self.desktop_size.height),
-                            flags: gcc::MonitorFlags::PRIMARY,
-                        }],
+                        monitors,
                     });
 
                 debug!(message = ?monitor_layout, "Send");
@@ -767,13 +778,17 @@ fn create_gcc_blocks(
     requested: SecurityProtocol,
     skip_channel_join: bool,
 ) -> gcc::ServerGccBlocks {
+    let mut flags = gcc::ServerEarlyCapabilityFlags::DYNAMIC_DST_SUPPORTED;
+    if skip_channel_join {
+        flags |= gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED;
+    }
+
     gcc::ServerGccBlocks {
         core: gcc::ServerCoreData {
             version: gcc::RdpVersion::V5_PLUS,
             optional_data: gcc::ServerCoreOptionalData {
                 client_requested_protocols: Some(requested),
-                early_capability_flags: skip_channel_join
-                    .then_some(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED),
+                early_capability_flags: Some(flags),
             },
         },
         security: gcc::ServerSecurityData::no_security(),

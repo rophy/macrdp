@@ -227,6 +227,12 @@ async fn main() -> Result<()> {
     // Share GFX state with the server
     server.set_gfx_state(gfx_state);
 
+    // Multi-monitor support
+    if let Some(max) = config.max_monitors {
+        server.set_max_monitors(max);
+        tracing::info!(max_monitors = max, "Multi-monitor support configured");
+    }
+
     // Set credentials — required for RDP authentication
     let (username, password) = match (&config.username, &config.password) {
         (Some(u), Some(p)) => (u.clone(), p.clone()),

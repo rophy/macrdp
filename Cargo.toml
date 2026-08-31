@@ -15,6 +15,7 @@ members = [
 [patch.crates-io]
 ironrdp-server = { path = "crates/ironrdp-server-gfx" }
 ironrdp-acceptor = { path = "crates/ironrdp-acceptor-patched" }
+ironrdp-displaycontrol = { path = "crates/ironrdp-displaycontrol-patched" }
 
 [workspace.package]
 edition = "2021"

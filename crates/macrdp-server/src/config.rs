@@ -116,6 +116,8 @@ pub struct ServerConfig {
     /// Clipboard synchronization configuration
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    /// Maximum number of monitors to advertise (default: auto-detect)
+    pub max_monitors: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -142,6 +144,7 @@ impl Default for ServerConfig {
             idle_keyframe_sec: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
+            max_monitors: None,
         }
     }
 }
