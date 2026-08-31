@@ -1,5 +1,6 @@
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
@@ -56,6 +57,29 @@ impl MouseCoordMapper {
     }
 }
 
+/// Tracks the last cursor position injected by client input.
+/// Used by the display cursor poll to suppress echoes of client-initiated moves.
+#[derive(Clone)]
+pub struct LastInjectedPos {
+    packed: Arc<AtomicU32>,
+}
+
+impl LastInjectedPos {
+    pub fn new() -> Self {
+        Self { packed: Arc::new(AtomicU32::new(0)) }
+    }
+
+    pub fn set(&self, x: u16, y: u16) {
+        let val = (x as u32) << 16 | y as u32;
+        self.packed.store(val, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> (u16, u16) {
+        let val = self.packed.load(Ordering::Relaxed);
+        ((val >> 16) as u16, val as u16)
+    }
+}
+
 /// Bridges RDP input events to macOS CGEvent injection
 pub struct MacInputHandler {
     keyboard: Option<KeyboardInjector>,
@@ -65,10 +89,11 @@ pub struct MacInputHandler {
     last_rdp_x: u16,
     last_rdp_y: u16,
     coord_mapper: MouseCoordMapper,
+    last_injected: LastInjectedPos,
 }
 
 impl MacInputHandler {
-    pub fn new(coord_mapper: MouseCoordMapper) -> Self {
+    pub fn new(coord_mapper: MouseCoordMapper, last_injected: LastInjectedPos) -> Self {
         let keyboard = KeyboardInjector::new()
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -90,6 +115,7 @@ impl MacInputHandler {
             last_rdp_x: 0,
             last_rdp_y: 0,
             coord_mapper,
+            last_injected,
         }
     }
 }
@@ -124,6 +150,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.last_mouse_y = my;
                 self.last_rdp_x = x;
                 self.last_rdp_y = y;
+                self.last_injected.set(mx, my);
                 m.move_to(mx, my)
             }
             MouseEvent::LeftPressed => {

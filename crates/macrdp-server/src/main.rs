@@ -151,8 +151,11 @@ async fn main() -> Result<()> {
     // Create shared GFX state
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
 
+    // Shared last-injected position for cursor echo suppression
+    let last_injected = handler::LastInjectedPos::new();
+
     // Create input handler with coordinate mapper
-    let input_handler = MacInputHandler::new(coord_mapper.clone());
+    let input_handler = MacInputHandler::new(coord_mapper.clone(), last_injected.clone());
 
     // Audio setup — shared sender slot, recreated per connection by AudioFactory
     let shared_audio_tx = if config.audio.enabled {
@@ -209,7 +212,7 @@ async fn main() -> Result<()> {
     if cursor_channel {
         tracing::info!("Cursor channel enabled — cursor sent via RDP pointer PDUs");
     }
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone());
+    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone(), last_injected);
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 

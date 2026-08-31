@@ -11,7 +11,7 @@ use macrdp_encode::{self, Quality, VideoEncoder, encode_rect_h264};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
-use crate::handler::MouseCoordMapper;
+use crate::handler::{LastInjectedPos, MouseCoordMapper};
 use crate::perf_stats::SharedPerfStats;
 
 /// Maximum tile size for bitmap updates
@@ -179,6 +179,8 @@ pub struct MacDisplay {
     encoder_cache: Arc<std::sync::Mutex<Option<Box<dyn macrdp_encode::VideoEncoder>>>>,
     /// Resolution the cached encoder was created for
     cached_encoder_dims: (u16, u16),
+    /// Last cursor position injected by client input (shared with input handler)
+    last_injected: LastInjectedPos,
 }
 
 impl MacDisplay {
@@ -194,6 +196,7 @@ impl MacDisplay {
         coord_mapper: MouseCoordMapper,
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
+        last_injected: LastInjectedPos,
     ) -> Self {
         let base_bitrate = bitrate_override
             .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
@@ -213,6 +216,7 @@ impl MacDisplay {
             perf_stats,
             encoder_cache: Arc::new(std::sync::Mutex::new(None)),
             cached_encoder_dims: (0, 0),
+            last_injected,
         }
     }
 }
@@ -336,6 +340,7 @@ impl RdpServerDisplay for MacDisplay {
             keyframe_replayed: self.gfx_state.lock().unwrap().last_keyframe.is_none(),
             last_applied_bitrate: self.base_bitrate,
             progressive: ProgressiveRamp::new(),
+            last_injected: self.last_injected.clone(),
         }))
     }
 }
@@ -370,6 +375,8 @@ struct MacDisplayUpdates {
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
     last_applied_bitrate: u32,
     progressive: ProgressiveRamp,
+    /// Last cursor position injected by client input (shared with input handler)
+    last_injected: LastInjectedPos,
 }
 
 impl Drop for MacDisplayUpdates {
@@ -427,6 +434,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     let (x, y) = get_cursor_position();
                     if (x, y) != self.last_cursor_pos {
                         self.last_cursor_pos = (x, y);
+                        // Suppress echo: if cursor is at the position we just injected
+                        // from client input, this is the client's own move echoed back.
+                        if (x, y) == self.last_injected.get() {
+                            continue;
+                        }
                         return Ok(Some(DisplayUpdate::PointerPosition(
                             PointerPositionAttribute { x, y }
                         )));
