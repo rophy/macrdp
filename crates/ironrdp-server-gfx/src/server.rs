@@ -232,6 +232,7 @@ pub struct RdpServer {
     gfx_state: Arc<std::sync::Mutex<GfxState>>,
     gfx_enabled: bool,
     max_monitors: u32,
+    channels_started: bool,
 }
 
 #[derive(Debug)]
@@ -292,6 +293,7 @@ impl RdpServer {
             gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false))),
             gfx_enabled: true,
             max_monitors: 1,
+            channels_started: false,
         }
     }
 
@@ -360,6 +362,8 @@ impl RdpServer {
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
         let peer_ip = stream.peer_addr().map(|addr| addr.ip()).ok();
         let framed = TokioFramed::new(stream);
+
+        self.channels_started = false;
 
         // Reset protocol state for new connection, preserving network stats and hot-config
         let pending_resolution = {
@@ -1043,8 +1047,38 @@ impl RdpServer {
             .await?;
         }
 
-        self.static_channels = result.static_channels;
+        // Check bitmap capability for resolution mismatch BEFORE starting
+        // channels. If the client wants a different size, trigger
+        // deactivation-reactivation now — before DVC channels are set up —
+        // so the client gets a new Demand Active with the correct desktop size.
         if !result.reactivation {
+            for c in &result.capabilities {
+                if let CapabilitySet::Bitmap(b) = c {
+                    let client_size = DesktopSize {
+                        width: b.desktop_width,
+                        height: b.desktop_height,
+                    };
+                    let display_size = self.display.lock().await.size().await;
+
+                    if client_size.width != display_size.width || client_size.height != display_size.height {
+                        info!(
+                            client_w = client_size.width, client_h = client_size.height,
+                            server_w = display_size.width, server_h = display_size.height,
+                            "Client resolution mismatch — resize and reactivate before DVC setup"
+                        );
+                        self.display.lock().await.request_resize(client_size.width, client_size.height);
+                        let new_size = self.display.lock().await.size().await;
+                        self.static_channels = result.static_channels;
+                        deactivate_all(result.io_channel_id, result.user_channel_id, writer).await?;
+                        return Ok(RunState::DeactivationReactivation { desktop_size: new_size });
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.static_channels = result.static_channels;
+        if !self.channels_started {
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
@@ -1054,6 +1088,7 @@ impl RdpServer {
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
             }
+            self.channels_started = true;
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();
@@ -1066,22 +1101,8 @@ impl RdpServer {
                         bail!("Fastpath output not supported!");
                     }
                 }
-                CapabilitySet::Bitmap(b) => {
-                    let client_size = DesktopSize {
-                        width: b.desktop_width,
-                        height: b.desktop_height,
-                    };
-                    let display_size = self.display.lock().await.size().await;
-
-                    if client_size.width != display_size.width || client_size.height != display_size.height {
-                        info!(
-                            client_w = client_size.width, client_h = client_size.height,
-                            server_w = display_size.width, server_h = display_size.height,
-                            "Client bitmap capability differs from server — scheduling deferred resize"
-                        );
-                        self.display.lock().await.request_resize(client_size.width, client_size.height);
-                        self.gfx_state.lock().unwrap().pending_resize = Some((client_size.width, client_size.height));
-                    }
+                CapabilitySet::Bitmap(_) => {
+                    // Already handled above
                 }
                 CapabilitySet::SurfaceCommands(c) => {
                     surface_flags = c.flags;
