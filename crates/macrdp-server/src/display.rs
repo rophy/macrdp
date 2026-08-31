@@ -341,6 +341,7 @@ impl RdpServerDisplay for MacDisplay {
             last_applied_bitrate: self.base_bitrate,
             progressive: ProgressiveRamp::new(),
             last_injected: self.last_injected.clone(),
+            coord_mapper: self.coord_mapper.clone(),
         }))
     }
 }
@@ -377,6 +378,8 @@ struct MacDisplayUpdates {
     progressive: ProgressiveRamp,
     /// Last cursor position injected by client input (shared with input handler)
     last_injected: LastInjectedPos,
+    /// Coordinate mapper for CG→RDP conversion of cursor position
+    coord_mapper: MouseCoordMapper,
 }
 
 impl Drop for MacDisplayUpdates {
@@ -439,8 +442,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         if (x, y) == self.last_injected.get() {
                             continue;
                         }
+                        // Map CG logical coords to RDP desktop coords
+                        let (rx, ry) = self.coord_mapper.map_to_rdp(x, y);
                         return Ok(Some(DisplayUpdate::PointerPosition(
-                            PointerPositionAttribute { x, y }
+                            PointerPositionAttribute { x: rx, y: ry }
                         )));
                     }
                     continue;

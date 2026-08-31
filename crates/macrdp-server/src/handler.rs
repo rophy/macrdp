@@ -42,6 +42,22 @@ impl MouseCoordMapper {
         (mac_x, mac_y)
     }
 
+    /// Reverse map: CG logical coords → RDP desktop coords
+    pub fn map_to_rdp(&self, cg_x: u16, cg_y: u16) -> (u16, u16) {
+        let s = self.0.lock().unwrap();
+        let rdp_x = (cg_x as f64 * s.rdp_w / s.logical_w).round() as u16;
+        let rdp_y = (cg_y as f64 * s.rdp_h / s.logical_h).round() as u16;
+        (rdp_x, rdp_y)
+    }
+
+    /// Reverse map: CG logical coords → RDP desktop coords
+    pub fn map_to_rdp(&self, cg_x: u16, cg_y: u16) -> (u16, u16) {
+        let s = self.0.lock().unwrap();
+        let rdp_x = (cg_x as f64 * s.rdp_w / s.logical_w).round() as u16;
+        let rdp_y = (cg_y as f64 * s.rdp_h / s.logical_h).round() as u16;
+        (rdp_x, rdp_y)
+    }
+
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
         let old_w = s.rdp_w;
