@@ -62,6 +62,8 @@ pub struct MacInputHandler {
     mouse: Option<MouseInjector>,
     last_mouse_x: u16,
     last_mouse_y: u16,
+    last_rdp_x: u16,
+    last_rdp_y: u16,
     coord_mapper: MouseCoordMapper,
 }
 
@@ -85,6 +87,8 @@ impl MacInputHandler {
             mouse,
             last_mouse_x: 0,
             last_mouse_y: 0,
+            last_rdp_x: 0,
+            last_rdp_y: 0,
             coord_mapper,
         }
     }
@@ -118,9 +122,16 @@ impl RdpServerInputHandler for MacInputHandler {
                 let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
+                self.last_rdp_x = x;
+                self.last_rdp_y = y;
                 m.move_to(mx, my)
             }
             MouseEvent::LeftPressed => {
+                tracing::debug!(
+                    rdp_x = self.last_rdp_x, rdp_y = self.last_rdp_y,
+                    mac_x = self.last_mouse_x, mac_y = self.last_mouse_y,
+                    "Mouse click (left down)"
+                );
                 m.button_event(MouseButton::Left, true, self.last_mouse_x, self.last_mouse_y)
             }
             MouseEvent::LeftReleased => {
