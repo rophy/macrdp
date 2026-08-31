@@ -466,6 +466,14 @@ impl RdpServer {
             let pending = takeover_pending.lock().await.take();
             if let Some((takeover_framed, mut takeover_acceptor)) = pending {
                 info!("Processing takeover connection");
+                // Reset GFX state so the new client can negotiate fresh capabilities
+                {
+                    let mut gs = self.gfx_state.lock().unwrap();
+                    let w = gs.width;
+                    let h = gs.height;
+                    let avc444_enabled = gs.avc444_enabled;
+                    gs.reset_for_reconnect(w, h, avc444_enabled);
+                }
                 self.attach_channels(&mut takeover_acceptor);
                 match self.accept_finalize(takeover_framed, takeover_acceptor).await {
                     Ok(framed) => {
