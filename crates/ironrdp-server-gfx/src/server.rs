@@ -753,6 +753,7 @@ impl RdpServer {
         &mut self,
         events: &mut Vec<ServerEvent>,
         writer: &mut impl FramedWrite,
+        io_channel_id: u16,
         user_channel_id: u16,
     ) -> Result<RunState> {
         // Avoid wave message queuing up and causing extra delays.
@@ -764,10 +765,18 @@ impl RdpServer {
             match event {
                 ServerEvent::Quit(reason) => {
                     debug!("Got quit event: {reason}");
+                    let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+                        rdp::server_error_info::ProtocolIndependentCode::RpcInitiatedDisconnect,
+                    );
+                    let _ = send_graceful_disconnect(io_channel_id, user_channel_id, writer, error_info).await;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::Takeover => {
                     info!("Session takeover: disconnecting current client");
+                    let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+                        rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
+                    );
+                    let _ = send_graceful_disconnect(io_channel_id, user_channel_id, writer, error_info).await;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -891,7 +900,7 @@ impl RdpServer {
                     let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
                         rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
                     );
-                    let _ = send_error_info(io_channel_id, user_channel_id, writer, error_info).await;
+                    let _ = send_graceful_disconnect(io_channel_id, user_channel_id, writer, error_info).await;
                 }
                 return Err(e);
             }
@@ -982,7 +991,7 @@ impl RdpServer {
                 }
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_server_events(&mut events, &mut event_writer, user_channel_id)
+                    .dispatch_server_events(&mut events, &mut event_writer, io_channel_id, user_channel_id)
                     .await?
                 {
                     RunState::Continue => continue,
@@ -1429,6 +1438,27 @@ async fn deactivate_all(
     Ok(())
 }
 
+async fn send_disconnect_ultimatum(writer: &mut impl FramedWrite) -> Result<(), anyhow::Error> {
+    let disconnect = mcs::DisconnectProviderUltimatum::from_reason(mcs::DisconnectReason::ProviderInitiated);
+    let msg = encode_vec(&X224(mcs::McsMessage::DisconnectProviderUltimatum(disconnect)))?;
+    writer.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send the standard RDP graceful disconnect sequence:
+/// Set Error Info PDU → Deactivate All → MCS Disconnect Provider Ultimatum
+async fn send_graceful_disconnect(
+    io_channel_id: u16,
+    user_channel_id: u16,
+    writer: &mut impl FramedWrite,
+    error_info: rdp::server_error_info::ErrorInfo,
+) -> Result<(), anyhow::Error> {
+    let _ = send_error_info(io_channel_id, user_channel_id, writer, error_info).await;
+    let _ = deactivate_all(io_channel_id, user_channel_id, writer).await;
+    let _ = send_disconnect_ultimatum(writer).await;
+    Ok(())
+}
+
 fn encode_cliprdr_pdu(pdu: ClipboardPdu<'static>) -> SvcMessage {
     SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL)
 }
@@ -1653,5 +1683,87 @@ mod tests {
         let desc = error_info.description();
         assert!(desc.contains("insufficient") || desc.contains("privileges"),
             "description should mention privileges: {desc}");
+    }
+
+    struct MockWriter {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl MockWriter {
+        fn new() -> Self {
+            Self { chunks: Vec::new() }
+        }
+    }
+
+    impl FramedWrite for MockWriter {
+        type WriteAllFut<'a> = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'a>> where Self: 'a;
+
+        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            self.chunks.push(buf.to_vec());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_disconnect_ultimatum_encodes_mcs_pdu() {
+        let mut writer = MockWriter::new();
+        send_disconnect_ultimatum(&mut writer).await.unwrap();
+        assert_eq!(writer.chunks.len(), 1);
+        let data = &writer.chunks[0];
+        // Should contain X224 header + MCS Disconnect Provider Ultimatum
+        assert!(!data.is_empty());
+        // MCS DPU domain tag = 8, encoded in ASN.1 BER: (8 << 2) | class bits
+        // The X224 wrapper adds a TPKT header (4 bytes) + X224 data header (3 bytes)
+        assert!(data.len() >= 7, "disconnect PDU should be at least 7 bytes, got {}", data.len());
+    }
+
+    #[tokio::test]
+    async fn send_graceful_disconnect_sends_three_pdus() {
+        let mut writer = MockWriter::new();
+        let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+            rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
+        );
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+        // Should send 3 PDUs: error info, deactivate all, disconnect ultimatum
+        assert_eq!(writer.chunks.len(), 3, "graceful disconnect should send 3 PDUs");
+    }
+
+    #[tokio::test]
+    async fn send_graceful_disconnect_for_tcc_sends_three_pdus() {
+        let mut writer = MockWriter::new();
+        let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+            rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
+        );
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+        assert_eq!(writer.chunks.len(), 3, "graceful disconnect should send 3 PDUs");
+    }
+
+    #[tokio::test]
+    async fn send_graceful_disconnect_error_info_is_first_pdu() {
+        let mut writer = MockWriter::new();
+        let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+            rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
+        );
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+
+        // First PDU should contain the error code 0x05 (DisconnectedByOtherconnection)
+        let first_pdu = &writer.chunks[0];
+        assert!(first_pdu.windows(4).any(|w| w == [0x05, 0x00, 0x00, 0x00]),
+            "first PDU should contain error code 0x05");
+    }
+
+    #[tokio::test]
+    async fn send_graceful_disconnect_ultimatum_is_last_pdu() {
+        let mut writer = MockWriter::new();
+        let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
+            rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
+        );
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+
+        // Last PDU should be the disconnect ultimatum (same as standalone)
+        let mut standalone_writer = MockWriter::new();
+        send_disconnect_ultimatum(&mut standalone_writer).await.unwrap();
+        assert_eq!(writer.chunks[2], standalone_writer.chunks[0],
+            "last PDU should be the MCS Disconnect Provider Ultimatum");
     }
 }
