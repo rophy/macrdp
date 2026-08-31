@@ -458,10 +458,14 @@ impl ScreenCapturer {
         let frame_interval = CMTime::new(1, config.frame_rate as i32);
 
         let captures_audio = audio_tx.is_some();
+        let dest_rect = screencapturekit::cg::CGRect::new(
+            0.0, 0.0, actual_width as f64, actual_height as f64,
+        );
         let stream_config = SCStreamConfiguration::new()
             .with_width(actual_width)
             .with_height(actual_height)
             .with_scales_to_fit(true)
+            .with_destination_rect(dest_rect)
             .with_minimum_frame_interval(&frame_interval)
             .with_pixel_format(match config.pixel_format {
                 CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
