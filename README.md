@@ -3,123 +3,229 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
-[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Supported-green.svg)](#)
 
-**[English](README_EN.md)** | 中文
+An RDP server for macOS. Connect to a Mac from Windows (mstsc), Linux (FreeRDP) or any
+other RDP client that supports the RDP graphics pipeline with H.264.
 
-**macOS 远程桌面服务端**
-
-原生 macOS RDP 服务端。从 Windows、Linux、iOS 或 Android 远程连接你的 Mac — 支持任何标准 RDP 客户端，如 Windows 远程桌面 (mstsc)、Microsoft Remote Desktop、FreeRDP。
-
-> **为什么选 macrdp？** macOS 没有内置 RDP 服务端，自带的 VNC 又慢又模糊。macrdp 让你的 Mac 拥有一流的远程桌面体验 — 快速、清晰、开箱即用兼容所有 RDP 客户端。
+This is a fork of [x6nux/macrdp](https://github.com/x6nux/macrdp). The fork adds dynamic
+resolution, session reconnect and takeover, adaptive frame rate, a separate cursor channel,
+and many protocol fixes. See [Changes in this fork](#changes-in-this-fork).
 
 ---
 
-## 功能特性
+## Why
 
-- **标准 RDP 协议** — 兼容任何 RDP 客户端，客户端无需安装特殊软件
-- **硬件加速编码** — 通过 Apple VideoToolbox GPU 加速 H.264，Apple Silicon 上低延迟
-- **高保真色彩** — AVC444 模式像素级色彩还原（RDP 10）
-- **完整键鼠支持** — 104 键映射、数字键盘、修饰键、滚轮，完整输入注入
-- **HiDPI / Retina 支持** — 2x/3x 倍率采集，远程 4K 高清显示
-- **灵活配置** — 分辨率、帧率、码率、编码器、质量预设，简单 TOML 配置
-- **安全连接** — NLA/CredSSP 认证 + 自动生成 TLS 证书
-- **锁屏采集** — 锁屏时自动切换 CoreGraphics 回退
+macOS has no RDP server. Its built-in Screen Sharing (VNC) sends lossless ZRLE to
+third-party viewers, so it is slow over normal networks. macrdp encodes the screen as
+H.264 with the hardware encoder and sends it over RDP.
 
----
+Measured on an M1 Mac (1280x720, Wi-Fi), client in a Linux VM
+(method and scripts: [`tests/bench`](tests/bench/README.md)):
 
-## 环境要求
-
-- **macOS 14+**（Sonoma 或更高版本）
-- **Rust 1.75+**
-- 屏幕录制权限（系统设置 > 隐私与安全性）
-- 辅助功能权限（用于键盘鼠标注入）
+| | macrdp | macOS Screen Sharing |
+|---|---|---|
+| Full-screen motion | 47–52 fps, 12–21 Mbps | 4 fps, 44–51 Mbps |
+| Scrolling | 46 fps | 16–17 fps |
+| Key-to-screen latency (median) | ~50 ms | 155–205 ms |
+| Static screen | ~0 Mbps | ~0 Mbps |
+| Image quality | lossy (H.264 4:2:0; AVC444 available) | pixel-exact |
 
 ---
 
-## 快速开始
+## Features
+
+- **H.264 over RDP GFX** — AVC420, or AVC444 for full chroma. Hardware encoder
+  (VideoToolbox) or software encoder (OpenH264).
+- **Dirty-rect encoding** — small changes encode only the changed region.
+- **Adaptive frame rate and bitrate** — capture drops to 5 fps when the screen is idle and
+  returns to full rate on activity. Bitrate ramps up after scene changes.
+- **Separate cursor channel** — the cursor is sent as RDP pointer updates, not in the video.
+- **Dynamic resolution** — follows the client window size (DisplayControl channel).
+- **Session reconnect and takeover** — one session at a time. A new connection that
+  authenticates replaces the current session; the encoder is reused and a keyframe is
+  replayed.
+- **Audio** — system audio over `rdpsnd` (PCM 48 kHz stereo). Silent periods are not sent.
+  The server respects the client's audio mode (see [Audio](#audio)).
+- **Clipboard** — text and file copy/paste between client and Mac.
+- **Keyboard and mouse** — scancode mapping, modifiers, wheel.
+- **Lock screen** — falls back to CoreGraphics capture when ScreenCaptureKit cannot capture.
+- **TLS and NLA (CredSSP)** — self-signed certificate generated on first run.
+- **Clean errors** — the client gets an Error Info PDU (for example, when Screen Recording
+  permission is missing) and a graceful disconnect instead of a dropped socket.
+
+### Tested clients
+
+| Client | Notes |
+|---|---|
+| Windows `mstsc` (Windows 10 22H2) | Works with default settings |
+| FreeRDP 3.x with H.264 | Use `/gfx:AVC420` (or `/gfx:AVC444`); add `/sound` for audio |
+
+Clients without H.264 GFX support (bitmap-only clients) are not supported.
+
+---
+
+## Requirements
+
+- macOS 14 (Sonoma) or later. Apple Silicon is tested.
+- Rust 1.75 or later, and Xcode or the Command Line Tools (for the Swift runtime that
+  ScreenCaptureKit needs).
+- Permissions for the `macrdp-server` binary (System Settings → Privacy & Security):
+  - **Screen Recording** — capture
+  - **Accessibility** — keyboard and mouse injection
+
+macOS grants these permissions per binary path and file. After each rebuild, you may have
+to grant them again.
+
+---
+
+## Build and run
 
 ```bash
-# 编译
-cargo build --release
-
-# 运行
-cargo run --release --bin macrdp-server
-
-# 从任意 RDP 客户端连接 → Mac-IP:3389
+cargo build --release --bin macrdp-server
+./target/release/macrdp-server --config config.toml
 ```
+
+Connect your RDP client to `<mac-ip>:<port>`.
+
+Command-line options:
+
+| Option | Meaning |
+|---|---|
+| `-c, --config <path>` | Config file |
+| `-p, --port <port>` | Listen port (default 3389; overrides the config file) |
+| `--frame-rate <n>` | Target frame rate |
+| `--log-level <level>` | `trace`, `debug`, `info`, `warn`, `error` |
+| `--perf` | Collect performance statistics and print a summary on exit |
+
+**Build over SSH:** `.cargo/config.toml` sets `DYLD_LIBRARY_PATH` to the Swift 5.5
+libraries. If the build fails over SSH, override it:
+
+```bash
+cargo build --release --bin macrdp-server \
+  --config 'env.DYLD_LIBRARY_PATH.value="/usr/lib/swift"' \
+  --config 'env.DYLD_LIBRARY_PATH.force=true'
+```
+
+There is also a Tauri desktop UI in [`macrdp-ui`](macrdp-ui) (from upstream).
+Run `make help` for its build targets.
 
 ---
 
-## 配置
+## Configuration
 
-复制 `config.example.toml` 为 `config.toml` 并按需修改：
+Copy [`config.example.toml`](config.example.toml) to `config.toml` and edit it.
 
-```toml
-# 网络
-port = 13389
+macrdp uses the first `config.toml` it finds in:
 
-# 认证
-username = "admin"
-password = "123456"
+1. the current directory
+2. `~/.config/macrdp/`
+3. `~/Library/Application Support/macrdp/`
 
-# 显示
-width = 0          # 0 = 自动检测
-height = 0
-frame_rate = 60
-hidpi_scale = 2    # Retina 上 2 倍缩放获得 4K
-
-# 编码
-quality = "high_quality"    # low_latency / balanced / high_quality
-encoder = "hardware"        # hardware (GPU) / software (CPU)
-chroma_mode = "avc420"      # avc420 (兼容) / avc444 (最佳画质)
-bitrate_mbps = 50           # 目标码率 (Mbps)
-
-# 日志
-log_level = "info"          # trace / debug / info / warn / error
-```
-
-配置搜索顺序:
-1. `./config.toml`
-2. `~/.config/macrdp/config.toml`
-3. `~/Library/Application Support/macrdp/config.toml`
+| Key | Default | Meaning |
+|---|---|---|
+| `port` | `3389` | TCP port |
+| `username`, `password` | none | Login. If not set, any credentials are accepted. |
+| `width`, `height` | `0` (auto) | Fixed resolution. `0` follows the display and the client. |
+| `resolution` | `auto` | Capture size, e.g. `"3840x2160"` for a sharper image on Retina displays |
+| `frame_rate` | `60` | Target frame rate |
+| `quality` | `high_quality` | `low_latency`, `balanced` or `high_quality` |
+| `encoder` | software | `hardware` (VideoToolbox) or `software` (OpenH264) |
+| `chroma_mode` | `avc420` | `avc420`, or `avc444` for full chroma |
+| `bitrate_mbps` | auto | Bitrate ceiling |
+| `cursor_channel` | `true` | Send the cursor as pointer updates instead of in the video |
+| `show_cursor` | auto | Draw the cursor in the video (default: only when `cursor_channel` is off) |
+| `max_monitors` | auto | Number of monitors to advertise |
+| `cert_path`, `key_path` | auto | TLS certificate and key (PEM); generated if not set |
+| `idle_timeout_secs` | `1800` | Disconnect after this many seconds without input |
+| `log_level` | `info` | Log level |
+| `[audio] enabled` | `true` | Audio forwarding |
+| `[audio] sample_rate`, `channels` | `48000`, `2` | Audio format |
+| `[clipboard] enabled` | `true` | Clipboard sync |
+| `[clipboard] max_file_size_mb` | `100` | Largest file for clipboard file transfer |
 
 ---
 
-## 项目结构
+## Audio
+
+The server sends audio only when the client asks for it. It reads the audio mode from the
+client's Client Info PDU:
+
+| Client setting | mstsc "Remote audio" | FreeRDP | Server |
+|---|---|---|---|
+| Play on this computer | default | `/sound` | sends audio |
+| Play on remote computer | "Play on remote computer" | `/audio-mode:1` | no audio; the Mac plays it |
+| Do not play | "Do not play" | default, `/audio-mode:2` | no audio |
+
+When no audio is requested, the Mac does not capture audio for that session.
+
+Audio is uncompressed PCM, about 1.5 Mbps while sound plays. Silence is not sent.
+
+---
+
+## Project layout
 
 ```
 crates/
-├── macrdp-server/       主服务端程序
-├── macrdp-capture/      屏幕采集
-├── macrdp-input/        键鼠注入
-├── macrdp-encode/       视频编码
-├── ironrdp-server-gfx/  RDP 协议层 (IronRDP fork)
-└── ironrdp-acceptor-patched/
-                         RDP 连接接受器
+├── macrdp-server/                  server binary: config, session, display loop
+├── macrdp-capture/                 ScreenCaptureKit capture (+ CoreGraphics fallback)
+├── macrdp-encode/                  H.264 encoders (VideoToolbox, OpenH264), AVC444
+├── macrdp-input/                   keyboard and mouse injection
+├── macrdp-audio/                   system audio → rdpsnd
+├── macrdp-clipboard/               clipboard and file transfer
+├── macrdp-core/                    shared types
+├── ironrdp-server-gfx/             RDP server (IronRDP fork with GFX, ZGFX, takeover, …)
+├── ironrdp-acceptor-patched/       connection acceptor (IronRDP fork)
+└── ironrdp-displaycontrol-patched/ DisplayControl channel (IronRDP fork)
+macrdp-ui/                          Tauri desktop UI
+tests/
+├── e2e_test.sh                     smoke test from a Linux client
+└── bench/                          macrdp vs macOS Screen Sharing benchmark
 ```
 
 ---
 
-## 致谢
+## Tests
 
-本项目的诞生离不开以下优秀的开源项目，在此致以诚挚的敬意：
+```bash
+cargo test --workspace
+```
 
-- **[IronRDP](https://github.com/Devolutions/IronRDP)** — 纯 Rust RDP 协议实现。macrdp 的协议栈基于 ironrdp-server 的 fork，添加了 GFX/AVC444 扩展。
-- **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — 开源 RDP 参考实现。其 AVC444 双流编码方案和 YUV444 B 区域拆分算法是 macrdp 实现的重要参考。
-- **[RustDesk](https://github.com/rustdesk/rustdesk)** — 使用 Rust 编写的开源远程桌面软件。其跨平台屏幕采集和输入注入的架构思路给予了很大启发。
-
----
-
-## 许可证
-
-本项目采用 **GNU 通用公共许可证 v3.0** 授权 — 详见 [LICENSE](LICENSE)。任何基于本项目的衍生作品必须同样以 GPLv3 开源。
+`tests/e2e_test.sh <host> <port>` runs a smoke test with FreeRDP from a Linux machine.
+`tests/bench` has the benchmark (see its README).
 
 ---
 
-<details>
-<summary><b>关键词</b></summary>
+## Changes in this fork
 
-macOS RDP 服务端, Mac 远程桌面, Mac 远程桌面服务端, 远程桌面协议 macOS, 从 Windows 连接 Mac, 从 Linux 连接 Mac, 从安卓连接 Mac, 远程控制 Mac, Mac 远程访问, Mac 屏幕共享, Apple Silicon 远程桌面, VNC 替代方案, macOS 远程桌面方案, macOS RDP server, Mac remote desktop server, RDP server for Mac, connect to Mac from Windows, remote control Mac, VNC alternative Mac
+Compared with upstream:
 
-</details>
+- Dynamic resolution through the DisplayControl channel
+- Session reconnect (warm reset, encoder reuse, keyframe replay) and session takeover
+  (a new authenticated connection replaces the current one)
+- Activity-based adaptive frame rate; fix: capture size is kept when the frame rate changes
+- Adaptive bitrate and progressive rendering after scene changes
+- Dirty-rect H.264 encoding
+- Separate cursor channel (RDP pointer PDUs)
+- ZGFX bulk compression for GFX PDUs
+- Multi-monitor protocol plumbing (monitor layout; capture is still the main display)
+- Audio: no silent chunks; respects the client audio mode
+- Error Info PDU and graceful disconnect sequence
+- Main display is used for capture (was: first display)
+- E2E smoke test and benchmark scripts
+
+---
+
+## Credits
+
+- **[x6nux/macrdp](https://github.com/x6nux/macrdp)** — the upstream project.
+- **[IronRDP](https://github.com/Devolutions/IronRDP)** — Rust RDP implementation. The
+  server and acceptor crates here are forks of IronRDP crates.
+- **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — reference for AVC444 encoding and
+  the client used for testing.
+- **[RustDesk](https://github.com/rustdesk/rustdesk)** — ideas for capture and input.
+
+---
+
+## License
+
+GNU General Public License v3.0. See [LICENSE](LICENSE).
