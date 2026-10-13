@@ -10,7 +10,7 @@ use ironrdp_pdu::nego::SecurityProtocol;
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{StaticChannelSet, SvcServerProcessor};
 use pdu::rdp::capability_sets::CapabilitySet;
-use pdu::rdp::client_info::Credentials;
+use pdu::rdp::client_info::{ClientInfoFlags, Credentials};
 use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
@@ -36,6 +36,7 @@ pub struct Acceptor {
     pub(crate) creds: Option<Credentials>,
     reactivation: bool,
     monitors: Option<Vec<gcc::Monitor>>,
+    client_info_flags: ClientInfoFlags,
 }
 
 #[derive(Debug)]
@@ -46,6 +47,8 @@ pub struct AcceptorResult {
     pub user_channel_id: u16,
     pub io_channel_id: u16,
     pub reactivation: bool,
+    /// Flags from the client's Client Info PDU (e.g. audio playback mode).
+    pub client_info_flags: ClientInfoFlags,
 }
 
 impl Acceptor {
@@ -67,6 +70,7 @@ impl Acceptor {
             creds,
             reactivation: false,
             monitors: None,
+            client_info_flags: ClientInfoFlags::empty(),
         }
     }
 
@@ -109,6 +113,7 @@ impl Acceptor {
             creds: consumed.creds,
             reactivation: true,
             monitors: consumed.monitors,
+            client_info_flags: consumed.client_info_flags,
         })
     }
 
@@ -166,6 +171,7 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 reactivation: self.reactivation,
+                client_info_flags: self.client_info_flags,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -533,6 +539,7 @@ impl Sequence for Acceptor {
                     decode(data.user_data.as_ref()).map_err(ConnectorError::decode)?;
 
                 debug!(message = ?client_info, "Received");
+                self.client_info_flags = client_info.client_info.flags;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;

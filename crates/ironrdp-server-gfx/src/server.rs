@@ -14,6 +14,7 @@ use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
@@ -1034,12 +1035,22 @@ impl RdpServer {
         }
 
         self.static_channels = result.static_channels;
+        let audio_playback = client_wants_audio_playback(result.client_info_flags);
+        if !result.reactivation && !audio_playback {
+            info!(flags = ?result.client_info_flags, "Client asked for no audio playback, rdpsnd not started");
+            if let Some(factory) = self.sound_factory.as_deref() {
+                factory.playback_disabled();
+            }
+        }
         if !result.reactivation {
-            for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
+            for (type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
                     continue;
                 };
+                if !audio_playback && type_id == core::any::TypeId::of::<RdpsndServer>() {
+                    continue;
+                }
                 let svc_responses = channel.start()?;
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
@@ -1386,6 +1397,12 @@ impl RdpServer {
     }
 }
 
+/// Audio is played on the client only when it set neither NO_AUDIO_PLAYBACK
+/// ("do not play") nor REMOTE_CONSOLE_AUDIO ("play on remote computer").
+fn client_wants_audio_playback(flags: ClientInfoFlags) -> bool {
+    !flags.intersects(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO)
+}
+
 async fn send_error_info(
     io_channel_id: u16,
     user_channel_id: u16,
@@ -1515,6 +1532,16 @@ mod tests {
             security: RdpServerSecurity::None,
             codecs: BitmapCodecs(vec![]),
         }
+    }
+
+    #[test]
+    fn audio_playback_follows_client_info_flags() {
+        assert!(client_wants_audio_playback(ClientInfoFlags::MOUSE | ClientInfoFlags::UNICODE));
+        assert!(!client_wants_audio_playback(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert!(!client_wants_audio_playback(ClientInfoFlags::REMOTE_CONSOLE_AUDIO));
+        assert!(!client_wants_audio_playback(
+            ClientInfoFlags::REMOTE_CONSOLE_AUDIO | ClientInfoFlags::NO_AUDIO_PLAYBACK
+        ));
     }
 
     #[test]

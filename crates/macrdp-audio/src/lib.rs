@@ -183,6 +183,12 @@ impl SoundServerFactory for MacAudioFactory {
 
         Box::new(MacAudioHandler::new(sample_rate, channels))
     }
+
+    fn playback_disabled(&self) {
+        // Drop the sender: the display then starts capture without audio,
+        // and audio_loop ends when its receiver closes.
+        *self.shared_tx.lock().unwrap() = None;
+    }
 }
 
 impl ServerEventSender for MacAudioFactory {
