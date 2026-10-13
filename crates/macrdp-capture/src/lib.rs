@@ -115,6 +115,8 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: SCStream,
     frame_rx: mpsc::Receiver<CaptureEvent>,
+    /// Full stream configuration, kept so runtime updates preserve size/format.
+    stream_config: SCStreamConfiguration,
 }
 
 struct VideoOutputHandler {
@@ -507,6 +509,7 @@ impl ScreenCapturer {
         Ok(Self {
             stream,
             frame_rx,
+            stream_config,
         })
     }
 
@@ -524,10 +527,11 @@ impl ScreenCapturer {
     /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
     pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
         use screencapturekit::cm::CMTime;
-        use screencapturekit::prelude::SCStreamConfiguration;
 
+        // Start from the full config: a fresh SCStreamConfiguration resets
+        // width/height/pixel format to SCK defaults (e.g. 1920x1080).
         let interval = CMTime::new(1, fps as i32);
-        let mut config = SCStreamConfiguration::new();
+        let mut config = self.stream_config.clone();
         config.set_minimum_frame_interval(&interval);
         self.stream
             .update_configuration(&config)
