@@ -42,15 +42,26 @@ async fn audio_loop(
             let samples_per_ch = frame_size_interleaved / channels as usize;
             let offset_ms = (samples_sent * 1000) / sample_rate as u64;
             let ts = base_timestamp_ms.unwrap_or(0) + offset_ms;
+            samples_sent += samples_per_ch as u64;
+
+            // SCK delivers buffers even when nothing plays. Sending digital
+            // silence as PCM costs ~1.5 Mbps, so skip it; the timestamp of the
+            // next sent chunk still follows the real timeline.
+            if is_silent(&wave_data) {
+                continue;
+            }
 
             let _ = event_sender.send(ServerEvent::Rdpsnd(
                 RdpsndServerMessage::Wave(wave_data, ts as u32),
             ));
-
-            samples_sent += samples_per_ch as u64;
         }
     }
     tracing::info!("Audio loop ended");
+}
+
+/// True when every S16LE sample in the chunk is zero.
+fn is_silent(wave_data: &[u8]) -> bool {
+    wave_data.iter().all(|&b| b == 0)
 }
 
 /// Find best matching server format index given client's supported formats.
@@ -194,6 +205,12 @@ mod tests {
             bits_per_sample: 16,
             data: None,
         }
+    }
+
+    #[test]
+    fn silent_chunk_detected() {
+        assert!(is_silent(&[0u8; 8]));
+        assert!(!is_silent(&[0, 0, 1, 0]));
     }
 
     #[test]
