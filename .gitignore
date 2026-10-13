@@ -33,3 +33,5 @@ macrdp-ui/dist/
 # Misc
 *.git.bak/
 **/.git.bak/
+# Python
+__pycache__/
