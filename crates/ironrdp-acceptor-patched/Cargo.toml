@@ -40,7 +40,6 @@ repository = "https://github.com/Devolutions/IronRDP"
 [lib]
 name = "ironrdp_acceptor"
 path = "src/lib.rs"
-test = false
 doctest = false
 
 [dependencies.ironrdp-async]

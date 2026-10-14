@@ -62,7 +62,6 @@ rayon = ["dep:rayon"]
 [lib]
 name = "ironrdp_server"
 path = "src/lib.rs"
-test = false
 doctest = true
 
 [dependencies.anyhow]
