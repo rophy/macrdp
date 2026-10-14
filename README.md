@@ -106,9 +106,6 @@ cargo build --release --bin macrdp-server \
   --config 'env.DYLD_LIBRARY_PATH.force=true'
 ```
 
-There is also a Tauri desktop UI in [`macrdp-ui`](macrdp-ui) (from upstream).
-Run `make help` for its build targets.
-
 ---
 
 ## Configuration
@@ -172,11 +169,9 @@ crates/
 ├── macrdp-input/                   keyboard and mouse injection
 ├── macrdp-audio/                   system audio → rdpsnd
 ├── macrdp-clipboard/               clipboard and file transfer
-├── macrdp-core/                    shared types
 ├── ironrdp-server-gfx/             RDP server (IronRDP fork with GFX, ZGFX, takeover, …)
 ├── ironrdp-acceptor-patched/       connection acceptor (IronRDP fork)
 └── ironrdp-displaycontrol-patched/ DisplayControl channel (IronRDP fork)
-macrdp-ui/                          Tauri desktop UI
 tests/
 ├── e2e_test.sh                     smoke test from a Linux client
 └── bench/                          macrdp vs macOS Screen Sharing benchmark

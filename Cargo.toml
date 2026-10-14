@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/macrdp-core",
     "crates/macrdp-server",
     "crates/macrdp-capture",
     "crates/macrdp-input",

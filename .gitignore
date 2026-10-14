@@ -1,37 +1,38 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
 
-.claude/
-.DS_Store
+# Runtime config (contains credentials; use config.example.toml as template)
+config.toml
+# TLS certificates (generated at runtime)
+tls/
+
+# Environment
 .env
 .env.local
+
+# Logs
+*.log
+
+# IDE / tools
 .idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.claude/
 .serena/
 .spec-workflow/
 .superpowers/
-.vscode/
-*.iml
-*.log
-*.swo
-*.swp
-**/*.rs.bk
-# Rust build artifacts
-/target/
-**/target/
-# Environment
-# IDE
-# Log files
-# macOS
-# Runtime config (contains credentials, use config.example.toml as template)
-# Rust
-# TLS certificates (generated at runtime)
-Cargo.lock
-config.toml
 docs/superpowers/
-tls/
-# Node / Frontend build artifacts
-node_modules/
-macrdp-ui/dist/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+
 # Misc
 *.git.bak/
 **/.git.bak/
-# Python
-__pycache__/
