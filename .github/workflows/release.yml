@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: # dry run: no release, no tag
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      version: ${{ steps.v.outputs.version }}
+      sha: ${{ steps.v.outputs.sha }}
+      dry_run: ${{ steps.v.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: v
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "macrdp-server") | .version')
+          release=true
+          if [[ "$DRY_RUN" != true ]]; then
+            if [[ "$version" == *-* ]]; then
+              echo "::notice::$version is a development version; no release"
+              release=false
+            elif git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+              echo "::notice::tag v$version exists; no release"
+              release=false
+            fi
+          fi
+          {
+            echo "version=$version"
+            echo "release=$release"
+            echo "sha=$SHA"
+            echo "dry_run=$DRY_RUN"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: v${{ needs.check.outputs.version }}
+      SHA: ${{ needs.check.outputs.sha }}
+      NAME: macrdp-v${{ needs.check.outputs.version }}-macos-arm64
+      BIN: target/release/macrdp-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+
+      - name: Tag locally (for --version)
+        run: git tag -f "$TAG" "$SHA"
+
+      - name: Build
+        run: cargo build --release --locked --bin macrdp-server
+
+      - name: Check rpaths
+        run: |
+          rpaths=$(otool -l "$BIN" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }')
+          echo "rpaths: $rpaths"
+          if grep -v '^/usr/lib/' <<<"$rpaths" | grep -q .; then
+            echo "::error::rpath outside /usr/lib"
+            exit 1
+          fi
+
+      - name: Import signing certificate
+        env:
+          MACOS_P12_BASE64: ${{ secrets.MACOS_P12_BASE64 }}
+          MACOS_P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass=$(openssl rand -hex 16)
+          base64 --decode <<<"$MACOS_P12_BASE64" > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$kc_pass" "$keychain" >/dev/null
+          existing=()
+          while IFS= read -r k; do existing+=("$k"); done \
+            < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Sign
+        env:
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+        run: |
+          codesign --force --options runtime --timestamp \
+            --identifier io.github.rophy.macrdp \
+            --keychain "$KEYCHAIN" --sign "$MACOS_CODESIGN_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          info=$(codesign -dvv "$BIN" 2>&1)
+          echo "$info"
+          grep -q '^Identifier=io.github.rophy.macrdp$' <<<"$info"
+          grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<<"$info"
+          grep -q 'flags=.*runtime' <<<"$info"
+
+      - name: Smoke test
+        run: |
+          out=$("$BIN" --version)
+          echo "$out"
+          [[ "$out" == "macrdp $VERSION" ]]
+
+      - name: Notarize
+        env:
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$MACOS_NOTARY_KEY_P8" > "$key"
+          auth=(--key "$key" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID")
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" "${auth[@]}" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          cat "$RUNNER_TEMP/notary.json"
+          id=$(jq -r '.id // empty' "$RUNNER_TEMP/notary.json")
+          status=$(jq -r '.status // empty' "$RUNNER_TEMP/notary.json")
+          if [[ "$status" != Accepted ]]; then
+            [[ -n "$id" ]] && xcrun notarytool log "$id" "${auth[@]}"
+            echo "::error::notarization status: ${status:-none}"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p "dist/$NAME"
+          cp "$BIN" config.example.toml README.md LICENSE \
+            packaging/install.sh packaging/uninstall.sh packaging/io.github.rophy.macrdp.plist \
+            "dist/$NAME/"
+          chmod 755 "dist/$NAME/macrdp-server" "dist/$NAME/install.sh" "dist/$NAME/uninstall.sh"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload dry-run artifact
+        if: needs.check.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macrdp-dry-run
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Create release and tag
+        if: needs.check.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "$TAG" --generate-notes \
+            "dist/$NAME.tar.gz" dist/SHA256SUMS
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          [[ -n "${KEYCHAIN:-}" ]] && security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
