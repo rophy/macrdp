@@ -176,7 +176,8 @@ tests/
 cargo test --workspace
 ```
 
-`tests/e2e_test.sh <host> <port>` runs a smoke test with FreeRDP from a Linux machine.
+`MACRDP_USER=… MACRDP_PASS=… tests/e2e_test.sh <host> [port]` runs a smoke test with
+FreeRDP 3 from a Linux machine (`XFREERDP` selects the client binary).
 `tests/bench` has the benchmark (see its README).
 
 ---

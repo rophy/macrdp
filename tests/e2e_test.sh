@@ -1,17 +1,22 @@
 #!/bin/bash
 # E2E smoke test for macrdp
-# Runs from a Linux machine against a Mac running macrdp-server
+# Runs from a Linux machine with FreeRDP 3 against a Mac running macrdp-server.
 #
-# Usage: ./tests/e2e_test.sh [host] [port]
-#   host: macrdp server address (default: 192.168.1.207)
-#   port: macrdp server port (default: 13389)
+# Usage: MACRDP_USER=<user> MACRDP_PASS=<pass> ./tests/e2e_test.sh <host> [port]
+#   or set MACRDP_HOST / MACRDP_PORT instead of arguments (port default: 3389)
+#   XFREERDP: FreeRDP client binary (default: xfreerdp3)
 
 set -euo pipefail
 
-HOST="${1:-192.168.1.207}"
-PORT="${2:-13389}"
-USER="admin"
-PASS="123456"
+HOST="${1:-${MACRDP_HOST:-}}"
+PORT="${2:-${MACRDP_PORT:-3389}}"
+USER="${MACRDP_USER:-}"
+PASS="${MACRDP_PASS:-}"
+XFREERDP="${XFREERDP:-xfreerdp3}"
+if [[ -z "$HOST" || -z "$USER" || -z "$PASS" ]]; then
+    sed -n '2,7p' "$0" >&2
+    exit 2
+fi
 ADDR="${HOST}:${PORT}"
 PASSED=0
 FAILED=0
@@ -35,7 +40,7 @@ fi
 
 # 2. RDP authentication (auth-only mode)
 echo "[2] RDP authentication"
-AUTH_OUT=$(timeout 10 xfreerdp3 /v:"${ADDR}" /u:${USER} /p:${PASS} /cert:ignore /auth-only 2>&1) || true
+AUTH_OUT=$(timeout 10 "$XFREERDP" /v:"${ADDR}" /u:${USER} /p:${PASS} /cert:ignore /auth-only 2>&1) || true
 if echo "$AUTH_OUT" | grep -q "Authentication only, exit status 1"; then
     pass "RDP auth succeeds"
 else
@@ -44,7 +49,7 @@ fi
 
 # 3. Wrong password rejected
 echo "[3] Wrong password rejected"
-BAD_OUT=$(timeout 10 xfreerdp3 /v:"${ADDR}" /u:${USER} /p:wrong /cert:ignore /auth-only 2>&1) || true
+BAD_OUT=$(timeout 10 "$XFREERDP" /v:"${ADDR}" /u:${USER} /p:wrong /cert:ignore /auth-only 2>&1) || true
 if echo "$BAD_OUT" | grep -qi "logon\|credentials\|denied\|ERRCONNECT\|failed"; then
     pass "Bad password rejected"
 else
@@ -54,7 +59,7 @@ fi
 # 4. Full RDP connection with GFX (headless via xvfb)
 echo "[4] Full RDP connection (GFX/H.264)"
 if command -v xvfb-run &>/dev/null; then
-    FULL_OUT=$(timeout 15 xvfb-run -a xfreerdp3 /v:"${ADDR}" /u:${USER} /p:${PASS} \
+    FULL_OUT=$(timeout 15 xvfb-run -a "$XFREERDP" /v:"${ADDR}" /u:${USER} /p:${PASS} \
         /cert:ignore /gfx /timeout:5000 +auto-reconnect 2>&1) || true
     if echo "$FULL_OUT" | grep -qi "Capabilities\|GFX\|connected\|surface"; then
         pass "GFX connection"
@@ -71,19 +76,19 @@ fi
 echo "[5] Concurrent connection rejection"
 if command -v xvfb-run &>/dev/null; then
     # Start a background session
-    xvfb-run -a xfreerdp3 /v:"${ADDR}" /u:${USER} /p:${PASS} \
+    xvfb-run -a "$XFREERDP" /v:"${ADDR}" /u:${USER} /p:${PASS} \
         /cert:ignore /timeout:8000 2>/dev/null &
     BG_PID=$!
     sleep 3
 
     # Try a second connection — should fail quickly, not hang
     REJECT_START=$(date +%s)
-    REJECT_OUT=$(timeout 10 xfreerdp3 /v:"${ADDR}" /u:${USER} /p:${PASS} \
+    REJECT_OUT=$(timeout 10 "$XFREERDP" /v:"${ADDR}" /u:${USER} /p:${PASS} \
         /cert:ignore /auth-only 2>&1) || true
     REJECT_END=$(date +%s)
     REJECT_TIME=$((REJECT_END - REJECT_START))
 
-    kill $BG_PID 2>/dev/null; wait $BG_PID 2>/dev/null || true
+    kill $BG_PID 2>/dev/null || true; wait $BG_PID 2>/dev/null || true
     sleep 1
 
     if [ "$REJECT_TIME" -lt 8 ]; then
