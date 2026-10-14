@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --all --check
+      # The forked IronRDP crates keep upstream's lint set; lint only our crates.
+      - name: Clippy (macrdp crates)
+        run: >-
+          cargo clippy --workspace --exclude ironrdp-server --exclude ironrdp-acceptor
+          --all-targets --locked --no-deps -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build release binary
+        run: cargo build --release --locked --bin macrdp-server
