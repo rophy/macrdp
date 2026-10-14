@@ -3,6 +3,7 @@ mod display;
 mod handler;
 mod perf_stats;
 mod tls;
+mod version;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -44,7 +45,7 @@ async fn main() -> Result<()> {
 
     eprintln!("Log file: {}", log_path.display());
 
-    tracing::info!(?config, "macrdp server starting");
+    tracing::info!(version = version::version(), ?config, "macrdp server starting");
 
     // Ensure TLS certificates exist
     let (cert_path, key_path) =

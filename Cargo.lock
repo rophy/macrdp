@@ -2065,7 +2065,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "macrdp-audio"
-version = "0.1.0"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "approx",
@@ -2078,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-capture"
-version = "0.1.0"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-clipboard"
-version = "0.1.0"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "image",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-encode"
-version = "0.1.0"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-input"
-version = "0.1.0"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "core-foundation 0.10.1",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "macrdp-server"
-version = "0.1.0"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",

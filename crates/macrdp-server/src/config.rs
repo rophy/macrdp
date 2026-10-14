@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "macrdp", about = "macOS RDP Server")]
+#[command(name = "macrdp", about = "macOS RDP Server", version = crate::version::version())]
 pub struct Cli {
     /// TCP port to listen on
     #[arg(short, long, default_value_t = 3389)]
