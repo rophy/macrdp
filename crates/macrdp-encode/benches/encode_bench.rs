@@ -144,14 +144,9 @@ fn bench_openh264_encode(c: &mut Criterion) {
         let height = 2160u32;
         let stride = width as usize * 4;
         let bgra = generate_test_pattern(width, height, stride);
-        let mut encoder = OpenH264Encoder::new(
-            align16(width),
-            align16(height),
-            120.0,
-            50_000_000,
-            false,
-        )
-        .expect("Failed to create 4K OpenH264 encoder");
+        let mut encoder =
+            OpenH264Encoder::new(align16(width), align16(height), 120.0, 50_000_000, false)
+                .expect("Failed to create 4K OpenH264 encoder");
 
         group.bench_function("openh264_4k_120fps", |b| {
             b.iter(|| {
@@ -166,14 +161,9 @@ fn bench_openh264_encode(c: &mut Criterion) {
         let height = 1080u32;
         let stride = width as usize * 4;
         let bgra = generate_test_pattern(width, height, stride);
-        let mut encoder = OpenH264Encoder::new(
-            align16(width),
-            align16(height),
-            120.0,
-            30_000_000,
-            false,
-        )
-        .expect("Failed to create 1080p OpenH264 encoder");
+        let mut encoder =
+            OpenH264Encoder::new(align16(width), align16(height), 120.0, 30_000_000, false)
+                .expect("Failed to create 1080p OpenH264 encoder");
 
         group.bench_function("openh264_1080p_120fps", |b| {
             b.iter(|| {
@@ -260,14 +250,7 @@ fn nv12_conversion(c: &mut Criterion) {
         group.bench_function("vimage_bgra_to_nv12_4k", |b| {
             b.iter(|| {
                 converter
-                    .bgra_to_nv12(
-                        black_box(&bgra),
-                        w,
-                        h,
-                        stride,
-                        &mut y_buf,
-                        &mut uv_buf,
-                    )
+                    .bgra_to_nv12(black_box(&bgra), w, h, stride, &mut y_buf, &mut uv_buf)
                     .unwrap();
             })
         });

@@ -174,8 +174,8 @@ pub fn yuv444_split_to_yuv420(
         let half_row = src_row / 2; // 0, 1, 2, ...
         let block = half_row / 8;
         let offset = half_row % 8;
-        let u_dst_row = block * 16 + offset;       // U data in first 8 rows of block
-        let v_dst_row = block * 16 + offset + 8;   // V data in next 8 rows
+        let u_dst_row = block * 16 + offset; // U data in first 8 rows of block
+        let v_dst_row = block * 16 + offset + 8; // V data in next 8 rows
 
         let src_offset = src_row * w;
         // B4: Copy U444 odd row into aux Y
@@ -246,7 +246,15 @@ mod tests {
         let mut u444 = vec![0u8; size];
         let mut v444 = vec![0u8; size];
 
-        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, &mut y444, &mut u444, &mut v444);
+        bgra_to_yuv444(
+            &bgra,
+            w,
+            h,
+            (w * 4) as usize,
+            &mut y444,
+            &mut u444,
+            &mut v444,
+        );
 
         let (exp_y, exp_u, exp_v) = ref_bt601(200, 100, 50);
         for i in 0..size {
@@ -265,9 +273,9 @@ mod tests {
         for row in 0..h as usize {
             for col in 0..w as usize {
                 let px = row * stride + col * 4;
-                bgra[px] = 30;      // B
-                bgra[px + 1] = 60;  // G
-                bgra[px + 2] = 90;  // R
+                bgra[px] = 30; // B
+                bgra[px + 1] = 60; // G
+                bgra[px + 2] = 90; // R
                 bgra[px + 3] = 255; // A
             }
         }
@@ -303,7 +311,11 @@ mod tests {
 
         yuv444_split_to_yuv420(&y444, &u444, &v444, w, h, &mut main_view, &mut aux_view);
 
-        assert_eq!(&main_view.y[..size], &y444[..size], "B1: main Y must be identity copy of Y444");
+        assert_eq!(
+            &main_view.y[..size],
+            &y444[..size],
+            "B1: main Y must be identity copy of Y444"
+        );
     }
 
     #[test]
@@ -321,13 +333,25 @@ mod tests {
         // Block at (row 2-3, col 2-3): values 200, 210, 220, 230 → avg = 215
         let mut u444 = vec![0u8; size];
         // Row 0: [10, 20, 100, 110]
-        u444[0] = 10; u444[1] = 20; u444[2] = 100; u444[3] = 110;
+        u444[0] = 10;
+        u444[1] = 20;
+        u444[2] = 100;
+        u444[3] = 110;
         // Row 1: [30, 40, 120, 130]
-        u444[4] = 30; u444[5] = 40; u444[6] = 120; u444[7] = 130;
+        u444[4] = 30;
+        u444[5] = 40;
+        u444[6] = 120;
+        u444[7] = 130;
         // Row 2: [50, 60, 200, 210]
-        u444[8] = 50; u444[9] = 60; u444[10] = 200; u444[11] = 210;
+        u444[8] = 50;
+        u444[9] = 60;
+        u444[10] = 200;
+        u444[11] = 210;
         // Row 3: [70, 80, 220, 230]
-        u444[12] = 70; u444[13] = 80; u444[14] = 220; u444[15] = 230;
+        u444[12] = 70;
+        u444[13] = 80;
+        u444[14] = 220;
+        u444[15] = 230;
 
         // Use the same pattern for V444 but shifted by +5
         let v444: Vec<u8> = u444.iter().map(|&x| x.saturating_add(5)).collect();
@@ -368,8 +392,8 @@ mod tests {
         let mut v444 = vec![0u8; size];
         for row in 0..h as usize {
             for col in 0..wi {
-                u444[row * wi + col] = (row + 1) as u8;        // U: row number + 1
-                v444[row * wi + col] = (row + 1 + 100) as u8;  // V: row number + 101
+                u444[row * wi + col] = (row + 1) as u8; // U: row number + 1
+                v444[row * wi + col] = (row + 1 + 100) as u8; // V: row number + 101
             }
         }
 
@@ -389,14 +413,14 @@ mod tests {
 
         let test_cases: Vec<(usize, usize, usize)> = vec![
             // (src_row, expected_u_dst_row, expected_v_dst_row)
-            (1,  0,  8),
-            (3,  1,  9),
-            (5,  2,  10),
-            (7,  3,  11),
-            (9,  4,  12),
-            (11, 5,  13),
-            (13, 6,  14),
-            (15, 7,  15),
+            (1, 0, 8),
+            (3, 1, 9),
+            (5, 2, 10),
+            (7, 3, 11),
+            (9, 4, 12),
+            (11, 5, 13),
+            (13, 6, 14),
+            (15, 7, 15),
             (17, 16, 24),
             (19, 17, 25),
             (21, 18, 26),
@@ -460,11 +484,13 @@ mod tests {
                 let expected_v = (src_col * 10 + src_row + 50) as u8;
 
                 assert_eq!(
-                    aux_view.u[r * half_w + c], expected_u,
+                    aux_view.u[r * half_w + c],
+                    expected_u,
                     "B6: aux.u[{r}][{c}] should be u444[{src_row}][{src_col}] = {expected_u}"
                 );
                 assert_eq!(
-                    aux_view.v[r * half_w + c], expected_v,
+                    aux_view.v[r * half_w + c],
+                    expected_v,
                     "B7: aux.v[{r}][{c}] should be v444[{src_row}][{src_col}] = {expected_v}"
                 );
             }
@@ -486,9 +512,18 @@ mod tests {
         assert_eq!(frame.height, 16);
 
         // All values should be reset
-        assert!(frame.y.iter().all(|&v| v == 0), "Y should be zeroed after ensure_size");
-        assert!(frame.u.iter().all(|&v| v == 128), "U should be 128 after ensure_size");
-        assert!(frame.v.iter().all(|&v| v == 128), "V should be 128 after ensure_size");
+        assert!(
+            frame.y.iter().all(|&v| v == 0),
+            "Y should be zeroed after ensure_size"
+        );
+        assert!(
+            frame.u.iter().all(|&v| v == 128),
+            "U should be 128 after ensure_size"
+        );
+        assert!(
+            frame.v.iter().all(|&v| v == 128),
+            "V should be 128 after ensure_size"
+        );
     }
 
     #[test]
@@ -501,7 +536,15 @@ mod tests {
         let mut y444 = vec![0u8; size];
         let mut u444 = vec![0u8; size];
         let mut v444 = vec![0u8; size];
-        bgra_to_yuv444(&bgra, w, h, (w * 4) as usize, &mut y444, &mut u444, &mut v444);
+        bgra_to_yuv444(
+            &bgra,
+            w,
+            h,
+            (w * 4) as usize,
+            &mut y444,
+            &mut u444,
+            &mut v444,
+        );
 
         let mut main_view = Yuv420Frame::new(w, h);
         let mut aux_view = Yuv420Frame::new(w, h);

@@ -10,7 +10,7 @@ use clap::Parser;
 use config::{Cli, ServerConfig};
 use display::MacDisplay;
 use handler::MacInputHandler;
-use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx, gfx::GfxState};
+use ironrdp_server::{gfx::GfxState, Credentials, RdpServer, TlsIdentityCtx};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +24,9 @@ async fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
-    let log_path = std::env::current_dir().unwrap_or_default().join("macrdp.log");
+    let log_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("macrdp.log");
     let log_file = std::fs::File::create(&log_path)?;
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -32,20 +34,21 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(log_file))
+                .with_writer(std::sync::Mutex::new(log_file)),
         )
         .init();
 
     eprintln!("Log file: {}", log_path.display());
 
-    tracing::info!(version = version::version(), ?config, "macrdp server starting");
+    tracing::info!(
+        version = version::version(),
+        ?config,
+        "macrdp server starting"
+    );
 
     // Ensure TLS certificates exist
     let (cert_path, key_path) =
@@ -77,7 +80,11 @@ async fn main() -> Result<()> {
     };
     let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
         Ok((w, h)) => {
-            tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
+            tracing::info!(
+                width = w,
+                height = h,
+                "CG logical display size (CGEvent coordinate space)"
+            );
             (w as u16, h as u16)
         }
         Err(e) => {
@@ -87,7 +94,10 @@ async fn main() -> Result<()> {
     };
     if sck_w != cg_w || sck_h != cg_h {
         tracing::warn!(
-            sck_w, sck_h, cg_w, cg_h,
+            sck_w,
+            sck_h,
+            cg_w,
+            cg_h,
             "SCK and CG display sizes differ! Using CG for mouse mapping, SCK for capture."
         );
     }
@@ -112,7 +122,11 @@ async fn main() -> Result<()> {
 
     // Parse chroma mode
     let mode_444 = config.chroma_mode.as_deref() == Some("avc444");
-    tracing::info!(chroma_mode = config.chroma_mode.as_deref().unwrap_or("avc420"), mode_444, "Chroma mode");
+    tracing::info!(
+        chroma_mode = config.chroma_mode.as_deref().unwrap_or("avc420"),
+        mode_444,
+        "Chroma mode"
+    );
 
     // Resolution: "auto", "WxH" (e.g. "3840x2160"), or legacy scale (e.g. "2")
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
@@ -121,15 +135,23 @@ async fn main() -> Result<()> {
         let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
         tracing::info!(scale, width, height, "Resolution auto: display scale");
         (width * scale as u16, height * scale as u16)
-    } else if let Some((w, h)) = res_mode.split_once('x').and_then(|(w, h)| {
-        Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
-    }) {
+    } else if let Some((w, h)) = res_mode
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
+    {
         tracing::info!(w, h, "Resolution: explicit WxH");
         (w, h)
     } else if let Ok(scale) = res_mode.parse::<u32>() {
         let scale = scale.max(1).min(4);
         let (rw, rh) = (width as u32 * scale, height as u32 * scale);
-        tracing::info!(scale, rw, rh, "Resolution: legacy hidpi_scale → {}x{}", rw, rh);
+        tracing::info!(
+            scale,
+            rw,
+            rh,
+            "Resolution: legacy hidpi_scale → {}x{}",
+            rw,
+            rh
+        );
         (rw as u16, rh as u16)
     } else {
         tracing::warn!(res_mode, "Resolution: unrecognized, using logical");
@@ -143,9 +165,12 @@ async fn main() -> Result<()> {
     // different resolution.
     let coord_mapper = handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
     tracing::info!(
-        rdp_w = width, rdp_h = height,
-        cg_logical_w = cg_w, cg_logical_h = cg_h,
-        sck_w, sck_h,
+        rdp_w = width,
+        rdp_h = height,
+        cg_logical_w = cg_w,
+        cg_logical_h = cg_h,
+        sck_w,
+        sck_h,
         "Display resolution configured"
     );
 
@@ -181,7 +206,10 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("macrdp")
                 .join("clipboard");
-            Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(temp_dir, config.clipboard.max_file_size_mb)))
+            Some(Box::new(macrdp_clipboard::MacClipboardFactory::new(
+                temp_dir,
+                config.clipboard.max_file_size_mb,
+            )))
         } else {
             None
         };
@@ -210,7 +238,21 @@ async fn main() -> Result<()> {
     if cursor_channel {
         tracing::info!("Cursor channel enabled — cursor sent via RDP pointer PDUs");
     }
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone());
+    let display = MacDisplay::new(
+        width,
+        height,
+        fixed_resolution,
+        config.frame_rate,
+        quality,
+        encoder_pref,
+        mode_444,
+        show_cursor,
+        bitrate_override,
+        Arc::clone(&gfx_state),
+        coord_mapper,
+        shared_audio_tx,
+        perf_stats.clone(),
+    );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 
@@ -246,8 +288,16 @@ async fn main() -> Result<()> {
                     .as_nanos() as u64;
             let random_pass: String = (0..8)
                 .map(|i| {
-                    let v = ((seed.wrapping_mul(6364136223846793005).wrapping_add(i * 1442695040888963407)) >> (i * 5 + 3)) % 36;
-                    if v < 10 { (b'0' + v as u8) as char } else { (b'a' + (v - 10) as u8) as char }
+                    let v = ((seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(i * 1442695040888963407))
+                        >> (i * 5 + 3))
+                        % 36;
+                    if v < 10 {
+                        (b'0' + v as u8) as char
+                    } else {
+                        (b'a' + (v - 10) as u8) as char
+                    }
                 })
                 .collect();
             let user = "macrdp".to_string();
@@ -306,7 +356,9 @@ fn check_permissions() {
         tracing::warn!("[!!] Screen Recording — preflight check returned false");
         // Trigger the system dialog (no-op if already granted to this binary)
         macrdp_capture::request_screen_recording_permission();
-        tracing::warn!("     If capture fails: System Settings > Privacy & Security > Screen Recording");
+        tracing::warn!(
+            "     If capture fails: System Settings > Privacy & Security > Screen Recording"
+        );
         tracing::warn!("     Tip: debug builds change binary identity on each compile — re-authorize after rebuild");
     }
 
@@ -324,6 +376,8 @@ fn check_permissions() {
         tracing::info!("All permissions granted");
     } else {
         tracing::warn!("Some preflight checks failed — server will start anyway.");
-        tracing::warn!("If you already granted permission, this is likely a debug-build identity change.");
+        tracing::warn!(
+            "If you already granted permission, this is likely a debug-build identity change."
+        );
     }
 }

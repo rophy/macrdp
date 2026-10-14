@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn dirty_release_tree_shows_describe() {
-        assert_eq!(format_version("0.1.0", "v0.1.0-dirty"), "0.1.0 (v0.1.0-dirty)");
+        assert_eq!(
+            format_version("0.1.0", "v0.1.0-dirty"),
+            "0.1.0 (v0.1.0-dirty)"
+        );
     }
 
     #[test]

@@ -23,7 +23,10 @@ struct CoordState {
 impl MouseCoordMapper {
     pub fn new(logical_w: u16, logical_h: u16, rdp_w: u16, rdp_h: u16) -> Self {
         tracing::info!(
-            logical_w, logical_h, rdp_w, rdp_h,
+            logical_w,
+            logical_h,
+            rdp_w,
+            rdp_h,
             "MouseCoordMapper initialized"
         );
         Self(Arc::new(Mutex::new(CoordState {
@@ -48,9 +51,12 @@ impl MouseCoordMapper {
         s.rdp_w = rdp_w.max(1) as f64;
         s.rdp_h = rdp_h.max(1) as f64;
         tracing::info!(
-            old_rdp_w = old_w, old_rdp_h = old_h,
-            new_rdp_w = rdp_w, new_rdp_h = rdp_h,
-            logical_w = s.logical_w, logical_h = s.logical_h,
+            old_rdp_w = old_w,
+            old_rdp_h = old_h,
+            new_rdp_w = rdp_w,
+            new_rdp_h = rdp_h,
+            logical_w = s.logical_w,
+            logical_h = s.logical_h,
             "MouseCoordMapper: RDP desktop size updated"
         );
     }
@@ -75,9 +81,7 @@ impl MacInputHandler {
             .ok();
 
         if keyboard.is_none() || mouse.is_none() {
-            tracing::warn!(
-                "Input injection may fail — ensure Accessibility permission is granted"
-            );
+            tracing::warn!("Input injection may fail — ensure Accessibility permission is granted");
         }
 
         Self {
@@ -120,24 +124,42 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.last_mouse_y = my;
                 m.move_to(mx, my)
             }
-            MouseEvent::LeftPressed => {
-                m.button_event(MouseButton::Left, true, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::LeftReleased => {
-                m.button_event(MouseButton::Left, false, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::RightPressed => {
-                m.button_event(MouseButton::Right, true, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::RightReleased => {
-                m.button_event(MouseButton::Right, false, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::MiddlePressed => {
-                m.button_event(MouseButton::Middle, true, self.last_mouse_x, self.last_mouse_y)
-            }
-            MouseEvent::MiddleReleased => {
-                m.button_event(MouseButton::Middle, false, self.last_mouse_x, self.last_mouse_y)
-            }
+            MouseEvent::LeftPressed => m.button_event(
+                MouseButton::Left,
+                true,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::LeftReleased => m.button_event(
+                MouseButton::Left,
+                false,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::RightPressed => m.button_event(
+                MouseButton::Right,
+                true,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::RightReleased => m.button_event(
+                MouseButton::Right,
+                false,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::MiddlePressed => m.button_event(
+                MouseButton::Middle,
+                true,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
+            MouseEvent::MiddleReleased => m.button_event(
+                MouseButton::Middle,
+                false,
+                self.last_mouse_x,
+                self.last_mouse_y,
+            ),
             MouseEvent::VerticalScroll { value } => m.scroll(value),
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");

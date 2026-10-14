@@ -1,4 +1,6 @@
-use ironrdp_connector::{ConnectorError, ConnectorErrorExt as _, ConnectorResult, Sequence, State, Written};
+use ironrdp_connector::{
+    ConnectorError, ConnectorErrorExt as _, ConnectorResult, Sequence, State, Written,
+};
 use ironrdp_core::WriteBuf;
 use ironrdp_pdu::rdp;
 use ironrdp_pdu::x224::X224;
@@ -124,8 +126,12 @@ impl Sequence for FinalizationSequence {
                 debug!(message = ?synchronize_confirm, "Send");
 
                 let share_data = wrap_share_data(synchronize_confirm, self.io_channel_id);
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &share_data, output)?;
+                let written = util::encode_send_data_indication(
+                    self.user_channel_id,
+                    self.io_channel_id,
+                    &share_data,
+                    output,
+                )?;
 
                 (
                     Written::from_size(written)?,
@@ -139,8 +145,12 @@ impl Sequence for FinalizationSequence {
                 debug!(message = ?cooperate_confirm, "Send");
 
                 let share_data = wrap_share_data(cooperate_confirm, self.io_channel_id);
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &share_data, output)?;
+                let written = util::encode_send_data_indication(
+                    self.user_channel_id,
+                    self.io_channel_id,
+                    &share_data,
+                    output,
+                )?;
 
                 (
                     Written::from_size(written)?,
@@ -154,8 +164,12 @@ impl Sequence for FinalizationSequence {
                 debug!(message = ?control_confirm, "Send");
 
                 let share_data = wrap_share_data(control_confirm, self.io_channel_id);
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &share_data, output)?;
+                let written = util::encode_send_data_indication(
+                    self.user_channel_id,
+                    self.io_channel_id,
+                    &share_data,
+                    output,
+                )?;
 
                 (Written::from_size(written)?, FinalizationState::SendFontMap)
             }
@@ -166,8 +180,12 @@ impl Sequence for FinalizationSequence {
                 debug!(message = ?font_map, "Send");
 
                 let share_data = wrap_share_data(font_map, self.io_channel_id);
-                let written =
-                    util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &share_data, output)?;
+                let written = util::encode_send_data_indication(
+                    self.user_channel_id,
+                    self.io_channel_id,
+                    &share_data,
+                    output,
+                )?;
 
                 (Written::from_size(written)?, FinalizationState::Finished)
             }
@@ -200,7 +218,9 @@ impl FinalizationSequence {
 }
 
 fn create_synchronize_confirm() -> rdp::headers::ShareDataPdu {
-    rdp::headers::ShareDataPdu::Synchronize(rdp::finalization_messages::SynchronizePdu { target_user_id: 0 })
+    rdp::headers::ShareDataPdu::Synchronize(rdp::finalization_messages::SynchronizePdu {
+        target_user_id: 0,
+    })
 }
 
 fn create_cooperate_confirm() -> rdp::headers::ShareDataPdu {
@@ -227,8 +247,9 @@ fn decode_share_control(input: &[u8]) -> ConnectorResult<rdp::headers::ShareCont
     let data_request = ironrdp_core::decode::<X224<ironrdp_pdu::mcs::SendDataRequest<'_>>>(input)
         .map_err(ConnectorError::decode)
         .map(|p| p.0)?;
-    let share_control = ironrdp_core::decode::<rdp::headers::ShareControlHeader>(data_request.user_data.as_ref())
-        .map_err(ConnectorError::decode)?;
+    let share_control =
+        ironrdp_core::decode::<rdp::headers::ShareControlHeader>(data_request.user_data.as_ref())
+            .map_err(ConnectorError::decode)?;
     Ok(share_control)
 }
 

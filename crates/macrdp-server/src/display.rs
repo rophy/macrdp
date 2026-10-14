@@ -1,13 +1,16 @@
 use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
-    BitmapUpdate, DesktopSize, DisplayControlMonitorLayout, DisplayUpdate, GfxDirtyH264Update,
-    GfxFrameUpdate, H264Rect, PixelFormat as RdpPixelFormat, PointerPositionAttribute,
-    RdpServerDisplay, RdpServerDisplayUpdates, gfx::GfxState,
+    gfx::GfxState, BitmapUpdate, DesktopSize, DisplayControlMonitorLayout, DisplayUpdate,
+    GfxDirtyH264Update, GfxFrameUpdate, H264Rect, PixelFormat as RdpPixelFormat,
+    PointerPositionAttribute, RdpServerDisplay, RdpServerDisplayUpdates,
 };
 use macrdp_audio::SharedAudioTx;
-use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer, get_cursor_position};
-use macrdp_encode::{self, Quality, VideoEncoder, encode_rect_h264};
+use macrdp_capture::{
+    get_cursor_position, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer,
+    FrameData, ScreenCapturer,
+};
+use macrdp_encode::{self, encode_rect_h264, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
@@ -54,7 +57,12 @@ impl ProgressiveRamp {
     }
 
     /// Evaluate a frame and return the bitrate action to take.
-    fn evaluate(&mut self, dirty_pixels: u64, total_pixels: u64, base_bitrate: u32) -> ProgressiveAction {
+    fn evaluate(
+        &mut self,
+        dirty_pixels: u64,
+        total_pixels: u64,
+        base_bitrate: u32,
+    ) -> ProgressiveAction {
         if total_pixels == 0 {
             return ProgressiveAction::None;
         }
@@ -73,7 +81,9 @@ impl ProgressiveRamp {
         if self.remaining > 0 {
             self.remaining -= 1;
             if self.remaining == 0 {
-                return ProgressiveAction::RampComplete { bitrate: base_bitrate };
+                return ProgressiveAction::RampComplete {
+                    bitrate: base_bitrate,
+                };
             }
             let progress = 1.0 - (self.remaining as f32 / self.ramp_frames as f32);
             let factor = self.initial_quality + (1.0 - self.initial_quality) * progress;
@@ -119,8 +129,12 @@ pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<Bit
             let w = (frame.width as u16 - x).min(tile_size);
             let h = (frame.height as u16 - y).min(tile_size);
 
-            let Some(width) = NonZeroU16::new(w) else { continue };
-            let Some(height) = NonZeroU16::new(h) else { continue };
+            let Some(width) = NonZeroU16::new(w) else {
+                continue;
+            };
+            let Some(height) = NonZeroU16::new(h) else {
+                continue;
+            };
 
             let mut tile_data = Vec::with_capacity(w as usize * h as usize * bpp);
             for dy in 0..h {
@@ -129,12 +143,15 @@ pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<Bit
                 let src_x_end = src_x_start + w as usize * bpp;
                 let row_start = src_y * frame.stride;
                 if row_start + src_x_end <= bgra.len() {
-                    tile_data.extend_from_slice(&bgra[row_start + src_x_start..row_start + src_x_end]);
+                    tile_data
+                        .extend_from_slice(&bgra[row_start + src_x_start..row_start + src_x_end]);
                 }
             }
 
             let stride = w as usize * bpp;
-            let Some(stride) = NonZeroUsize::new(stride) else { continue };
+            let Some(stride) = NonZeroUsize::new(stride) else {
+                continue;
+            };
 
             updates.push(BitmapUpdate {
                 x,
@@ -183,9 +200,11 @@ pub struct MacDisplay {
 
 impl MacDisplay {
     pub fn new(
-        width: u16, height: u16,
+        width: u16,
+        height: u16,
         fixed_resolution: bool,
-        frame_rate: u32, quality: Quality,
+        frame_rate: u32,
+        quality: Quality,
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
         show_cursor: bool,
@@ -195,20 +214,37 @@ impl MacDisplay {
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
     ) -> Self {
-        let base_bitrate = bitrate_override
-            .unwrap_or_else(|| macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality));
-        tracing::info!(base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0, "Base bitrate");
+        let base_bitrate = bitrate_override.unwrap_or_else(|| {
+            macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
+        });
+        tracing::info!(
+            base_bitrate_mbps = base_bitrate as f64 / 1_000_000.0,
+            "Base bitrate"
+        );
         // Max resolution: use physical display size so clients can resize freely.
         // SCK scales_to_fit handles any resolution.
         let (max_w, max_h) = macrdp_capture::detect_display_scale()
-            .map(|scale| (width.max((width as u32 * scale) as u16), height.max((height as u32 * scale) as u16)))
+            .map(|scale| {
+                (
+                    width.max((width as u32 * scale) as u16),
+                    height.max((height as u32 * scale) as u16),
+                )
+            })
             .unwrap_or((width.max(3840), height.max(2160)));
         Self {
-            width, height,
-            max_width: max_w, max_height: max_h,
+            width,
+            height,
+            max_width: max_w,
+            max_height: max_h,
             coord_mapper,
             fixed_resolution,
-            frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
+            frame_rate,
+            quality,
+            encoder_pref,
+            mode_444,
+            show_cursor,
+            base_bitrate,
+            gfx_state,
             shared_audio_tx,
             perf_stats,
             encoder_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -220,7 +256,10 @@ impl MacDisplay {
 #[async_trait::async_trait]
 impl RdpServerDisplay for MacDisplay {
     async fn size(&mut self) -> DesktopSize {
-        DesktopSize { width: self.width, height: self.height }
+        DesktopSize {
+            width: self.width,
+            height: self.height,
+        }
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
@@ -251,14 +290,19 @@ impl RdpServerDisplay for MacDisplay {
         let h = height.min(self.max_height);
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
             tracing::info!(
-                old_w = self.width, old_h = self.height,
-                new_w = w, new_h = h,
+                old_w = self.width,
+                old_h = self.height,
+                new_w = w,
+                new_h = h,
                 "Adopting client-requested resolution"
             );
             self.width = w;
             self.height = h;
             self.base_bitrate = macrdp_encode::screen_bitrate(
-                w as u32, h as u32, self.frame_rate as f32, self.quality,
+                w as u32,
+                h as u32,
+                self.frame_rate as f32,
+                self.quality,
             );
             self.coord_mapper.update_rdp_size(w, h);
         }
@@ -269,7 +313,9 @@ impl RdpServerDisplay for MacDisplay {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
-            pixel_format: if self.encoder_pref == macrdp_encode::EncoderPreference::Hardware && !self.mode_444 {
+            pixel_format: if self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
+                && !self.mode_444
+            {
                 CapturePixelFormat::Nv12
             } else {
                 CapturePixelFormat::Bgra
@@ -277,7 +323,9 @@ impl RdpServerDisplay for MacDisplay {
             show_cursor: self.show_cursor,
         };
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
-        let audio_tx = self.shared_audio_tx.as_ref()
+        let audio_tx = self
+            .shared_audio_tx
+            .as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
         let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
 
@@ -290,17 +338,27 @@ impl RdpServerDisplay for MacDisplay {
                 Some(enc)
             } else {
                 macrdp_encode::create_encoder(
-                    self.width as u32, self.height as u32,
-                    self.frame_rate as f32, self.quality, self.encoder_pref,
-                    self.mode_444, self.base_bitrate,
-                ).ok()
+                    self.width as u32,
+                    self.height as u32,
+                    self.frame_rate as f32,
+                    self.quality,
+                    self.encoder_pref,
+                    self.mode_444,
+                    self.base_bitrate,
+                )
+                .ok()
             }
         } else {
             macrdp_encode::create_encoder(
-                self.width as u32, self.height as u32,
-                self.frame_rate as f32, self.quality, self.encoder_pref,
-                self.mode_444, self.base_bitrate,
-            ).ok()
+                self.width as u32,
+                self.height as u32,
+                self.frame_rate as f32,
+                self.quality,
+                self.encoder_pref,
+                self.mode_444,
+                self.base_bitrate,
+            )
+            .ok()
         };
         self.cached_encoder_dims = (self.width, self.height);
 
@@ -384,7 +442,10 @@ impl Drop for MacDisplayUpdates {
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         if let Some((w, h)) = self.gfx_state.lock().unwrap().pending_resize.take() {
-            return Ok(Some(DisplayUpdate::Resize(DesktopSize { width: w, height: h })));
+            return Ok(Some(DisplayUpdate::Resize(DesktopSize {
+                width: w,
+                height: h,
+            })));
         }
 
         // Replay cached keyframe on reconnect for instant image
@@ -453,12 +514,16 @@ impl MacDisplayUpdates {
             let event = match self.capturer.next_frame().await {
                 Some(e) => e,
                 None => {
-                    tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
+                    tracing::warn!(
+                        "SCStream stopped — switching to CoreGraphics fallback (lock screen?)"
+                    );
                     let fallback = CgFallbackCapturer::new(&self.capture_config);
                     loop {
                         match ScreenCapturer::new(self.capture_config.clone(), None).await {
                             Ok(new_capturer) => {
-                                tracing::info!("SCStream recovered — switching back from CoreGraphics");
+                                tracing::info!(
+                                    "SCStream recovered — switching back from CoreGraphics"
+                                );
                                 self.capturer = new_capturer;
                                 break;
                             }
@@ -492,7 +557,9 @@ impl MacDisplayUpdates {
             return;
         }
 
-        let dirty_pixels: u64 = frame.dirty_rects.iter()
+        let dirty_pixels: u64 = frame
+            .dirty_rects
+            .iter()
             .map(|r| r.width as u64 * r.height as u64)
             .sum();
         let dirty_frac = dirty_pixels as f64 / total_pixels as f64;
@@ -533,11 +600,16 @@ impl MacDisplayUpdates {
         };
 
         let total_pixels = frame.width as u64 * frame.height as u64;
-        let dirty_pixels: u64 = frame.dirty_rects.iter()
+        let dirty_pixels: u64 = frame
+            .dirty_rects
+            .iter()
             .map(|r| r.width as u64 * r.height as u64)
             .sum();
 
-        match self.progressive.evaluate(dirty_pixels, total_pixels, self.last_applied_bitrate) {
+        match self
+            .progressive
+            .evaluate(dirty_pixels, total_pixels, self.last_applied_bitrate)
+        {
             ProgressiveAction::SceneChange { bitrate, dirty_pct } => {
                 encoder.set_bitrate(bitrate);
                 encoder.force_keyframe();
@@ -572,9 +644,7 @@ impl MacDisplayUpdates {
         let (gfx_ready, use_444) = {
             let state = self.gfx_state.lock().unwrap();
             let ready = state.is_ready() && self.encoder.is_some();
-            let use_444 = self.mode_444
-                && state.avc444_supported
-                && state.avc444_enabled;
+            let use_444 = self.mode_444 && state.avc444_supported && state.avc444_enabled;
             (ready, use_444)
         };
 
@@ -605,11 +675,10 @@ impl MacDisplayUpdates {
             // GFX dirty-rect path — for small dirty regions, encode each rect
             // independently with OpenH264 instead of full-frame H.264
             if !frame.dirty_rects.is_empty() {
-                let total_area: u32 = frame.dirty_rects.iter()
-                    .map(|r| r.width * r.height)
-                    .sum();
+                let total_area: u32 = frame.dirty_rects.iter().map(|r| r.width * r.height).sum();
 
-                if total_area > 0 && total_area <= UNCOMPRESSED_MAX_PIXELS
+                if total_area > 0
+                    && total_area <= UNCOMPRESSED_MAX_PIXELS
                     && frame.dirty_rects.len() <= DIRTY_RECT_MAX_COUNT
                 {
                     if let Some(bgra) = frame.data.as_bgra_bytes() {
@@ -617,12 +686,18 @@ impl MacDisplayUpdates {
                         let mut h264_rects: Vec<H264Rect> = Vec::new();
                         let mut encode_failed = false;
 
-                        for r in frame.dirty_rects.iter().filter(|r| r.width > 0 && r.height > 0) {
+                        for r in frame
+                            .dirty_rects
+                            .iter()
+                            .filter(|r| r.width > 0 && r.height > 0)
+                        {
                             let x = r.x.min(frame.width.saturating_sub(1));
                             let y = r.y.min(frame.height.saturating_sub(1));
                             let w = r.width.min(frame.width - x);
                             let h = r.height.min(frame.height - y);
-                            if w == 0 || h == 0 { continue; }
+                            if w == 0 || h == 0 {
+                                continue;
+                            }
 
                             match encode_rect_h264(bgra, frame.stride, x, y, w, h) {
                                 Ok(encoded) => {
@@ -651,7 +726,8 @@ impl MacDisplayUpdates {
                         if !encode_failed && !h264_rects.is_empty() {
                             self.display_frame_count += 1;
                             let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            let total_h264: usize = h264_rects.iter().map(|r| r.h264_data.len()).sum();
+                            let total_h264: usize =
+                                h264_rects.iter().map(|r| r.h264_data.len()).sum();
                             {
                                 let mut st = self.gfx_state.lock().unwrap();
                                 st.last_encode_ms = encode_ms;
@@ -702,9 +778,14 @@ impl MacDisplayUpdates {
                                     st.last_frame_bytes = encoded.data.len() as u32;
                                 }
                                 if let Some(ps) = &self.perf_stats {
-                                    ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
+                                    ps.lock().unwrap().record_frame(
+                                        encode_ms,
+                                        encoded.data.len() as u32,
+                                        is_keyframe,
+                                    );
                                 }
-                                let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
+                                let frame_interval_ms =
+                                    1000.0 / self.capture_config.frame_rate as f64;
                                 if encode_ms > frame_interval_ms * 0.95 {
                                     self.skip_next_frame = true;
                                     self.overload_count += 1;
@@ -733,7 +814,9 @@ impl MacDisplayUpdates {
                                 return Ok(Some(DisplayUpdate::DefaultPointer));
                             }
                             Err(e) => {
-                                tracing::warn!("Zero-copy encode failed: {e}, falling back to DefaultPointer");
+                                tracing::warn!(
+                                    "Zero-copy encode failed: {e}, falling back to DefaultPointer"
+                                );
                                 return Ok(Some(DisplayUpdate::DefaultPointer));
                             }
                         }
@@ -749,7 +832,8 @@ impl MacDisplayUpdates {
                     match encoder.encode_bgra_444(bgra, frame.width, frame.height, frame.stride) {
                         Ok(encoded) if !encoded.main_view.data.is_empty() => {
                             let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            let total_bytes = encoded.main_view.data.len() + encoded.aux_view.data.len();
+                            let total_bytes =
+                                encoded.main_view.data.len() + encoded.aux_view.data.len();
                             let is_keyframe = encoded.main_view.is_keyframe;
                             tracing::debug!(
                                 display_frame = self.display_frame_count,
@@ -765,7 +849,11 @@ impl MacDisplayUpdates {
                                 st.last_frame_bytes = total_bytes as u32;
                             }
                             if let Some(ps) = &self.perf_stats {
-                                ps.lock().unwrap().record_frame(encode_ms, total_bytes as u32, is_keyframe);
+                                ps.lock().unwrap().record_frame(
+                                    encode_ms,
+                                    total_bytes as u32,
+                                    is_keyframe,
+                                );
                             }
                             let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                             if encode_ms > frame_interval_ms * 0.95 {
@@ -798,7 +886,10 @@ impl MacDisplayUpdates {
                             return Ok(Some(DisplayUpdate::DefaultPointer));
                         }
                         Err(e) => {
-                            tracing::warn!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
+                            tracing::warn!(
+                                display_frame = self.display_frame_count,
+                                "AVC444 encode failed: {e}, falling back to AVC420"
+                            );
                             // Fall through to AVC420 path below
                         }
                     }
@@ -822,7 +913,11 @@ impl MacDisplayUpdates {
                             st.last_frame_bytes = encoded.data.len() as u32;
                         }
                         if let Some(ps) = &self.perf_stats {
-                            ps.lock().unwrap().record_frame(encode_ms, encoded.data.len() as u32, is_keyframe);
+                            ps.lock().unwrap().record_frame(
+                                encode_ms,
+                                encoded.data.len() as u32,
+                                is_keyframe,
+                            );
                         }
                         let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
                         if encode_ms > frame_interval_ms * 0.95 {
@@ -855,7 +950,10 @@ impl MacDisplayUpdates {
                         return Ok(Some(DisplayUpdate::DefaultPointer));
                     }
                     Err(e) => {
-                        tracing::warn!(display_frame = self.display_frame_count, "H.264 encode failed: {e}");
+                        tracing::warn!(
+                            display_frame = self.display_frame_count,
+                            "H.264 encode failed: {e}"
+                        );
                     }
                 }
             }
@@ -896,8 +994,12 @@ impl MacDisplayUpdates {
             if max_x > min_x && max_y > min_y {
                 let w = max_x - min_x;
                 let h = max_y - min_y;
-                let Some(width) = NonZeroU16::new(w as u16) else { return Ok(None) };
-                let Some(height) = NonZeroU16::new(h as u16) else { return Ok(None) };
+                let Some(width) = NonZeroU16::new(w as u16) else {
+                    return Ok(None);
+                };
+                let Some(height) = NonZeroU16::new(h as u16) else {
+                    return Ok(None);
+                };
 
                 // Extract only the dirty region from the full frame buffer
                 let bpp = 4usize;
@@ -911,7 +1013,9 @@ impl MacDisplayUpdates {
                     }
                 }
 
-                let Some(stride) = NonZeroUsize::new(dirty_stride) else { return Ok(None) };
+                let Some(stride) = NonZeroUsize::new(dirty_stride) else {
+                    return Ok(None);
+                };
 
                 let update = BitmapUpdate {
                     x: min_x as u16,
@@ -928,9 +1032,15 @@ impl MacDisplayUpdates {
         }
 
         // No dirty rects available — send full frame (first frame or fallback)
-        let Some(width) = NonZeroU16::new(frame.width as u16) else { return Ok(None) };
-        let Some(height) = NonZeroU16::new(frame.height as u16) else { return Ok(None) };
-        let Some(stride) = NonZeroUsize::new(frame.stride) else { return Ok(None) };
+        let Some(width) = NonZeroU16::new(frame.width as u16) else {
+            return Ok(None);
+        };
+        let Some(height) = NonZeroU16::new(frame.height as u16) else {
+            return Ok(None);
+        };
+        let Some(stride) = NonZeroUsize::new(frame.stride) else {
+            return Ok(None);
+        };
 
         let update = BitmapUpdate {
             x: 0,
@@ -1023,8 +1133,14 @@ mod tests {
             let action = ramp.evaluate(0, 1000, base);
             match action {
                 ProgressiveAction::Ramp { bitrate } => {
-                    assert!(bitrate > prev_bitrate, "frame {i}: {bitrate} should be > {prev_bitrate}");
-                    assert!(bitrate < base, "frame {i}: {bitrate} should be < base {base}");
+                    assert!(
+                        bitrate > prev_bitrate,
+                        "frame {i}: {bitrate} should be > {prev_bitrate}"
+                    );
+                    assert!(
+                        bitrate < base,
+                        "frame {i}: {bitrate} should be < base {base}"
+                    );
                     prev_bitrate = bitrate;
                 }
                 other => panic!("frame {i}: expected Ramp, got {:?}", other),

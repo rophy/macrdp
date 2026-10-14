@@ -61,31 +61,156 @@ struct LiteralCode {
 }
 
 static LITERAL_SHORTCUTS: &[LiteralCode] = &[
-    LiteralCode { prefix: 0b11000,    prefix_len: 5, value_bits: 0, value_base: 0x00 },
-    LiteralCode { prefix: 0b11001,    prefix_len: 5, value_bits: 0, value_base: 0x01 },
-    LiteralCode { prefix: 0b110100,   prefix_len: 6, value_bits: 0, value_base: 0x02 },
-    LiteralCode { prefix: 0b110101,   prefix_len: 6, value_bits: 0, value_base: 0x03 },
-    LiteralCode { prefix: 0b110110,   prefix_len: 6, value_bits: 0, value_base: 0xFF },
-    LiteralCode { prefix: 0b1101110,  prefix_len: 7, value_bits: 0, value_base: 0x04 },
-    LiteralCode { prefix: 0b1101111,  prefix_len: 7, value_bits: 0, value_base: 0x05 },
-    LiteralCode { prefix: 0b1110000,  prefix_len: 7, value_bits: 0, value_base: 0x06 },
-    LiteralCode { prefix: 0b1110001,  prefix_len: 7, value_bits: 0, value_base: 0x07 },
-    LiteralCode { prefix: 0b1110010,  prefix_len: 7, value_bits: 0, value_base: 0x08 },
-    LiteralCode { prefix: 0b1110011,  prefix_len: 7, value_bits: 0, value_base: 0x09 },
-    LiteralCode { prefix: 0b1110100,  prefix_len: 7, value_bits: 0, value_base: 0x0A },
-    LiteralCode { prefix: 0b1110101,  prefix_len: 7, value_bits: 0, value_base: 0x0B },
-    LiteralCode { prefix: 0b1110110,  prefix_len: 7, value_bits: 0, value_base: 0x3A },
-    LiteralCode { prefix: 0b1110111,  prefix_len: 7, value_bits: 0, value_base: 0x3B },
-    LiteralCode { prefix: 0b1111000,  prefix_len: 7, value_bits: 0, value_base: 0x3C },
-    LiteralCode { prefix: 0b1111001,  prefix_len: 7, value_bits: 0, value_base: 0x3D },
-    LiteralCode { prefix: 0b1111010,  prefix_len: 7, value_bits: 0, value_base: 0x3E },
-    LiteralCode { prefix: 0b1111011,  prefix_len: 7, value_bits: 0, value_base: 0x3F },
-    LiteralCode { prefix: 0b1111100,  prefix_len: 7, value_bits: 0, value_base: 0x40 },
-    LiteralCode { prefix: 0b1111101,  prefix_len: 7, value_bits: 0, value_base: 0x80 },
-    LiteralCode { prefix: 0b11111100, prefix_len: 8, value_bits: 0, value_base: 0x0C },
-    LiteralCode { prefix: 0b11111101, prefix_len: 8, value_bits: 0, value_base: 0x38 },
-    LiteralCode { prefix: 0b11111110, prefix_len: 8, value_bits: 0, value_base: 0x39 },
-    LiteralCode { prefix: 0b11111111, prefix_len: 8, value_bits: 0, value_base: 0x66 },
+    LiteralCode {
+        prefix: 0b11000,
+        prefix_len: 5,
+        value_bits: 0,
+        value_base: 0x00,
+    },
+    LiteralCode {
+        prefix: 0b11001,
+        prefix_len: 5,
+        value_bits: 0,
+        value_base: 0x01,
+    },
+    LiteralCode {
+        prefix: 0b110100,
+        prefix_len: 6,
+        value_bits: 0,
+        value_base: 0x02,
+    },
+    LiteralCode {
+        prefix: 0b110101,
+        prefix_len: 6,
+        value_bits: 0,
+        value_base: 0x03,
+    },
+    LiteralCode {
+        prefix: 0b110110,
+        prefix_len: 6,
+        value_bits: 0,
+        value_base: 0xFF,
+    },
+    LiteralCode {
+        prefix: 0b1101110,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x04,
+    },
+    LiteralCode {
+        prefix: 0b1101111,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x05,
+    },
+    LiteralCode {
+        prefix: 0b1110000,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x06,
+    },
+    LiteralCode {
+        prefix: 0b1110001,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x07,
+    },
+    LiteralCode {
+        prefix: 0b1110010,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x08,
+    },
+    LiteralCode {
+        prefix: 0b1110011,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x09,
+    },
+    LiteralCode {
+        prefix: 0b1110100,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x0A,
+    },
+    LiteralCode {
+        prefix: 0b1110101,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x0B,
+    },
+    LiteralCode {
+        prefix: 0b1110110,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x3A,
+    },
+    LiteralCode {
+        prefix: 0b1110111,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x3B,
+    },
+    LiteralCode {
+        prefix: 0b1111000,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x3C,
+    },
+    LiteralCode {
+        prefix: 0b1111001,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x3D,
+    },
+    LiteralCode {
+        prefix: 0b1111010,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x3E,
+    },
+    LiteralCode {
+        prefix: 0b1111011,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x3F,
+    },
+    LiteralCode {
+        prefix: 0b1111100,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x40,
+    },
+    LiteralCode {
+        prefix: 0b1111101,
+        prefix_len: 7,
+        value_bits: 0,
+        value_base: 0x80,
+    },
+    LiteralCode {
+        prefix: 0b11111100,
+        prefix_len: 8,
+        value_bits: 0,
+        value_base: 0x0C,
+    },
+    LiteralCode {
+        prefix: 0b11111101,
+        prefix_len: 8,
+        value_bits: 0,
+        value_base: 0x38,
+    },
+    LiteralCode {
+        prefix: 0b11111110,
+        prefix_len: 8,
+        value_bits: 0,
+        value_base: 0x39,
+    },
+    LiteralCode {
+        prefix: 0b11111111,
+        prefix_len: 8,
+        value_bits: 0,
+        value_base: 0x66,
+    },
 ];
 
 struct DistanceCode {
@@ -97,17 +222,83 @@ struct DistanceCode {
 }
 
 static DISTANCE_TABLE: &[DistanceCode] = &[
-    DistanceCode { prefix: 0b10001,     prefix_len: 5, value_bits: 5,  base: 0,       max: 31 },
-    DistanceCode { prefix: 0b10010,     prefix_len: 5, value_bits: 7,  base: 32,      max: 159 },
-    DistanceCode { prefix: 0b10011,     prefix_len: 5, value_bits: 9,  base: 160,     max: 671 },
-    DistanceCode { prefix: 0b10100,     prefix_len: 5, value_bits: 10, base: 672,     max: 1695 },
-    DistanceCode { prefix: 0b10101,     prefix_len: 5, value_bits: 12, base: 1696,    max: 5791 },
-    DistanceCode { prefix: 0b101100,    prefix_len: 6, value_bits: 14, base: 5792,    max: 22175 },
-    DistanceCode { prefix: 0b101101,    prefix_len: 6, value_bits: 15, base: 22176,   max: 54943 },
-    DistanceCode { prefix: 0b1011100,   prefix_len: 7, value_bits: 18, base: 54944,   max: 317087 },
-    DistanceCode { prefix: 0b1011101,   prefix_len: 7, value_bits: 20, base: 317088,  max: 1365663 },
-    DistanceCode { prefix: 0b10111100,  prefix_len: 8, value_bits: 20, base: 1365664, max: 2414239 },
-    DistanceCode { prefix: 0b10111101,  prefix_len: 8, value_bits: 21, base: 2414240, max: 4511391 },
+    DistanceCode {
+        prefix: 0b10001,
+        prefix_len: 5,
+        value_bits: 5,
+        base: 0,
+        max: 31,
+    },
+    DistanceCode {
+        prefix: 0b10010,
+        prefix_len: 5,
+        value_bits: 7,
+        base: 32,
+        max: 159,
+    },
+    DistanceCode {
+        prefix: 0b10011,
+        prefix_len: 5,
+        value_bits: 9,
+        base: 160,
+        max: 671,
+    },
+    DistanceCode {
+        prefix: 0b10100,
+        prefix_len: 5,
+        value_bits: 10,
+        base: 672,
+        max: 1695,
+    },
+    DistanceCode {
+        prefix: 0b10101,
+        prefix_len: 5,
+        value_bits: 12,
+        base: 1696,
+        max: 5791,
+    },
+    DistanceCode {
+        prefix: 0b101100,
+        prefix_len: 6,
+        value_bits: 14,
+        base: 5792,
+        max: 22175,
+    },
+    DistanceCode {
+        prefix: 0b101101,
+        prefix_len: 6,
+        value_bits: 15,
+        base: 22176,
+        max: 54943,
+    },
+    DistanceCode {
+        prefix: 0b1011100,
+        prefix_len: 7,
+        value_bits: 18,
+        base: 54944,
+        max: 317087,
+    },
+    DistanceCode {
+        prefix: 0b1011101,
+        prefix_len: 7,
+        value_bits: 20,
+        base: 317088,
+        max: 1365663,
+    },
+    DistanceCode {
+        prefix: 0b10111100,
+        prefix_len: 8,
+        value_bits: 20,
+        base: 1365664,
+        max: 2414239,
+    },
+    DistanceCode {
+        prefix: 0b10111101,
+        prefix_len: 8,
+        value_bits: 21,
+        base: 2414240,
+        max: 4511391,
+    },
 ];
 
 fn literal_lookup_table() -> [u16; 256] {
@@ -268,46 +459,286 @@ mod tests {
     }
 
     static TOKEN_TABLE: &[TokenEntry] = &[
-        TokenEntry { prefix_len: 1, prefix_code: 0,   value_bits: 8,  token_type: 0, value_base: 0 },
-        TokenEntry { prefix_len: 5, prefix_code: 17,  value_bits: 5,  token_type: 1, value_base: 0 },
-        TokenEntry { prefix_len: 5, prefix_code: 18,  value_bits: 7,  token_type: 1, value_base: 32 },
-        TokenEntry { prefix_len: 5, prefix_code: 19,  value_bits: 9,  token_type: 1, value_base: 160 },
-        TokenEntry { prefix_len: 5, prefix_code: 20,  value_bits: 10, token_type: 1, value_base: 672 },
-        TokenEntry { prefix_len: 5, prefix_code: 21,  value_bits: 12, token_type: 1, value_base: 1696 },
-        TokenEntry { prefix_len: 5, prefix_code: 24,  value_bits: 0,  token_type: 0, value_base: 0x00 },
-        TokenEntry { prefix_len: 5, prefix_code: 25,  value_bits: 0,  token_type: 0, value_base: 0x01 },
-        TokenEntry { prefix_len: 6, prefix_code: 44,  value_bits: 14, token_type: 1, value_base: 5792 },
-        TokenEntry { prefix_len: 6, prefix_code: 45,  value_bits: 15, token_type: 1, value_base: 22176 },
-        TokenEntry { prefix_len: 6, prefix_code: 52,  value_bits: 0,  token_type: 0, value_base: 0x02 },
-        TokenEntry { prefix_len: 6, prefix_code: 53,  value_bits: 0,  token_type: 0, value_base: 0x03 },
-        TokenEntry { prefix_len: 6, prefix_code: 54,  value_bits: 0,  token_type: 0, value_base: 0xFF },
-        TokenEntry { prefix_len: 7, prefix_code: 92,  value_bits: 18, token_type: 1, value_base: 54944 },
-        TokenEntry { prefix_len: 7, prefix_code: 93,  value_bits: 20, token_type: 1, value_base: 317088 },
-        TokenEntry { prefix_len: 7, prefix_code: 110, value_bits: 0,  token_type: 0, value_base: 0x04 },
-        TokenEntry { prefix_len: 7, prefix_code: 111, value_bits: 0,  token_type: 0, value_base: 0x05 },
-        TokenEntry { prefix_len: 7, prefix_code: 112, value_bits: 0,  token_type: 0, value_base: 0x06 },
-        TokenEntry { prefix_len: 7, prefix_code: 113, value_bits: 0,  token_type: 0, value_base: 0x07 },
-        TokenEntry { prefix_len: 7, prefix_code: 114, value_bits: 0,  token_type: 0, value_base: 0x08 },
-        TokenEntry { prefix_len: 7, prefix_code: 115, value_bits: 0,  token_type: 0, value_base: 0x09 },
-        TokenEntry { prefix_len: 7, prefix_code: 116, value_bits: 0,  token_type: 0, value_base: 0x0A },
-        TokenEntry { prefix_len: 7, prefix_code: 117, value_bits: 0,  token_type: 0, value_base: 0x0B },
-        TokenEntry { prefix_len: 7, prefix_code: 118, value_bits: 0,  token_type: 0, value_base: 0x3A },
-        TokenEntry { prefix_len: 7, prefix_code: 119, value_bits: 0,  token_type: 0, value_base: 0x3B },
-        TokenEntry { prefix_len: 7, prefix_code: 120, value_bits: 0,  token_type: 0, value_base: 0x3C },
-        TokenEntry { prefix_len: 7, prefix_code: 121, value_bits: 0,  token_type: 0, value_base: 0x3D },
-        TokenEntry { prefix_len: 7, prefix_code: 122, value_bits: 0,  token_type: 0, value_base: 0x3E },
-        TokenEntry { prefix_len: 7, prefix_code: 123, value_bits: 0,  token_type: 0, value_base: 0x3F },
-        TokenEntry { prefix_len: 7, prefix_code: 124, value_bits: 0,  token_type: 0, value_base: 0x40 },
-        TokenEntry { prefix_len: 7, prefix_code: 125, value_bits: 0,  token_type: 0, value_base: 0x80 },
-        TokenEntry { prefix_len: 8, prefix_code: 188, value_bits: 20, token_type: 1, value_base: 1365664 },
-        TokenEntry { prefix_len: 8, prefix_code: 189, value_bits: 21, token_type: 1, value_base: 2414240 },
-        TokenEntry { prefix_len: 8, prefix_code: 252, value_bits: 0,  token_type: 0, value_base: 0x0C },
-        TokenEntry { prefix_len: 8, prefix_code: 253, value_bits: 0,  token_type: 0, value_base: 0x38 },
-        TokenEntry { prefix_len: 8, prefix_code: 254, value_bits: 0,  token_type: 0, value_base: 0x39 },
-        TokenEntry { prefix_len: 8, prefix_code: 255, value_bits: 0,  token_type: 0, value_base: 0x66 },
-        TokenEntry { prefix_len: 9, prefix_code: 380, value_bits: 22, token_type: 1, value_base: 4511392 },
-        TokenEntry { prefix_len: 9, prefix_code: 381, value_bits: 23, token_type: 1, value_base: 8705696 },
-        TokenEntry { prefix_len: 9, prefix_code: 382, value_bits: 24, token_type: 1, value_base: 17094304 },
+        TokenEntry {
+            prefix_len: 1,
+            prefix_code: 0,
+            value_bits: 8,
+            token_type: 0,
+            value_base: 0,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 17,
+            value_bits: 5,
+            token_type: 1,
+            value_base: 0,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 18,
+            value_bits: 7,
+            token_type: 1,
+            value_base: 32,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 19,
+            value_bits: 9,
+            token_type: 1,
+            value_base: 160,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 20,
+            value_bits: 10,
+            token_type: 1,
+            value_base: 672,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 21,
+            value_bits: 12,
+            token_type: 1,
+            value_base: 1696,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 24,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x00,
+        },
+        TokenEntry {
+            prefix_len: 5,
+            prefix_code: 25,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x01,
+        },
+        TokenEntry {
+            prefix_len: 6,
+            prefix_code: 44,
+            value_bits: 14,
+            token_type: 1,
+            value_base: 5792,
+        },
+        TokenEntry {
+            prefix_len: 6,
+            prefix_code: 45,
+            value_bits: 15,
+            token_type: 1,
+            value_base: 22176,
+        },
+        TokenEntry {
+            prefix_len: 6,
+            prefix_code: 52,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x02,
+        },
+        TokenEntry {
+            prefix_len: 6,
+            prefix_code: 53,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x03,
+        },
+        TokenEntry {
+            prefix_len: 6,
+            prefix_code: 54,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0xFF,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 92,
+            value_bits: 18,
+            token_type: 1,
+            value_base: 54944,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 93,
+            value_bits: 20,
+            token_type: 1,
+            value_base: 317088,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 110,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x04,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 111,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x05,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 112,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x06,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 113,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x07,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 114,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x08,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 115,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x09,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 116,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x0A,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 117,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x0B,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 118,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x3A,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 119,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x3B,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 120,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x3C,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 121,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x3D,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 122,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x3E,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 123,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x3F,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 124,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x40,
+        },
+        TokenEntry {
+            prefix_len: 7,
+            prefix_code: 125,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x80,
+        },
+        TokenEntry {
+            prefix_len: 8,
+            prefix_code: 188,
+            value_bits: 20,
+            token_type: 1,
+            value_base: 1365664,
+        },
+        TokenEntry {
+            prefix_len: 8,
+            prefix_code: 189,
+            value_bits: 21,
+            token_type: 1,
+            value_base: 2414240,
+        },
+        TokenEntry {
+            prefix_len: 8,
+            prefix_code: 252,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x0C,
+        },
+        TokenEntry {
+            prefix_len: 8,
+            prefix_code: 253,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x38,
+        },
+        TokenEntry {
+            prefix_len: 8,
+            prefix_code: 254,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x39,
+        },
+        TokenEntry {
+            prefix_len: 8,
+            prefix_code: 255,
+            value_bits: 0,
+            token_type: 0,
+            value_base: 0x66,
+        },
+        TokenEntry {
+            prefix_len: 9,
+            prefix_code: 380,
+            value_bits: 22,
+            token_type: 1,
+            value_base: 4511392,
+        },
+        TokenEntry {
+            prefix_len: 9,
+            prefix_code: 381,
+            value_bits: 23,
+            token_type: 1,
+            value_base: 8705696,
+        },
+        TokenEntry {
+            prefix_len: 9,
+            prefix_code: 382,
+            value_bits: 24,
+            token_type: 1,
+            value_base: 17094304,
+        },
     ];
 
     struct BitReader<'a> {
@@ -390,7 +821,8 @@ mod tests {
                                 }
                                 cnt + reader.get_bits(extra)
                             };
-                            let mut prev_idx = (hist_idx + HISTORY_SIZE - distance as usize) % HISTORY_SIZE;
+                            let mut prev_idx =
+                                (hist_idx + HISTORY_SIZE - distance as usize) % HISTORY_SIZE;
                             for _ in 0..count {
                                 let c = history[prev_idx];
                                 prev_idx = (prev_idx + 1) % HISTORY_SIZE;
@@ -427,7 +859,14 @@ mod tests {
     fn roundtrip(data: &[u8]) {
         let segment = compress(data);
         let decoded = decompress_segment(&segment);
-        assert_eq!(data, decoded.as_slice(), "roundtrip failed for {} bytes (segment type 0x{:02x}, compressed {} bytes)", data.len(), segment[0], segment.len());
+        assert_eq!(
+            data,
+            decoded.as_slice(),
+            "roundtrip failed for {} bytes (segment type 0x{:02x}, compressed {} bytes)",
+            data.len(),
+            segment[0],
+            segment.len()
+        );
     }
 
     #[test]
@@ -494,7 +933,9 @@ mod tests {
             ("all_zeros_64k", vec![0u8; 65536]),
             ("bgra_uniform_64k", {
                 let mut d = Vec::with_capacity(65536);
-                for _ in 0..16384 { d.extend_from_slice(&[0x1A, 0x2B, 0x3C, 0xFF]); }
+                for _ in 0..16384 {
+                    d.extend_from_slice(&[0x1A, 0x2B, 0x3C, 0xFF]);
+                }
                 d
             }),
             ("bgra_gradient_64k", {
@@ -509,7 +950,11 @@ mod tests {
         for (name, data) in &cases {
             let seg = compress(data);
             let ratio = seg.len() as f64 / data.len() as f64 * 100.0;
-            eprintln!("{name}: {} -> {} bytes ({ratio:.1}%)", data.len(), seg.len());
+            eprintln!(
+                "{name}: {} -> {} bytes ({ratio:.1}%)",
+                data.len(),
+                seg.len()
+            );
             roundtrip(data);
             assert!(seg[0] == 0x24, "{name} should compress");
         }
@@ -560,7 +1005,10 @@ mod tests {
     fn test_compressed_segment_format() {
         let data = vec![0u8; 256];
         let seg = compress(&data);
-        assert_eq!(seg[0], 0x24, "first byte must be PACKET_COMPRESSED | PACKET_COMPR_TYPE_RDP8");
+        assert_eq!(
+            seg[0], 0x24,
+            "first byte must be PACKET_COMPRESSED | PACKET_COMPR_TYPE_RDP8"
+        );
         let padding = seg[seg.len() - 1];
         assert!(padding < 8, "padding byte must be 0..7, got {padding}");
     }
@@ -569,7 +1017,10 @@ mod tests {
     fn test_uncompressed_segment_format() {
         let data = b"xy";
         let seg = compress(data);
-        assert_eq!(seg[0], 0x04, "first byte must be PACKET_COMPR_TYPE_RDP8 (uncompressed)");
+        assert_eq!(
+            seg[0], 0x04,
+            "first byte must be PACKET_COMPR_TYPE_RDP8 (uncompressed)"
+        );
         assert_eq!(&seg[1..], data);
     }
 
@@ -577,7 +1028,10 @@ mod tests {
     fn test_incompressible_falls_back() {
         let data: Vec<u8> = (0..=255).cycle().take(256).collect();
         let seg = compress(&data);
-        assert_eq!(seg[0], 0x04, "incompressible data should use uncompressed segment");
+        assert_eq!(
+            seg[0], 0x04,
+            "incompressible data should use uncompressed segment"
+        );
         assert_eq!(&seg[1..], data.as_slice());
     }
 
@@ -586,9 +1040,8 @@ mod tests {
     #[test]
     fn test_literal_shortcut_bytes() {
         let shortcut_bytes: &[u8] = &[
-            0x00, 0x01, 0x02, 0x03, 0xFF, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
-            0x3F, 0x40, 0x80, 0x0C, 0x38, 0x39, 0x66,
+            0x00, 0x01, 0x02, 0x03, 0xFF, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x3A,
+            0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x80, 0x0C, 0x38, 0x39, 0x66,
         ];
         for &b in shortcut_bytes {
             let data = vec![b; 64];
@@ -599,9 +1052,8 @@ mod tests {
     #[test]
     fn test_all_shortcut_bytes_mixed() {
         let data: Vec<u8> = vec![
-            0x00, 0x01, 0x02, 0x03, 0xFF, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
-            0x3F, 0x40, 0x80, 0x0C, 0x38, 0x39, 0x66,
+            0x00, 0x01, 0x02, 0x03, 0xFF, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x3A,
+            0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x80, 0x0C, 0x38, 0x39, 0x66,
         ];
         roundtrip(&data);
     }
@@ -678,7 +1130,11 @@ mod tests {
         let width = 256;
         let mut data = Vec::with_capacity(width * 4 * 10);
         for row in 0..10u8 {
-            let bg = if row < 3 { [0x2D, 0x2D, 0x2D, 0xFF] } else { [0xF0, 0xF0, 0xF0, 0xFF] };
+            let bg = if row < 3 {
+                [0x2D, 0x2D, 0x2D, 0xFF]
+            } else {
+                [0xF0, 0xF0, 0xF0, 0xFF]
+            };
             for col in 0..width {
                 if col > 50 && col < 200 && row > 1 && row < 8 {
                     data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);

@@ -5,7 +5,7 @@ use std::fmt;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
-use ironrdp_server::{ServerEvent, SoundServerFactory, ServerEventSender};
+use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
 use macrdp_capture::AudioFrame;
 use tokio::sync::mpsc;
 
@@ -51,9 +51,9 @@ async fn audio_loop(
                 continue;
             }
 
-            let _ = event_sender.send(ServerEvent::Rdpsnd(
-                RdpsndServerMessage::Wave(wave_data, ts as u32),
-            ));
+            let _ = event_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
+                wave_data, ts as u32,
+            )));
         }
     }
     tracing::info!("Audio loop ended");
@@ -98,17 +98,15 @@ impl fmt::Debug for MacAudioHandler {
 
 impl MacAudioHandler {
     pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let formats = vec![
-            AudioFormat {
-                format: WaveFormat::PCM,
-                n_channels: channels,
-                n_samples_per_sec: sample_rate,
-                n_avg_bytes_per_sec: sample_rate * (channels as u32) * 2,
-                n_block_align: channels * 2,
-                bits_per_sample: 16,
-                data: None,
-            },
-        ];
+        let formats = vec![AudioFormat {
+            format: WaveFormat::PCM,
+            n_channels: channels,
+            n_samples_per_sec: sample_rate,
+            n_avg_bytes_per_sec: sample_rate * (channels as u32) * 2,
+            n_block_align: channels * 2,
+            bits_per_sample: 16,
+            data: None,
+        }];
 
         Self {
             formats,
@@ -166,8 +164,7 @@ impl MacAudioFactory {
 
 impl SoundServerFactory for MacAudioFactory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
-        let sender = self.event_sender.clone()
-            .expect("event sender not set");
+        let sender = self.event_sender.clone().expect("event sender not set");
 
         let channels = self.channels;
         let sample_rate = self.sample_rate;
@@ -179,7 +176,13 @@ impl SoundServerFactory for MacAudioFactory {
         // Store the new sender so the display capturer uses it
         *self.shared_tx.lock().unwrap() = Some(tx);
 
-        tokio::spawn(audio_loop(rx, sender, frame_size_interleaved, channels, sample_rate));
+        tokio::spawn(audio_loop(
+            rx,
+            sender,
+            frame_size_interleaved,
+            channels,
+            sample_rate,
+        ));
 
         Box::new(MacAudioHandler::new(sample_rate, channels))
     }

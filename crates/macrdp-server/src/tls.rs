@@ -36,7 +36,11 @@ pub fn generate_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()
         fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
     }
 
-    tracing::info!(?cert_path, ?key_path, "Generated self-signed TLS certificate");
+    tracing::info!(
+        ?cert_path,
+        ?key_path,
+        "Generated self-signed TLS certificate"
+    );
     Ok(())
 }
 

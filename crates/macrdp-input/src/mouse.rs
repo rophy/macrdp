@@ -22,8 +22,9 @@ pub struct MouseInjector;
 
 impl MouseInjector {
     pub fn new() -> Result<Self> {
-        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission"))?;
+        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+            anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
+        })?;
         Ok(Self)
     }
 
@@ -35,13 +36,9 @@ impl MouseInjector {
     pub fn move_to(&self, x: u16, y: u16) -> Result<()> {
         let point = CGPoint::new(x as f64, y as f64);
         let source = Self::source()?;
-        let event = CGEvent::new_mouse_event(
-            source,
-            CGEventType::MouseMoved,
-            point,
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
+        let event =
+            CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
+                .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
 
         event.post(CGEventTapLocation::HID);
         tracing::trace!(x, y, "Mouse moved");

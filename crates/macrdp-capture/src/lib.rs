@@ -151,7 +151,9 @@ impl SCStreamOutputTrait for AudioOutputHandler {
             return;
         }
 
-        let Some(audio_buffer_list) = sample.audio_buffer_list() else { return };
+        let Some(audio_buffer_list) = sample.audio_buffer_list() else {
+            return;
+        };
 
         let timestamp = sample.presentation_timestamp();
         let timestamp_ms = if timestamp.timescale > 0 {
@@ -189,9 +191,7 @@ impl SCStreamOutputTrait for AudioOutputHandler {
                 .filter_map(|i| audio_buffer_list.get(i))
                 .map(|buf| {
                     let raw = buf.data();
-                    unsafe {
-                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4)
-                    }
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4) }
                 })
                 .collect();
 
@@ -358,10 +358,10 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
 fn find_main_sc_display_size() -> Result<(u32, u32)> {
     use core_graphics::display::CGDisplay;
     let main_id = CGDisplay::main().id;
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
     let displays = content.displays();
-    let display = displays.iter()
+    let display = displays
+        .iter()
         .find(|d| d.display_id() == main_id)
         .or_else(|| displays.first())
         .context("No display found")?;
@@ -373,7 +373,11 @@ pub fn detect_display_scale() -> Result<u32> {
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
     let (logical_w, _) = find_main_sc_display_size()?;
-    let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
+    let scale = if logical_w > 0 {
+        physical_w / logical_w
+    } else {
+        1
+    };
     Ok(scale.max(1))
 }
 
@@ -432,7 +436,8 @@ impl ScreenCapturer {
 
         let main_id = core_graphics::display::CGDisplay::main().id;
         let mut displays = content.displays();
-        let main_idx = displays.iter()
+        let main_idx = displays
+            .iter()
             .position(|d| d.display_id() == main_id)
             .unwrap_or(0);
         let display = if displays.is_empty() {
@@ -555,7 +560,11 @@ impl CgFallbackCapturer {
     /// Create a fallback capturer for the main display
     pub fn new(config: &CaptureConfig) -> Self {
         let display_id = core_graphics::display::CGDisplay::main().id;
-        let fps = if config.frame_rate > 0 { config.frame_rate } else { 30 };
+        let fps = if config.frame_rate > 0 {
+            config.frame_rate
+        } else {
+            30
+        };
         Self {
             display_id,
             width: config.width,

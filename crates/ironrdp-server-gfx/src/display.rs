@@ -273,7 +273,9 @@ impl BitmapUpdate {
         } else {
             let bpp = usize::from(self.format.bytes_per_pixel());
             let start = usize::from(y) * self.stride.get() + usize::from(x) * bpp;
-            let end = start + usize::from(height.get() - 1) * self.stride.get() + usize::from(width.get()) * bpp;
+            let end = start
+                + usize::from(height.get() - 1) * self.stride.get()
+                + usize::from(width.get()) * bpp;
             Some(Self {
                 x: self.x + x,
                 y: self.y + y,

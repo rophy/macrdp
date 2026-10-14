@@ -27,7 +27,10 @@ where
     Ok(written)
 }
 
-pub(crate) fn wrap_share_data(pdu: rdp::headers::ShareDataPdu, io_channel_id: u16) -> rdp::headers::ShareControlHeader {
+pub(crate) fn wrap_share_data(
+    pdu: rdp::headers::ShareDataPdu,
+    io_channel_id: u16,
+) -> rdp::headers::ShareControlHeader {
     rdp::headers::ShareControlHeader {
         share_id: 0,
         pdu_source: io_channel_id,

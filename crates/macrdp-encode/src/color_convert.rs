@@ -15,8 +15,8 @@ use std::ffi::c_void;
 #[repr(C)]
 struct VImageBuffer {
     data: *mut c_void,
-    height: usize,   // vImagePixelCount
-    width: usize,    // vImagePixelCount
+    height: usize,    // vImagePixelCount
+    width: usize,     // vImagePixelCount
     row_bytes: usize, // size_t
 }
 
@@ -53,7 +53,7 @@ struct VImageARGBToYpCbCrMatrix {
 // Format constants from vImage_Types.h enum values.
 const KV_IMAGE_ARGB8888: u32 = 0;
 const KV_IMAGE_420YP8_CB8_CR8: u32 = 3; // I420 (planar Cb + Cr)  — 'y420'/'f420'
-const KV_IMAGE_420YP8_CBCR8: u32 = 4;   // NV12 (interleaved CbCr) — '420v'/'420f'
+const KV_IMAGE_420YP8_CBCR8: u32 = 4; // NV12 (interleaved CbCr) — '420v'/'420f'
 
 // vImage processing flags
 const KV_IMAGE_NO_FLAGS: u32 = 0;
@@ -375,10 +375,10 @@ mod tests {
         for row in 0..h as usize {
             for col in 0..w as usize {
                 let px = row * stride + col * 4;
-                bgra[px] = (col * 4).min(255) as u8;       // B
-                bgra[px + 1] = (row * 4).min(255) as u8;   // G
+                bgra[px] = (col * 4).min(255) as u8; // B
+                bgra[px + 1] = (row * 4).min(255) as u8; // G
                 bgra[px + 2] = ((row + col) * 2).min(255) as u8; // R
-                bgra[px + 3] = 255;                         // A
+                bgra[px + 3] = 255; // A
             }
         }
 
@@ -428,7 +428,7 @@ mod tests {
         // Uniform gray: BGRA = (128, 128, 128, 255)
         let mut bgra = vec![0u8; stride * h as usize];
         for i in 0..(w * h) as usize {
-            bgra[i * 4] = 128;     // B
+            bgra[i * 4] = 128; // B
             bgra[i * 4 + 1] = 128; // G
             bgra[i * 4 + 2] = 128; // R
             bgra[i * 4 + 3] = 255; // A
@@ -479,10 +479,7 @@ mod tests {
         let mut yuv_too_small = vec![0u8; 100]; // way too small for 64x64
 
         let result = converter.bgra_to_i420(&bgra, w, h, stride, &mut yuv_too_small);
-        assert!(
-            result.is_err(),
-            "Should fail with too-small output buffer"
-        );
+        assert!(result.is_err(), "Should fail with too-small output buffer");
         let err_msg = result.unwrap_err();
         assert!(
             err_msg.contains("too small"),

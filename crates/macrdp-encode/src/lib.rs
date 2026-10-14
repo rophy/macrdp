@@ -1,17 +1,16 @@
 //! Video encoding abstraction (H.264 via VideoToolbox / OpenH264)
 
-mod openh264_enc;
-pub mod yuv444_split;
 #[cfg(target_os = "macos")]
 pub mod color_convert;
+mod openh264_enc;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
+pub mod yuv444_split;
 #[cfg(target_os = "macos")]
-
 use anyhow::Result;
 use bytes::Bytes;
 
-pub use openh264_enc::{OpenH264Encoder, encode_rect_h264};
+pub use openh264_enc::{encode_rect_h264, OpenH264Encoder};
 #[cfg(target_os = "macos")]
 pub use videotoolbox::VtEncoder;
 
@@ -44,15 +43,31 @@ pub enum Quality {
 /// Video encoder trait
 pub trait VideoEncoder: Send {
     /// AVC420 encode (existing)
-    fn encode_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<EncodedFrame>;
+    fn encode_bgra(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> Result<EncodedFrame>;
 
     /// AVC444 dual-stream encode.
     /// Internally performs BGRA -> YUV444 -> B-area split -> dual session encode.
-    fn encode_bgra_444(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<Avc444EncodedFrame>;
+    fn encode_bgra_444(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> Result<Avc444EncodedFrame>;
 
     /// Zero-copy encode from CVPixelBuffer (NV12). Default returns error (unsupported).
     /// Only VtEncoder overrides this.
-    fn encode_pixel_buffer(&mut self, _ptr: *mut std::ffi::c_void, _force_keyframe: bool) -> Result<EncodedFrame> {
+    fn encode_pixel_buffer(
+        &mut self,
+        _ptr: *mut std::ffi::c_void,
+        _force_keyframe: bool,
+    ) -> Result<EncodedFrame> {
         anyhow::bail!("encode_pixel_buffer not supported by this encoder")
     }
 
@@ -63,10 +78,18 @@ pub trait VideoEncoder: Send {
     fn supports_444(&self) -> bool;
 
     /// Whether this encoder supports async submit/collect pipelining.
-    fn supports_pipelining(&self) -> bool { false }
+    fn supports_pipelining(&self) -> bool {
+        false
+    }
 
     /// Submit a BGRA frame for async encoding. Returns immediately.
-    fn submit_bgra(&mut self, _data: &[u8], _width: u32, _height: u32, _stride: usize) -> Result<()> {
+    fn submit_bgra(
+        &mut self,
+        _data: &[u8],
+        _width: u32,
+        _height: u32,
+        _stride: usize,
+    ) -> Result<()> {
         anyhow::bail!("submit_bgra not supported by this encoder")
     }
 
@@ -121,7 +144,15 @@ impl EncoderPreference {
 
 /// Create an H.264 encoder based on preference.
 /// When `mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
-pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, preference: EncoderPreference, mode_444: bool, bitrate: u32) -> Result<Box<dyn VideoEncoder>> {
+pub fn create_encoder(
+    width: u32,
+    height: u32,
+    fps: f32,
+    quality: Quality,
+    preference: EncoderPreference,
+    mode_444: bool,
+    bitrate: u32,
+) -> Result<Box<dyn VideoEncoder>> {
     let enc_w = align16(width);
     let enc_h = align16(height);
 
@@ -130,7 +161,12 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
     if preference == EncoderPreference::Hardware {
         match VtEncoder::new(enc_w, enc_h, fps, bitrate, mode_444) {
             Ok(encoder) => {
-                tracing::info!(enc_w, enc_h, mode_444, "Using VideoToolbox hardware encoder (GPU)");
+                tracing::info!(
+                    enc_w,
+                    enc_h,
+                    mode_444,
+                    "Using VideoToolbox hardware encoder (GPU)"
+                );
                 return Ok(Box::new(encoder));
             }
             Err(e) => {
@@ -140,7 +176,12 @@ pub fn create_encoder(width: u32, height: u32, fps: f32, quality: Quality, prefe
     }
 
     // Software / Auto: OpenH264 CPU encoder (full P-frame support)
-    tracing::info!(enc_w, enc_h, mode_444, "Using OpenH264 software encoder (CPU)");
+    tracing::info!(
+        enc_w,
+        enc_h,
+        mode_444,
+        "Using OpenH264 software encoder (CPU)"
+    );
     let encoder = OpenH264Encoder::new(enc_w, enc_h, fps, bitrate, mode_444)?;
     Ok(Box::new(encoder))
 }

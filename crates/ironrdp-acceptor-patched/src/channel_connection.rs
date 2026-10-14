@@ -81,17 +81,24 @@ impl Sequence for ChannelConnectionSequence {
 
                 debug!(message = ?erect_domain_request, "Received");
 
-                (Written::Nothing, ChannelConnectionState::WaitAttachUserRequest)
+                (
+                    Written::Nothing,
+                    ChannelConnectionState::WaitAttachUserRequest,
+                )
             }
 
             ChannelConnectionState::WaitAttachUserRequest => {
-                let attach_user_request = ironrdp_core::decode::<X224<mcs::AttachUserRequest>>(input)
-                    .map_err(ConnectorError::decode)
-                    .map(|p| p.0)?;
+                let attach_user_request =
+                    ironrdp_core::decode::<X224<mcs::AttachUserRequest>>(input)
+                        .map_err(ConnectorError::decode)
+                        .map(|p| p.0)?;
 
                 debug!(message = ?attach_user_request, "Received");
 
-                (Written::Nothing, ChannelConnectionState::SendAttachUserConfirm)
+                (
+                    Written::Nothing,
+                    ChannelConnectionState::SendAttachUserConfirm,
+                )
             }
 
             ChannelConnectionState::SendAttachUserConfirm => {
@@ -102,11 +109,13 @@ impl Sequence for ChannelConnectionSequence {
 
                 debug!(message = ?attach_user_confirm, "Send");
 
-                let written =
-                    ironrdp_core::encode_buf(&X224(attach_user_confirm), output).map_err(ConnectorError::encode)?;
+                let written = ironrdp_core::encode_buf(&X224(attach_user_confirm), output)
+                    .map_err(ConnectorError::encode)?;
 
                 let next_state = match self.channel_ids.take() {
-                    Some(channel_ids) => ChannelConnectionState::WaitChannelJoinRequest { remaining: channel_ids },
+                    Some(channel_ids) => ChannelConnectionState::WaitChannelJoinRequest {
+                        remaining: channel_ids,
+                    },
                     None => ChannelConnectionState::AllJoined,
                 };
 
@@ -140,7 +149,10 @@ impl Sequence for ChannelConnectionSequence {
                 )
             }
 
-            ChannelConnectionState::SendChannelJoinConfirm { remaining, channel_id } => {
+            ChannelConnectionState::SendChannelJoinConfirm {
+                remaining,
+                channel_id,
+            } => {
                 let channel_confirm = mcs::ChannelJoinConfirm {
                     result: 0,
                     initiator_id: self.user_channel_id,
@@ -150,8 +162,8 @@ impl Sequence for ChannelConnectionSequence {
 
                 debug!(message = ?channel_confirm, "Send");
 
-                let written =
-                    ironrdp_core::encode_buf(&X224(channel_confirm), output).map_err(ConnectorError::encode)?;
+                let written = ironrdp_core::encode_buf(&X224(channel_confirm), output)
+                    .map_err(ConnectorError::encode)?;
 
                 let next_state = if remaining.is_empty() {
                     ChannelConnectionState::AllJoined

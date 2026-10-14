@@ -39,7 +39,9 @@ pub struct RdpServerBuilder<State> {
 
 impl RdpServerBuilder<WantsAddr> {
     pub fn new() -> Self {
-        Self { state: WantsAddr {} }
+        Self {
+            state: WantsAddr {},
+        }
     }
 
     #[expect(clippy::unused_self)] // ensuring state transition from WantsAddr
@@ -75,7 +77,11 @@ impl RdpServerBuilder<WantsSecurity> {
         }
     }
 
-    pub fn with_hybrid(self, acceptor: impl Into<TlsAcceptor>, pub_key: Vec<u8>) -> RdpServerBuilder<WantsHandler> {
+    pub fn with_hybrid(
+        self,
+        acceptor: impl Into<TlsAcceptor>,
+        pub_key: Vec<u8>,
+    ) -> RdpServerBuilder<WantsHandler> {
         RdpServerBuilder {
             state: WantsHandler {
                 addr: self.state.addr,
@@ -144,7 +150,10 @@ impl RdpServerBuilder<WantsDisplay> {
 }
 
 impl RdpServerBuilder<BuilderDone> {
-    pub fn with_cliprdr_factory(mut self, cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>) -> Self {
+    pub fn with_cliprdr_factory(
+        mut self,
+        cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+    ) -> Self {
         self.state.cliprdr_factory = cliprdr_factory;
         self
     }
@@ -196,7 +205,10 @@ struct NoopDisplay;
 #[async_trait::async_trait]
 impl RdpServerDisplay for NoopDisplay {
     async fn size(&mut self) -> DesktopSize {
-        DesktopSize { width: 0, height: 0 }
+        DesktopSize {
+            width: 0,
+            height: 0,
+        }
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {

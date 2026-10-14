@@ -14,14 +14,21 @@ use ironrdp_displaycontrol::server::{DisplayControlHandler, DisplayControlServer
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags,
+};
 use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
-use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, GeneralExtraFlags};
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{decode_err, mcs, nego, rdp, Action, PduResult};
-use ironrdp_svc::{server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage, SvcProcessor};
-use ironrdp_tokio::{split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed};
+use ironrdp_svc::{
+    server_encode_svc_messages, ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage,
+    SvcProcessor,
+};
+use ironrdp_tokio::{
+    split_tokio_framed, unsplit_tokio_framed, FramedRead, FramedWrite, TokioFramed,
+};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -376,9 +383,10 @@ impl RdpServer {
 
         // Apply hot-updated resolution for this new connection
         if let Some(ref res) = pending_resolution {
-            if let Some((w, h)) = res.split_once('x').and_then(|(w, h)| {
-                Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
-            }) {
+            if let Some((w, h)) = res
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
+            {
                 info!(w, h, "Applying hot-updated resolution for new connection");
                 // Use set_size (bypasses fixed_resolution check, since this is server-initiated)
                 self.display.lock().await.set_size(w, h);
@@ -390,7 +398,12 @@ impl RdpServer {
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
-        let mut acceptor = Acceptor::new(self.opts.security.flag(), size, capabilities, self.creds.clone());
+        let mut acceptor = Acceptor::new(
+            self.opts.security.flag(),
+            size,
+            capabilities,
+            self.creds.clone(),
+        );
 
         self.attach_channels(&mut acceptor);
 
@@ -456,10 +469,14 @@ impl RdpServer {
         self.local_addr = Some(local_addr);
 
         // Shared slot for an authenticated takeover connection waiting to be processed
-        type TakeoverSlot = Arc<Mutex<Option<(
-            TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>,
-            Acceptor,
-        )>>>;
+        type TakeoverSlot = Arc<
+            Mutex<
+                Option<(
+                    TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>,
+                    Acceptor,
+                )>,
+            >,
+        >;
         let takeover_pending: TakeoverSlot = Arc::new(Mutex::new(None));
 
         loop {
@@ -476,7 +493,10 @@ impl RdpServer {
                     gs.reset_for_reconnect(w, h, avc444_enabled);
                 }
                 self.attach_channels(&mut takeover_acceptor);
-                match self.accept_finalize(takeover_framed, takeover_acceptor).await {
+                match self
+                    .accept_finalize(takeover_framed, takeover_acceptor)
+                    .await
+                {
                     Ok(framed) => {
                         debug!("Shutting down takeover TLS connection");
                         let (mut tls_stream, _) = framed.into_inner();
@@ -650,19 +670,23 @@ impl RdpServer {
                     drop(state); // release lock before async
 
                     // Send as a single DVC message (auto-fragmented by encode_dvc_messages)
-                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
                         ChannelFlags::SHOW_PROTOCOL,
-                    ).context("Failed to encode DVC messages")?;
+                    )
+                    .context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
                         svc_messages.into(),
                         drdynvc_id,
                         user_channel_id,
                     )?;
-                    writer.write_all(&data).await
+                    writer
+                        .write_all(&data)
+                        .await
                         .context("failed to write GFX frame")?;
 
                     return Ok((RunState::Continue, encoder));
@@ -683,19 +707,23 @@ impl RdpServer {
                     let pdu_data = GfxHandler::create_uncompressed_pdu(&mut state, uncompressed);
                     drop(state);
 
-                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
                         ChannelFlags::SHOW_PROTOCOL,
-                    ).context("Failed to encode DVC messages")?;
+                    )
+                    .context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
                         svc_messages.into(),
                         drdynvc_id,
                         user_channel_id,
                     )?;
-                    writer.write_all(&data).await
+                    writer
+                        .write_all(&data)
+                        .await
                         .context("failed to write GFX uncompressed frame")?;
 
                     return Ok((RunState::Continue, encoder));
@@ -715,19 +743,23 @@ impl RdpServer {
                     let pdu_data = GfxHandler::create_dirty_h264_pdu(&mut state, dirty_h264);
                     drop(state);
 
-                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let dvc_messages: Vec<dvc::DvcMessage> =
+                        vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
                     let svc_messages = dvc::encode_dvc_messages(
                         channel_id,
                         dvc_messages,
                         ChannelFlags::SHOW_PROTOCOL,
-                    ).context("Failed to encode DVC messages")?;
+                    )
+                    .context("Failed to encode DVC messages")?;
 
                     let data = server_encode_svc_messages(
                         svc_messages.into(),
                         drdynvc_id,
                         user_channel_id,
                     )?;
-                    writer.write_all(&data).await
+                    writer
+                        .write_all(&data)
+                        .await
                         .context("failed to write GFX dirty H.264 frame")?;
 
                     return Ok((RunState::Continue, encoder));
@@ -779,7 +811,13 @@ impl RdpServer {
                     let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
                         rdp::server_error_info::ProtocolIndependentCode::RpcInitiatedDisconnect,
                     );
-                    let _ = send_graceful_disconnect(io_channel_id, user_channel_id, writer, error_info).await;
+                    let _ = send_graceful_disconnect(
+                        io_channel_id,
+                        user_channel_id,
+                        writer,
+                        error_info,
+                    )
+                    .await;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::Takeover => {
@@ -787,7 +825,13 @@ impl RdpServer {
                     let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
                         rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
                     );
-                    let _ = send_graceful_disconnect(io_channel_id, user_channel_id, writer, error_info).await;
+                    let _ = send_graceful_disconnect(
+                        io_channel_id,
+                        user_channel_id,
+                        writer,
+                        error_info,
+                    )
+                    .await;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -817,9 +861,9 @@ impl RdpServer {
                                 }
                             }
                         }
-                        RdpsndServerMessage::SetVolume { left, right } => {
-                            rdpsnd.set_volume(left, right).context("failed to send rdpsnd event")?
-                        }
+                        RdpsndServerMessage::SetVolume { left, right } => rdpsnd
+                            .set_volume(left, right)
+                            .context("failed to send rdpsnd event")?,
                         RdpsndServerMessage::Close => {
                             rdpsnd.close().context("failed to send rdpsnd event")?
                         }
@@ -831,7 +875,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<RdpsndServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::Clipboard(c) => {
@@ -840,9 +885,13 @@ impl RdpServer {
                         continue;
                     };
                     let msgs = match c {
-                        ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
+                        ClipboardMessage::SendInitiateCopy(formats) => {
+                            cliprdr.initiate_copy(&formats)
+                        }
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
-                        ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
+                        ClipboardMessage::SendInitiatePaste(format) => {
+                            cliprdr.initiate_paste(format)
+                        }
                         ClipboardMessage::Error(error) => {
                             error!(?error, "Handling clipboard event");
                             continue;
@@ -852,7 +901,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::ClipboardFileContents(response) => {
@@ -866,7 +916,8 @@ impl RdpServer {
                     let channel_id = self
                         .get_channel_id_by_type::<CliprdrServer>()
                         .ok_or_else(|| anyhow!("SVC channel not found"))?;
-                    let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
+                    let data =
+                        server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)?;
                     writer.write_all(&data).await?;
                 }
                 ServerEvent::ClipboardFileContentsRequest(request) => {
@@ -906,12 +957,21 @@ impl RdpServer {
             Ok(updates) => updates,
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if err_str.contains("Screen Recording") || err_str.contains("declined TCCs") || err_str.contains("shareable content") {
+                if err_str.contains("Screen Recording")
+                    || err_str.contains("declined TCCs")
+                    || err_str.contains("shareable content")
+                {
                     warn!("Screen capture permission denied, sending error to client");
                     let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
                         rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
                     );
-                    let _ = send_graceful_disconnect(io_channel_id, user_channel_id, writer, error_info).await;
+                    let _ = send_graceful_disconnect(
+                        io_channel_id,
+                        user_channel_id,
+                        writer,
+                        error_info,
+                    )
+                    .await;
                 }
                 return Err(e);
             }
@@ -1002,7 +1062,12 @@ impl RdpServer {
                 }
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_server_events(&mut events, &mut event_writer, io_channel_id, user_channel_id)
+                    .dispatch_server_events(
+                        &mut events,
+                        &mut event_writer,
+                        io_channel_id,
+                        user_channel_id,
+                    )
                     .await?
                 {
                     RunState::Continue => continue,
@@ -1062,7 +1127,8 @@ impl RdpServer {
                     continue;
                 }
                 let svc_responses = channel.start()?;
-                let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
+                let response =
+                    server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
             }
         }
@@ -1072,7 +1138,9 @@ impl RdpServer {
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
-                    let fastpath = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
+                    let fastpath = c
+                        .extra_flags
+                        .contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
                     if !fastpath {
                         bail!("Fastpath output not supported!");
                     }
@@ -1084,16 +1152,21 @@ impl RdpServer {
                     };
                     let display_size = self.display.lock().await.size().await;
 
-                    if client_size.width != display_size.width || client_size.height != display_size.height {
+                    if client_size.width != display_size.width
+                        || client_size.height != display_size.height
+                    {
                         info!(
-                            client_w = client_size.width, client_h = client_size.height,
-                            server_w = display_size.width, server_h = display_size.height,
+                            client_w = client_size.width,
+                            client_h = client_size.height,
+                            server_w = display_size.width,
+                            server_h = display_size.height,
                             "Client requested different resolution"
                         );
                         // Adopt client resolution via request_resize
-                        self.display.lock().await.request_resize(
-                            client_size.width, client_size.height,
-                        );
+                        self.display
+                            .lock()
+                            .await
+                            .request_resize(client_size.width, client_size.height);
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {
@@ -1111,16 +1184,16 @@ impl RdpServer {
                             // We should distinguish parameters for both modes,
                             // and somehow choose the "best", instead of picking
                             // the last parsed here.
-                            CodecProperty::RemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(c))
-                                if self.opts.has_remote_fx() =>
-                            {
+                            CodecProperty::RemoteFx(
+                                rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
+                            ) if self.opts.has_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
                             }
-                            CodecProperty::ImageRemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(
-                                c,
-                            )) if self.opts.has_image_remote_fx() => {
+                            CodecProperty::ImageRemoteFx(
+                                rdp::capability_sets::RemoteFxContainer::ClientContainer(c),
+                            ) if self.opts.has_image_remote_fx() => {
                                 for caps in c.caps_data.0 .0 {
                                     update_codecs.set_remotefx(Some((caps.entropy_bits, codec.id)));
                                 }
@@ -1147,7 +1220,13 @@ impl RdpServer {
             .context("failed to initialize update encoder")?;
 
         let state = self
-            .client_loop(reader, writer, result.io_channel_id, result.user_channel_id, encoder)
+            .client_loop(
+                reader,
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                encoder,
+            )
             .await
             .context("client loop failure")?;
 
@@ -1169,7 +1248,9 @@ impl RdpServer {
                 }
 
                 Ok(Action::X224) => {
-                    let _ = self.handle_x224(writer, io_channel_id, user_channel_id, &frame).await;
+                    let _ = self
+                        .handle_x224(writer, io_channel_id, user_channel_id, &frame)
+                        .await;
                 }
 
                 // the frame here is always valid, because otherwise it would
@@ -1259,10 +1340,17 @@ impl RdpServer {
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
                     let response_pdus = svc.process(&data.user_data)?;
-                    let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)?;
+                    let response = server_encode_svc_messages(
+                        response_pdus,
+                        data.channel_id,
+                        user_channel_id,
+                    )?;
                     writer.write_all(&response).await?;
                 } else {
-                    warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
+                    warn!(
+                        channel_id = data.channel_id,
+                        "Unexpected channel received: ID",
+                    );
                 }
             }
 
@@ -1273,7 +1361,10 @@ impl RdpServer {
             }
 
             _ => {
-                warn!(name = ironrdp_core::name(&message), "Unexpected mcs message");
+                warn!(
+                    name = ironrdp_core::name(&message),
+                    "Unexpected mcs message"
+                );
             }
         }
 
@@ -1313,7 +1404,11 @@ impl RdpServer {
         }
     }
 
-    async fn accept_finalize<S>(&mut self, mut framed: TokioFramed<S>, mut acceptor: Acceptor) -> Result<TokioFramed<S>>
+    async fn accept_finalize<S>(
+        &mut self,
+        mut framed: TokioFramed<S>,
+        mut acceptor: Acceptor,
+    ) -> Result<TokioFramed<S>>
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
@@ -1324,7 +1419,10 @@ impl RdpServer {
 
             let (mut reader, mut writer) = split_tokio_framed(new_framed);
 
-            match self.client_accepted(&mut reader, &mut writer, result).await? {
+            match self
+                .client_accepted(&mut reader, &mut writer, result)
+                .await?
+            {
                 RunState::Continue => {
                     unreachable!();
                 }
@@ -1363,7 +1461,10 @@ impl RdpServer {
         creds: Option<Credentials>,
         stream: TcpStream,
         desktop_size: DesktopSize,
-    ) -> Result<(TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>, Acceptor)> {
+    ) -> Result<(
+        TokioFramed<tokio_rustls::server::TlsStream<TcpStream>>,
+        Acceptor,
+    )> {
         let framed = TokioFramed::new(stream);
         let size = desktop_size;
         let capabilities = capabilities::capabilities(opts, size);
@@ -1380,7 +1481,9 @@ impl RdpServer {
                     RdpServerSecurity::Hybrid((acceptor, _)) => acceptor,
                     RdpServerSecurity::None => unreachable!(),
                 };
-                let accept = tls_acceptor.accept(stream).await
+                let accept = tls_acceptor
+                    .accept(stream)
+                    .await
                     .context("TLS accept failed")?;
                 let mut framed = TokioFramed::new(accept);
 
@@ -1467,8 +1570,11 @@ async fn deactivate_all(
 }
 
 async fn send_disconnect_ultimatum(writer: &mut impl FramedWrite) -> Result<(), anyhow::Error> {
-    let disconnect = mcs::DisconnectProviderUltimatum::from_reason(mcs::DisconnectReason::ProviderInitiated);
-    let msg = encode_vec(&X224(mcs::McsMessage::DisconnectProviderUltimatum(disconnect)))?;
+    let disconnect =
+        mcs::DisconnectProviderUltimatum::from_reason(mcs::DisconnectReason::ProviderInitiated);
+    let msg = encode_vec(&X224(mcs::McsMessage::DisconnectProviderUltimatum(
+        disconnect,
+    )))?;
     writer.write_all(&msg).await?;
     Ok(())
 }
@@ -1547,9 +1653,15 @@ mod tests {
 
     #[test]
     fn audio_playback_follows_client_info_flags() {
-        assert!(client_wants_audio_playback(ClientInfoFlags::MOUSE | ClientInfoFlags::UNICODE));
-        assert!(!client_wants_audio_playback(ClientInfoFlags::NO_AUDIO_PLAYBACK));
-        assert!(!client_wants_audio_playback(ClientInfoFlags::REMOTE_CONSOLE_AUDIO));
+        assert!(client_wants_audio_playback(
+            ClientInfoFlags::MOUSE | ClientInfoFlags::UNICODE
+        ));
+        assert!(!client_wants_audio_playback(
+            ClientInfoFlags::NO_AUDIO_PLAYBACK
+        ));
+        assert!(!client_wants_audio_playback(
+            ClientInfoFlags::REMOTE_CONSOLE_AUDIO
+        ));
         assert!(!client_wants_audio_playback(
             ClientInfoFlags::REMOTE_CONSOLE_AUDIO | ClientInfoFlags::NO_AUDIO_PLAYBACK
         ));
@@ -1617,8 +1729,12 @@ mod tests {
             &test_opts_no_security(),
             None,
             server_stream,
-            DesktopSize { width: 1920, height: 1080 },
-        ).await;
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .await;
 
         assert!(result.is_err());
         client_task.await.unwrap();
@@ -1639,8 +1755,12 @@ mod tests {
             &test_opts_no_security(),
             None,
             server_stream,
-            DesktopSize { width: 1920, height: 1080 },
-        ).await;
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .await;
 
         assert!(result.is_err());
         client_task.await.unwrap();
@@ -1721,8 +1841,10 @@ mod tests {
             rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
         );
         let desc = error_info.description();
-        assert!(desc.contains("insufficient") || desc.contains("privileges"),
-            "description should mention privileges: {desc}");
+        assert!(
+            desc.contains("insufficient") || desc.contains("privileges"),
+            "description should mention privileges: {desc}"
+        );
     }
 
     struct MockWriter {
@@ -1736,7 +1858,10 @@ mod tests {
     }
 
     impl FramedWrite for MockWriter {
-        type WriteAllFut<'a> = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'a>> where Self: 'a;
+        type WriteAllFut<'a>
+            = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<()>> + 'a>>
+        where
+            Self: 'a;
 
         fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
             self.chunks.push(buf.to_vec());
@@ -1754,7 +1879,11 @@ mod tests {
         assert!(!data.is_empty());
         // MCS DPU domain tag = 8, encoded in ASN.1 BER: (8 << 2) | class bits
         // The X224 wrapper adds a TPKT header (4 bytes) + X224 data header (3 bytes)
-        assert!(data.len() >= 7, "disconnect PDU should be at least 7 bytes, got {}", data.len());
+        assert!(
+            data.len() >= 7,
+            "disconnect PDU should be at least 7 bytes, got {}",
+            data.len()
+        );
     }
 
     #[tokio::test]
@@ -1763,9 +1892,15 @@ mod tests {
         let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
             rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
         );
-        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info)
+            .await
+            .unwrap();
         // Should send 3 PDUs: error info, deactivate all, disconnect ultimatum
-        assert_eq!(writer.chunks.len(), 3, "graceful disconnect should send 3 PDUs");
+        assert_eq!(
+            writer.chunks.len(),
+            3,
+            "graceful disconnect should send 3 PDUs"
+        );
     }
 
     #[tokio::test]
@@ -1774,8 +1909,14 @@ mod tests {
         let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
             rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
         );
-        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
-        assert_eq!(writer.chunks.len(), 3, "graceful disconnect should send 3 PDUs");
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.chunks.len(),
+            3,
+            "graceful disconnect should send 3 PDUs"
+        );
     }
 
     #[tokio::test]
@@ -1784,12 +1925,16 @@ mod tests {
         let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
             rdp::server_error_info::ProtocolIndependentCode::DisconnectedByOtherconnection,
         );
-        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info)
+            .await
+            .unwrap();
 
         // First PDU should contain the error code 0x05 (DisconnectedByOtherconnection)
         let first_pdu = &writer.chunks[0];
-        assert!(first_pdu.windows(4).any(|w| w == [0x05, 0x00, 0x00, 0x00]),
-            "first PDU should contain error code 0x05");
+        assert!(
+            first_pdu.windows(4).any(|w| w == [0x05, 0x00, 0x00, 0x00]),
+            "first PDU should contain error code 0x05"
+        );
     }
 
     #[tokio::test]
@@ -1798,12 +1943,18 @@ mod tests {
         let error_info = rdp::server_error_info::ErrorInfo::ProtocolIndependentCode(
             rdp::server_error_info::ProtocolIndependentCode::ServerInsufficientPrivileges,
         );
-        send_graceful_disconnect(1004, 1003, &mut writer, error_info).await.unwrap();
+        send_graceful_disconnect(1004, 1003, &mut writer, error_info)
+            .await
+            .unwrap();
 
         // Last PDU should be the disconnect ultimatum (same as standalone)
         let mut standalone_writer = MockWriter::new();
-        send_disconnect_ultimatum(&mut standalone_writer).await.unwrap();
-        assert_eq!(writer.chunks[2], standalone_writer.chunks[0],
-            "last PDU should be the MCS Disconnect Provider Ultimatum");
+        send_disconnect_ultimatum(&mut standalone_writer)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.chunks[2], standalone_writer.chunks[0],
+            "last PDU should be the MCS Disconnect Provider Ultimatum"
+        );
     }
 }

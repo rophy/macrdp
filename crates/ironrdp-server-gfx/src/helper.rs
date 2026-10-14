@@ -26,15 +26,16 @@ impl TlsIdentityCtx {
                 .collect::<Result<Vec<_>, _>>()
                 .with_context(|| format!("collecting server cert `{cert_path:?}`"))?
         } else {
-            certs(&mut BufReader::new(
-                File::open(cert_path).with_context(|| format!("opening server cert `{cert_path:?}`"))?,
-            ))
+            certs(&mut BufReader::new(File::open(cert_path).with_context(
+                || format!("opening server cert `{cert_path:?}`"),
+            )?))
             .collect::<Result<Vec<_>, _>>()
             .with_context(|| format!("collecting server cert `{cert_path:?}`"))?
         };
 
         let priv_key = if key_path.extension().is_some_and(|ext| ext == "pem") {
-            PrivateKeyDer::from_pem_file(key_path).with_context(|| format!("reading server key `{key_path:?}`"))?
+            PrivateKeyDer::from_pem_file(key_path)
+                .with_context(|| format!("reading server key `{key_path:?}`"))?
         } else {
             pkcs8_private_keys(&mut BufReader::new(File::open(key_path)?))
                 .next()
@@ -45,13 +46,17 @@ impl TlsIdentityCtx {
         let pub_key = {
             use x509_cert::der::Decode as _;
 
-            let cert = certs.first().ok_or_else(|| std::io::Error::other("invalid cert"))?;
+            let cert = certs
+                .first()
+                .ok_or_else(|| std::io::Error::other("invalid cert"))?;
             let cert = x509_cert::Certificate::from_der(cert).map_err(std::io::Error::other)?;
             cert.tbs_certificate
                 .subject_public_key_info
                 .subject_public_key
                 .as_bytes()
-                .ok_or_else(|| std::io::Error::other("subject public key BIT STRING is not aligned"))?
+                .ok_or_else(|| {
+                    std::io::Error::other("subject public key BIT STRING is not aligned")
+                })?
                 .to_owned()
         };
 

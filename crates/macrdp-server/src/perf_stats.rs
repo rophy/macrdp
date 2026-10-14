@@ -91,11 +91,18 @@ impl PerfStats {
         println!("───────────────────────────────────────────");
         println!("  Encode Latency (ms):");
         println!("    Mean:   {:<7.1} Stddev: {:.1}", enc.mean, enc.stddev);
-        println!("    P50:    {:<7.1} P95:    {:<7.1} P99:   {:.1}", enc.p50, enc.p95, enc.p99);
+        println!(
+            "    P50:    {:<7.1} P95:    {:<7.1} P99:   {:.1}",
+            enc.p50, enc.p95, enc.p99
+        );
         println!("    Min:    {:<7.1} Max:    {:.1}", enc.min, enc.max);
         println!("───────────────────────────────────────────");
         println!("  Frame Size (KB):");
-        println!("    Mean:   {:<7.1} P95:   {:.1}", size_stats.mean / 1024.0, size_stats.p95 / 1024.0);
+        println!(
+            "    Mean:   {:<7.1} P95:   {:.1}",
+            size_stats.mean / 1024.0,
+            size_stats.p95 / 1024.0
+        );
         println!("  Throughput:");
         println!("    Avg:    {:.1} Mbps", avg_mbps);
         if !self.network_rtts.is_empty() {

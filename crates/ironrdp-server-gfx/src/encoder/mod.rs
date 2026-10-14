@@ -7,7 +7,9 @@ use ironrdp_graphics::diff::{find_different_rects_sub, Rect};
 use ironrdp_pdu::encode_vec;
 use ironrdp_pdu::fast_path::UpdateCode;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
-use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute};
+use ironrdp_pdu::pointer::{
+    ColorPointerAttribute, Point16, PointerAttribute, PointerPositionAttribute,
+};
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
 use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
 use tracing::{debug, warn};
@@ -104,7 +106,11 @@ impl fmt::Debug for UpdateEncoder {
 
 impl UpdateEncoder {
     #[cfg_attr(feature = "__bench", visibility::make(pub))]
-    pub(crate) fn new(desktop_size: DesktopSize, surface_flags: CmdFlags, codecs: UpdateEncoderCodecs) -> Result<Self> {
+    pub(crate) fn new(
+        desktop_size: DesktopSize,
+        surface_flags: CmdFlags,
+        codecs: UpdateEncoderCodecs,
+    ) -> Result<Self> {
         let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
             let mut bitmap = BitmapUpdater::None(NoneHandler);
 
@@ -118,7 +124,9 @@ impl UpdateEncoder {
             }
             #[cfg(feature = "qoiz")]
             if let Some(id) = codecs.qoiz {
-                bitmap = BitmapUpdater::Qoiz(QoizHandler::new(id).context("failed to initialize qoiz handler")?);
+                bitmap = BitmapUpdater::Qoiz(
+                    QoizHandler::new(id).context("failed to initialize qoiz handler")?,
+                );
             }
 
             bitmap
@@ -168,7 +176,10 @@ impl UpdateEncoder {
             xor_bpp: 32,
             color_pointer,
         };
-        Ok(UpdateFragmenter::new(UpdateCode::NewPointer, encode_vec(&ptr)?))
+        Ok(UpdateFragmenter::new(
+            UpdateCode::NewPointer,
+            encode_vec(&ptr)?,
+        ))
     }
 
     fn color_pointer(ptr: ColorPointer) -> Result<UpdateFragmenter> {
@@ -184,7 +195,10 @@ impl UpdateEncoder {
             xor_mask: &ptr.xor_mask,
             and_mask: &ptr.and_mask,
         };
-        Ok(UpdateFragmenter::new(UpdateCode::ColorPointer, encode_vec(&ptr)?))
+        Ok(UpdateFragmenter::new(
+            UpdateCode::ColorPointer,
+            encode_vec(&ptr)?,
+        ))
     }
 
     fn default_pointer() -> Result<UpdateFragmenter> {
@@ -196,7 +210,10 @@ impl UpdateEncoder {
     }
 
     fn pointer_position(pos: PointerPositionAttribute) -> Result<UpdateFragmenter> {
-        Ok(UpdateFragmenter::new(UpdateCode::PositionPointer, encode_vec(&pos)?))
+        Ok(UpdateFragmenter::new(
+            UpdateCode::PositionPointer,
+            encode_vec(&pos)?,
+        ))
     }
 
     fn bitmap_diffs(&mut self, bitmap: &BitmapUpdate) -> Vec<Rect> {
@@ -251,7 +268,10 @@ impl UpdateEncoder {
     async fn bitmap(&mut self, bitmap: BitmapUpdate) -> Result<UpdateFragmenter> {
         // Move the bitmap updater to satisfy spawn_blocking 'static requirement.
         // It is restored after the blocking operation completes.
-        let mut updater = self.bitmap_updater.take().expect("bitmap updater always Some");
+        let mut updater = self
+            .bitmap_updater
+            .take()
+            .expect("bitmap updater always Some");
 
         let (result, updater) = tokio::task::spawn_blocking(move || {
             let result = time_warn!("Encoding bitmap", 10, updater.handle(&bitmap));
@@ -294,7 +314,11 @@ impl EncoderIter<'_> {
                 State::Start(update) => match update {
                     DisplayUpdate::Bitmap(bitmap) => {
                         let diffs = encoder.bitmap_diffs(&bitmap);
-                        self.state = State::BitmapDiffs { diffs, bitmap, pos: 0 };
+                        self.state = State::BitmapDiffs {
+                            diffs,
+                            bitmap,
+                            pos: 0,
+                        };
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
@@ -303,7 +327,9 @@ impl EncoderIter<'_> {
                     DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                     DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
                     DisplayUpdate::Resize(_) => return None,
-                    DisplayUpdate::GfxFrame(_) | DisplayUpdate::GfxUncompressed(_) | DisplayUpdate::GfxDirtyH264(_) => {
+                    DisplayUpdate::GfxFrame(_)
+                    | DisplayUpdate::GfxUncompressed(_)
+                    | DisplayUpdate::GfxDirtyH264(_) => {
                         // GFX frames are handled separately in the server loop, not through the encoder
                         return None;
                     }
@@ -314,29 +340,50 @@ impl EncoderIter<'_> {
                         self.state = State::Ended;
                         return None;
                     };
-                    let Rect { x, y, width, height } = *rect;
+                    let Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } = *rect;
 
                     let x = match u16::try_from(x) {
                         Ok(x) => x,
-                        Err(_) => return Some(Err(anyhow!("invalid `x`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!(
+                                "invalid `x`: out of range integral conversion"
+                            )))
+                        }
                     };
                     let y = match u16::try_from(y) {
                         Ok(y) => y,
-                        Err(_) => return Some(Err(anyhow!("invalid `y`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!(
+                                "invalid `y`: out of range integral conversion"
+                            )))
+                        }
                     };
                     let width = match u16::try_from(width) {
                         Ok(width) => match NonZeroU16::new(width) {
                             Some(width) => width,
                             None => return Some(Err(anyhow!("rectangle width cannot be zero"))),
                         },
-                        Err(_) => return Some(Err(anyhow!("invalid `width`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!(
+                                "invalid `width`: out of range integral conversion"
+                            )))
+                        }
                     };
                     let height = match u16::try_from(height) {
                         Ok(height) => match NonZeroU16::new(height) {
                             Some(height) => height,
                             None => return Some(Err(anyhow!("rectangle height cannot be zero"))),
                         },
-                        Err(_) => return Some(Err(anyhow!("invalid `height`: out of range integral conversion"))),
+                        Err(_) => {
+                            return Some(Err(anyhow!(
+                                "invalid `height`: out of range integral conversion"
+                            )))
+                        }
                     };
 
                     let Some(sub) = bitmap.sub(x, y, width, height) else {
@@ -524,7 +571,9 @@ struct QoizHandler {
 #[cfg(feature = "qoiz")]
 impl fmt::Debug for QoizHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QoizHandler").field("codec_id", &self.codec_id).finish()
+        f.debug_struct("QoizHandler")
+            .field("codec_id", &self.codec_id)
+            .finish()
     }
 }
 
@@ -572,7 +621,12 @@ impl BitmapUpdateHandler for QoizHandler {
                     &mut inb,
                     zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_flush,
                 )
-                .map_err(|code| anyhow!("failed to Zstd compress: {}", zstd_safe::get_error_name(code)))?;
+                .map_err(|code| {
+                    anyhow!(
+                        "failed to Zstd compress: {}",
+                        zstd_safe::get_error_name(code)
+                    )
+                })?;
             if res == 0 {
                 break;
             }
@@ -597,10 +651,14 @@ fn qoi_encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>> {
         RgbA32 => qoi::RawChannels::Rgba,
         RgbX32 => qoi::RawChannels::Rgbx,
     };
-    let enc = qoi::EncoderBuilder::new(&bitmap.data, bitmap.width.get().into(), bitmap.height.get().into())
-        .stride(bitmap.stride.get())
-        .raw_channels(raw_channels)
-        .build()?;
+    let enc = qoi::EncoderBuilder::new(
+        &bitmap.data,
+        bitmap.width.get().into(),
+        bitmap.height.get().into(),
+    )
+    .stride(bitmap.stride.get())
+    .raw_channels(raw_channels)
+    .build()?;
     Ok(enc.encode_to_vec()?)
 }
 
@@ -624,5 +682,8 @@ fn set_surface(bitmap: &BitmapUpdate, codec_id: u8, data: &[u8]) -> Result<Updat
         extended_bitmap_data,
     };
     let cmd = SurfaceCommand::SetSurfaceBits(pdu);
-    Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, encode_vec(&cmd)?))
+    Ok(UpdateFragmenter::new(
+        UpdateCode::SurfaceCommands,
+        encode_vec(&cmd)?,
+    ))
 }

@@ -2,17 +2,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use ironrdp_core::{encode_vec, impl_as_any, Encode, WriteCursor, EncodeResult};
+use ironrdp_core::{encode_vec, impl_as_any, Encode, EncodeResult, WriteCursor};
 use ironrdp_dvc::{DvcEncode, DvcProcessor, DvcServerProcessor};
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
-    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
-    CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
-    CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
+    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV103Flags,
+    CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
+    CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, Encoding, EndFramePdu,
     MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
     ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
-use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::{decode, PduResult};
 
 type DvcMessage = ironrdp_dvc::DvcMessage;
@@ -101,7 +101,10 @@ fn unwrap_zgfx(data: &[u8]) -> Option<Vec<u8>> {
                     break;
                 }
                 let seg_size = u32::from_le_bytes([
-                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
                 ]) as usize;
                 offset += 4;
                 if offset < data.len() && data[offset] == 0x04 {
@@ -259,11 +262,16 @@ impl GfxState {
             let dt = prev.elapsed().as_secs_f64().max(0.0001);
             let mbps = self.last_frame_bytes as f64 * 8.0 / dt / 1_000_000.0;
             self.bitrate_samples.push(mbps);
-            if mbps > self.bitrate_max { self.bitrate_max = mbps; }
-            if mbps < self.bitrate_min { self.bitrate_min = mbps; }
+            if mbps > self.bitrate_max {
+                self.bitrate_max = mbps;
+            }
+            if mbps < self.bitrate_min {
+                self.bitrate_min = mbps;
+            }
         }
         self.last_frame_time = Some(std::time::Instant::now());
-        self.frame_send_times.insert(self.frame_id, std::time::Instant::now());
+        self.frame_send_times
+            .insert(self.frame_id, std::time::Instant::now());
         // Limit map size to prevent unbounded growth
         if self.frame_send_times.len() > 120 {
             let cutoff = self.frame_id.saturating_sub(120);
@@ -338,12 +346,12 @@ impl GfxHandler {
         let enc_h = frame.enc_height;
 
         // Detect resolution change (e.g. client resize or HiDPI mismatch) — rebuild surface
-        if state.surface_created
-            && (state.width != frame.width || state.height != frame.height)
-        {
+        if state.surface_created && (state.width != frame.width || state.height != frame.height) {
             info!(
-                old_w = state.width, old_h = state.height,
-                new_w = frame.width, new_h = frame.height,
+                old_w = state.width,
+                old_h = state.height,
+                new_w = frame.width,
+                new_h = frame.height,
                 "GFX resolution changed, rebuilding surface"
             );
             state.width = frame.width;
@@ -385,7 +393,10 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
-            info!("GFX surface created: {}x{} (enc: {}x{})", state.width, state.height, enc_w, enc_h);
+            info!(
+                "GFX surface created: {}x{} (enc: {}x{})",
+                state.width, state.height, enc_w, enc_h
+            );
         }
 
         let frame_id = state.next_frame_id();
@@ -413,7 +424,7 @@ impl GfxHandler {
         let make_dest_rect = || InclusiveRectangle {
             left: 0,
             top: 0,
-            right: frame.width,   // RDPGFX_RECT16 exclusive bound = match surface/desktop
+            right: frame.width, // RDPGFX_RECT16 exclusive bound = match surface/desktop
             bottom: frame.height, // RDPGFX_RECT16 exclusive bound = match surface/desktop
         };
 
@@ -424,9 +435,7 @@ impl GfxHandler {
         };
 
         // Choose AVC444 or AVC420 path based on available data and negotiated caps
-        let use_avc444 = frame.h264_aux.is_some()
-            && state.avc444_supported
-            && state.avc444_enabled;
+        let use_avc444 = frame.h264_aux.is_some() && state.avc444_supported && state.avc444_enabled;
 
         if use_avc444 {
             // AVC444 path: WireToSurface1 + Avc444BitmapStream
@@ -500,16 +509,19 @@ impl GfxHandler {
     /// Create a ZGFX-wrapped buffer for uncompressed dirty rect updates.
     /// Uses WireToSurface1 with Codec1Type::Uncompressed for each rect.
     /// First call also includes surface setup PDUs.
-    pub fn create_uncompressed_pdu(state: &mut GfxState, update: &GfxUncompressedUpdate) -> Vec<u8> {
+    pub fn create_uncompressed_pdu(
+        state: &mut GfxState,
+        update: &GfxUncompressedUpdate,
+    ) -> Vec<u8> {
         let mut raw_pdus = Vec::new();
 
         // Detect resolution change — rebuild surface
-        if state.surface_created
-            && (state.width != update.width || state.height != update.height)
-        {
+        if state.surface_created && (state.width != update.width || state.height != update.height) {
             info!(
-                old_w = state.width, old_h = state.height,
-                new_w = update.width, new_h = update.height,
+                old_w = state.width,
+                old_h = state.height,
+                new_w = update.width,
+                new_h = update.height,
                 "GFX uncompressed resolution changed, rebuilding surface"
             );
             state.width = update.width;
@@ -551,7 +563,10 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
-            info!("GFX surface created (uncompressed): {}x{}", update.width, update.height);
+            info!(
+                "GFX surface created (uncompressed): {}x{}",
+                update.width, update.height
+            );
         }
 
         let frame_id = state.next_frame_id();
@@ -609,9 +624,7 @@ impl GfxHandler {
     pub fn create_dirty_h264_pdu(state: &mut GfxState, update: &GfxDirtyH264Update) -> Vec<u8> {
         let mut raw_pdus = Vec::new();
 
-        if state.surface_created
-            && (state.width != update.width || state.height != update.height)
-        {
+        if state.surface_created && (state.width != update.width || state.height != update.height) {
             state.width = update.width;
             state.height = update.height;
             state.surface_created = false;
@@ -650,7 +663,10 @@ impl GfxHandler {
             }
 
             state.surface_created = true;
-            info!("GFX surface created (dirty H.264): {}x{}", update.width, update.height);
+            info!(
+                "GFX surface created (dirty H.264): {}x{}",
+                update.width, update.height
+            );
         }
 
         let frame_id = state.next_frame_id();
@@ -766,7 +782,9 @@ impl DvcProcessor for GfxHandler {
 
                 for cap in cap_sets {
                     match cap {
-                        CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
+                        CapabilitySet::V10_7 { flags }
+                            if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) =>
+                        {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
                             best_cap = Some(cap.clone());
@@ -784,37 +802,49 @@ impl DvcProcessor for GfxHandler {
                         {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V10_3 { flags }
                             if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
                         {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
                             if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
                         {
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V10_1 => {
                             // V10_1 has no AVC_DISABLED flag — always supports AVC
                             state.avc420_supported = true;
                             state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         CapabilitySet::V8_1 { flags }
                             if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) =>
                         {
                             state.avc420_supported = true;
                             // V8.1 only supports AVC420, not AVC444
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                         _ => {
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
+                            if best_cap.is_none() {
+                                best_cap = Some(cap.clone());
+                            }
                         }
                     }
                 }
@@ -855,13 +885,26 @@ impl DvcProcessor for GfxHandler {
                     let (inst_avg, inst_std) = if n > 0.0 {
                         let sum: f64 = state.bitrate_samples.iter().sum();
                         let avg = sum / n;
-                        let var: f64 = state.bitrate_samples.iter().map(|x| (x - avg).powi(2)).sum::<f64>() / n;
+                        let var: f64 = state
+                            .bitrate_samples
+                            .iter()
+                            .map(|x| (x - avg).powi(2))
+                            .sum::<f64>()
+                            / n;
                         (avg, var.sqrt())
                     } else {
                         (0.0, 0.0)
                     };
-                    let inst_max = if state.bitrate_max > 0.0 { state.bitrate_max } else { 0.0 };
-                    let inst_min = if state.bitrate_min < f64::MAX { state.bitrate_min } else { 0.0 };
+                    let inst_max = if state.bitrate_max > 0.0 {
+                        state.bitrate_max
+                    } else {
+                        0.0
+                    };
+                    let inst_min = if state.bitrate_min < f64::MAX {
+                        state.bitrate_min
+                    } else {
+                        0.0
+                    };
 
                     info!(
                         "RTT {:.1}ms | encode {:.1}ms | net {:.1}ms | instant {:.1}/{:.1}/{:.1} Mbps (avg/max/min) | std {:.1} | {}KB/f | {} pending",
@@ -1008,9 +1051,9 @@ mod tests {
     fn pending_resize_set_when_layout_differs() {
         let gs = Arc::new(Mutex::new(GfxState::new(1920, 1080, false)));
 
-        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(
-            2560, 1440, None, None,
-        ).expect("valid layout");
+        let layout =
+            DisplayControlMonitorLayout::new_single_primary_monitor(2560, 1440, None, None)
+                .expect("valid layout");
 
         // Simulate the request_layout pattern from macrdp display implementations:
         // find primary monitor, compare dimensions, set pending_resize if different
@@ -1036,9 +1079,9 @@ mod tests {
     fn pending_resize_not_set_when_layout_matches() {
         let gs = Arc::new(Mutex::new(GfxState::new(1920, 1080, false)));
 
-        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(
-            1920, 1080, None, None,
-        ).expect("valid layout");
+        let layout =
+            DisplayControlMonitorLayout::new_single_primary_monitor(1920, 1080, None, None)
+                .expect("valid layout");
 
         {
             let primary = layout.monitors().iter().find(|m| m.is_primary());
@@ -1066,9 +1109,9 @@ mod tests {
 
     #[test]
     fn display_control_layout_roundtrip() {
-        let layout = DisplayControlMonitorLayout::new_single_primary_monitor(
-            3840, 2160, None, None,
-        ).expect("valid 4K layout");
+        let layout =
+            DisplayControlMonitorLayout::new_single_primary_monitor(3840, 2160, None, None)
+                .expect("valid 4K layout");
 
         let monitors = layout.monitors();
         assert_eq!(monitors.len(), 1);

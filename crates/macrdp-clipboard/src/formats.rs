@@ -1,6 +1,6 @@
 // Format conversion implemented in Task 6
 
-use image::{RgbaImage, ImageFormat};
+use image::{ImageFormat, RgbaImage};
 use std::io::Cursor;
 
 pub const BITMAPINFOHEADER_SIZE: usize = 40;
@@ -24,17 +24,17 @@ pub fn png_to_dib(image_data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut dib = Vec::with_capacity(BITMAPINFOHEADER_SIZE + pixel_data_size);
 
     // BITMAPINFOHEADER (40 bytes)
-    dib.extend_from_slice(&40u32.to_le_bytes());           // biSize
-    dib.extend_from_slice(&(width as i32).to_le_bytes());  // biWidth
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
     dib.extend_from_slice(&(height as i32).to_le_bytes()); // biHeight (positive = bottom-up)
-    dib.extend_from_slice(&1u16.to_le_bytes());            // biPlanes
-    dib.extend_from_slice(&32u16.to_le_bytes());           // biBitCount (BGRA)
-    dib.extend_from_slice(&0u32.to_le_bytes());            // biCompression (BI_RGB)
+    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount (BGRA)
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB)
     dib.extend_from_slice(&(pixel_data_size as u32).to_le_bytes()); // biSizeImage
-    dib.extend_from_slice(&0i32.to_le_bytes());            // biXPelsPerMeter
-    dib.extend_from_slice(&0i32.to_le_bytes());            // biYPelsPerMeter
-    dib.extend_from_slice(&0u32.to_le_bytes());            // biClrUsed
-    dib.extend_from_slice(&0u32.to_le_bytes());            // biClrImportant
+    dib.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+    dib.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
 
     // Pixel data: RGBA (top-down) → BGRA (bottom-up)
     for y in (0..height).rev() {
@@ -80,10 +80,18 @@ pub fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
                 continue;
             }
             let (r, g, b, a) = match bits_per_pixel {
-                32 => (pixel_data[px_start + 2], pixel_data[px_start + 1],
-                       pixel_data[px_start], pixel_data[px_start + 3]),
-                24 => (pixel_data[px_start + 2], pixel_data[px_start + 1],
-                       pixel_data[px_start], 255),
+                32 => (
+                    pixel_data[px_start + 2],
+                    pixel_data[px_start + 1],
+                    pixel_data[px_start],
+                    pixel_data[px_start + 3],
+                ),
+                24 => (
+                    pixel_data[px_start + 2],
+                    pixel_data[px_start + 1],
+                    pixel_data[px_start],
+                    255,
+                ),
                 _ => (0, 0, 0, 255),
             };
             img.put_pixel(x, y, image::Rgba([r, g, b, a]));
@@ -199,7 +207,11 @@ mod tests {
         img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
 
         let mut png_bytes = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).unwrap();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
 
         let dib = png_to_dib(&png_bytes).unwrap();
         assert!(dib.len() > 40);
@@ -231,7 +243,10 @@ mod tests {
 
     #[test]
     fn uti_to_rdp_file_url() {
-        assert_eq!(uti_to_rdp_format_id("public.file-url"), Some(FORMAT_ID_FILE_LIST));
+        assert_eq!(
+            uti_to_rdp_format_id("public.file-url"),
+            Some(FORMAT_ID_FILE_LIST)
+        );
     }
 
     #[test]

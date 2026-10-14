@@ -61,8 +61,8 @@ fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
     // Screen content needs high bitrate for sharp text and UI edges
     // Base bits-per-pixel at 30fps, scaled by actual fps
     let base_bpp = match quality {
-        Quality::LowLatency => 8.0,  // ~16 Mbps for 1080p@30
-        Quality::Balanced => 16.0,   // ~33 Mbps for 1080p@30
+        Quality::LowLatency => 8.0,   // ~16 Mbps for 1080p@30
+        Quality::Balanced => 16.0,    // ~33 Mbps for 1080p@30
         Quality::HighQuality => 24.0, // ~50 Mbps for 1080p@30
     };
     let fps_factor = (fps as f64 / 30.0).max(1.0);
@@ -80,7 +80,9 @@ fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Re
         .skip_frames(false)
         .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
         .complexity(openh264::encoder::Complexity::Medium)
-        .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps as u32 * 5))
+        .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
+            fps as u32 * 5,
+        ))
         .long_term_reference(true)
         .num_threads(4);
 
@@ -90,14 +92,16 @@ fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Re
 
 impl OpenH264Encoder {
     pub fn new(width: u32, height: u32, fps: f32, bitrate: u32, mode_444: bool) -> Result<Self> {
-
         let encoder = create_oh264_encoder(width, height, fps, bitrate)?;
 
         // AVC444: create auxiliary encoder with 70% bitrate
         let encoder_aux = if mode_444 {
             let aux_bitrate = (bitrate as f64 * 0.7) as u32;
             let aux = create_oh264_encoder(width, height, fps, aux_bitrate)?;
-            tracing::info!(aux_bitrate_mbps = aux_bitrate as f64 / 1_000_000.0, "AVC444 auxiliary OpenH264 encoder created");
+            tracing::info!(
+                aux_bitrate_mbps = aux_bitrate as f64 / 1_000_000.0,
+                "AVC444 auxiliary OpenH264 encoder created"
+            );
             Some(aux)
         } else {
             None
@@ -116,7 +120,10 @@ impl OpenH264Encoder {
         };
 
         tracing::info!(
-            width, height, fps, mode_444,
+            width,
+            height,
+            fps,
+            mode_444,
             bitrate_mbps = bitrate as f64 / 1_000_000.0,
             "OpenH264 encoder created (screen-optimized)"
         );
@@ -138,8 +145,13 @@ impl OpenH264Encoder {
 
 /// Convert BGRA to YUV420 into an encoder-sized buffer (handles padding).
 fn bgra_to_yuv420_padded(
-    bgra: &[u8], src_w: u32, src_h: u32, stride: usize,
-    enc_w: u32, enc_h: u32, yuv: &mut [u8],
+    bgra: &[u8],
+    src_w: u32,
+    src_h: u32,
+    stride: usize,
+    enc_w: u32,
+    enc_h: u32,
+    yuv: &mut [u8],
 ) {
     let ew = enc_w as usize;
     let sw = src_w as usize;
@@ -154,7 +166,9 @@ fn bgra_to_yuv420_padded(
     for row in 0..sh {
         for col in 0..sw {
             let bgra_offset = row * stride + col * 4;
-            if bgra_offset + 2 >= bgra.len() { continue; }
+            if bgra_offset + 2 >= bgra.len() {
+                continue;
+            }
             let b = bgra[bgra_offset] as i32;
             let g = bgra[bgra_offset + 1] as i32;
             let r = bgra[bgra_offset + 2] as i32;
@@ -183,11 +197,20 @@ fn pack_i420(y: &[u8], u: &[u8], v: &[u8], dst: &mut [u8]) {
 }
 
 impl VideoEncoder for OpenH264Encoder {
-    fn encode_bgra(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<EncodedFrame> {
+    fn encode_bgra(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> Result<EncodedFrame> {
         if width > self.width || height > self.height {
             anyhow::bail!(
                 "Frame too large: encoder {}x{}, got {}x{}",
-                self.width, self.height, width, height
+                self.width,
+                self.height,
+                width,
+                height
             );
         }
 
@@ -204,15 +227,32 @@ impl VideoEncoder for OpenH264Encoder {
             // For now, use vImage for the visible area, then zero-fill padding
             if width == self.width && height == self.height {
                 // No padding needed — vImage directly
-                converter.bgra_to_i420(data, width, height, stride, &mut self.yuv_buf)
+                converter
+                    .bgra_to_i420(data, width, height, stride, &mut self.yuv_buf)
                     .map_err(|e| anyhow::anyhow!("vImage BGRA->I420 failed: {e}"))?;
             } else {
                 // Encoder dimensions have padding — use scalar fallback for now
                 // TODO: vImage with manual padding
-                bgra_to_yuv420_padded(data, width, height, stride, self.width, self.height, &mut self.yuv_buf);
+                bgra_to_yuv420_padded(
+                    data,
+                    width,
+                    height,
+                    stride,
+                    self.width,
+                    self.height,
+                    &mut self.yuv_buf,
+                );
             }
         } else {
-            bgra_to_yuv420_padded(data, width, height, stride, self.width, self.height, &mut self.yuv_buf);
+            bgra_to_yuv420_padded(
+                data,
+                width,
+                height,
+                stride,
+                self.width,
+                self.height,
+                &mut self.yuv_buf,
+            );
         }
 
         let yuv = YUVBuffer::from_vec(
@@ -227,7 +267,9 @@ impl VideoEncoder for OpenH264Encoder {
             self.force_keyframe = false;
         }
 
-        let bitstream = self.encoder.encode(&yuv)
+        let bitstream = self
+            .encoder
+            .encode(&yuv)
             .context("OpenH264 encode failed")?;
 
         let mut nal_data = Vec::new();
@@ -243,10 +285,20 @@ impl VideoEncoder for OpenH264Encoder {
         })
     }
 
-    fn encode_bgra_444(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<Avc444EncodedFrame> {
-        let encoder_aux = self.encoder_aux.as_mut()
+    fn encode_bgra_444(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> Result<Avc444EncodedFrame> {
+        let encoder_aux = self
+            .encoder_aux
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no auxiliary encoder"))?;
-        let bufs = self.yuv444_bufs.as_mut()
+        let bufs = self
+            .yuv444_bufs
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no YUV444 buffers"))?;
 
         let w = self.width;
@@ -254,37 +306,51 @@ impl VideoEncoder for OpenH264Encoder {
 
         // Step 1: BGRA -> YUV444
         crate::yuv444_split::bgra_to_yuv444(
-            data, width, height, stride,
-            &mut bufs.y444, &mut bufs.u444, &mut bufs.v444,
+            data,
+            width,
+            height,
+            stride,
+            &mut bufs.y444,
+            &mut bufs.u444,
+            &mut bufs.v444,
         );
 
         // Step 2: YUV444 -> Main YUV420 + Aux YUV420 (B-area split)
         crate::yuv444_split::yuv444_split_to_yuv420(
-            &bufs.y444, &bufs.u444, &bufs.v444,
-            w, h,
-            &mut bufs.main_view, &mut bufs.aux_view,
+            &bufs.y444,
+            &bufs.u444,
+            &bufs.v444,
+            w,
+            h,
+            &mut bufs.main_view,
+            &mut bufs.aux_view,
         );
 
         // Step 3: Pack into I420 and encode both streams
-        pack_i420(&bufs.main_view.y, &bufs.main_view.u, &bufs.main_view.v, &mut bufs.main_yuv_buf);
-        let main_yuv = YUVBuffer::from_vec(
-            bufs.main_yuv_buf.clone(),
-            w as usize,
-            h as usize,
+        pack_i420(
+            &bufs.main_view.y,
+            &bufs.main_view.u,
+            &bufs.main_view.v,
+            &mut bufs.main_yuv_buf,
         );
-        let main_bitstream = self.encoder.encode(&main_yuv)
+        let main_yuv = YUVBuffer::from_vec(bufs.main_yuv_buf.clone(), w as usize, h as usize);
+        let main_bitstream = self
+            .encoder
+            .encode(&main_yuv)
             .context("OpenH264 main encode failed")?;
         let mut main_nal = Vec::new();
         main_bitstream.write_vec(&mut main_nal);
         let main_keyframe = matches!(main_bitstream.frame_type(), FrameType::IDR | FrameType::I);
 
-        pack_i420(&bufs.aux_view.y, &bufs.aux_view.u, &bufs.aux_view.v, &mut bufs.aux_yuv_buf);
-        let aux_yuv = YUVBuffer::from_vec(
-            bufs.aux_yuv_buf.clone(),
-            w as usize,
-            h as usize,
+        pack_i420(
+            &bufs.aux_view.y,
+            &bufs.aux_view.u,
+            &bufs.aux_view.v,
+            &mut bufs.aux_yuv_buf,
         );
-        let aux_bitstream = encoder_aux.encode(&aux_yuv)
+        let aux_yuv = YUVBuffer::from_vec(bufs.aux_yuv_buf.clone(), w as usize, h as usize);
+        let aux_bitstream = encoder_aux
+            .encode(&aux_yuv)
             .context("OpenH264 aux encode failed")?;
         let mut aux_nal = Vec::new();
         aux_bitstream.write_vec(&mut aux_nal);
@@ -330,9 +396,15 @@ impl VideoEncoder for OpenH264Encoder {
                 &mut bitrate_info as *mut _ as *mut c_void,
             );
             if ret != 0 {
-                tracing::warn!(ret, "OpenH264 set_option(BITRATE) failed, bitrate change deferred");
+                tracing::warn!(
+                    ret,
+                    "OpenH264 set_option(BITRATE) failed, bitrate change deferred"
+                );
             } else {
-                tracing::info!(bitrate_mbps = bitrate_bps as f64 / 1_000_000.0, "Bitrate updated via SetOption");
+                tracing::info!(
+                    bitrate_mbps = bitrate_bps as f64 / 1_000_000.0,
+                    "Bitrate updated via SetOption"
+                );
             }
         }
         if let Some(ref mut aux) = self.encoder_aux {
@@ -366,7 +438,10 @@ impl VideoEncoder for OpenH264Encoder {
 pub fn encode_rect_h264(
     bgra: &[u8],
     stride: usize,
-    rx: u32, ry: u32, rw: u32, rh: u32,
+    rx: u32,
+    ry: u32,
+    rw: u32,
+    rh: u32,
 ) -> Result<EncodedFrame> {
     if rw == 0 || rh == 0 {
         anyhow::bail!("zero-size rect");
@@ -408,7 +483,9 @@ pub fn encode_rect_h264(
         let src_y = ry as usize + row;
         for col in 0..rw as usize {
             let src_off = src_y * stride + (rx as usize + col) * bpp;
-            if src_off + 2 >= bgra.len() { continue; }
+            if src_off + 2 >= bgra.len() {
+                continue;
+            }
             let b = bgra[src_off] as i32;
             let g = bgra[src_off + 1] as i32;
             let r = bgra[src_off + 2] as i32;
@@ -422,13 +499,15 @@ pub fn encode_rect_h264(
                 let uv_w = enc_w as usize / 2;
                 let uv_idx = (row / 2) * uv_w + (col / 2);
                 yuv_buf[y_size + uv_idx] = u.clamp(0, 255) as u8;
-                yuv_buf[y_size + (enc_w as usize / 2) * (enc_h as usize / 2) + uv_idx] = v.clamp(0, 255) as u8;
+                yuv_buf[y_size + (enc_w as usize / 2) * (enc_h as usize / 2) + uv_idx] =
+                    v.clamp(0, 255) as u8;
             }
         }
     }
 
     let yuv = YUVBuffer::from_vec(yuv_buf, enc_w as usize, enc_h as usize);
-    let bitstream = encoder.encode(&yuv)
+    let bitstream = encoder
+        .encode(&yuv)
         .map_err(|e| anyhow::anyhow!("OpenH264 rect encode ({enc_w}x{enc_h}) failed: {e}"))?;
 
     let mut nal_data = Vec::new();
@@ -467,7 +546,11 @@ mod tests {
         assert!(encoded.width >= 50);
         assert!(encoded.height >= 30);
         // H.264 should be much smaller than raw BGRA (50*30*4 = 6000 bytes)
-        assert!(encoded.data.len() < 6000, "H.264 {} bytes should be < 6000 raw", encoded.data.len());
+        assert!(
+            encoded.data.len() < 6000,
+            "H.264 {} bytes should be < 6000 raw",
+            encoded.data.len()
+        );
     }
 
     #[test]
@@ -509,6 +592,10 @@ mod tests {
     #[test]
     fn test_screen_bitrate() {
         let br = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
-        assert!(br > 30_000_000, "1080p60 HighQuality should be > 30Mbps, got {}", br);
+        assert!(
+            br > 30_000_000,
+            "1080p60 HighQuality should be > 30Mbps, got {}",
+            br
+        );
     }
 }

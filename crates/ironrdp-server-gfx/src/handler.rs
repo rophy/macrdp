@@ -79,9 +79,15 @@ impl From<(u8, fast_path::KeyboardFlags)> for KeyboardEvent {
     fn from((key, flags): (u8, fast_path::KeyboardFlags)) -> Self {
         let extended = flags.contains(fast_path::KeyboardFlags::EXTENDED);
         if flags.contains(fast_path::KeyboardFlags::RELEASE) {
-            KeyboardEvent::Released { code: key, extended }
+            KeyboardEvent::Released {
+                code: key,
+                extended,
+            }
         } else {
-            KeyboardEvent::Pressed { code: key, extended }
+            KeyboardEvent::Pressed {
+                code: key,
+                extended,
+            }
         }
     }
 }
@@ -260,9 +266,15 @@ impl From<ainput::MousePdu> for MouseEvent {
                 MouseEvent::MiddleReleased
             }
         } else if value.flags.contains(MouseEventFlags::WHEEL) {
-            MouseEvent::Scroll { x: value.x, y: value.y }
+            MouseEvent::Scroll {
+                x: value.x,
+                y: value.y,
+            }
         } else if value.flags.contains(MouseEventFlags::REL) {
-            MouseEvent::RelMove { x: value.x, y: value.y }
+            MouseEvent::RelMove {
+                x: value.x,
+                y: value.y,
+            }
         } else if value.flags.contains(MouseEventFlags::MOVE) {
             // assume moves are 0 <= u16::MAX
             MouseEvent::Move {

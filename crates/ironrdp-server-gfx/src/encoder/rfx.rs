@@ -6,8 +6,8 @@ use ironrdp_graphics::color_conversion::to_64x64_ycbcr_tile;
 use ironrdp_graphics::rfx_encode_component;
 use ironrdp_graphics::rlgr::RlgrError;
 use ironrdp_pdu::codecs::rfx::{
-    self, Block, ChannelsPdu, CodecChannel, CodecVersionsPdu, FrameBeginPdu, FrameEndPdu, OperatingMode, Quant,
-    RegionPdu, RfxChannel, SyncPdu, TileSetPdu,
+    self, Block, ChannelsPdu, CodecChannel, CodecVersionsPdu, FrameBeginPdu, FrameEndPdu,
+    OperatingMode, Quant, RegionPdu, RfxChannel, SyncPdu, TileSetPdu,
 };
 use ironrdp_pdu::rdp::capability_sets::EntropyBits;
 use ironrdp_pdu::WriteCursor;
@@ -149,7 +149,9 @@ impl<'a> UpdateEncoder<'a> {
         #[cfg(feature = "rayon")]
         let chunks = data.0.par_chunks_mut(64 * 64 * 3);
 
-        let tiles: Vec<_> = (0..tiles_y).flat_map(|y| (0..tiles_x).map(move |x| (x, y))).collect();
+        let tiles: Vec<_> = (0..tiles_y)
+            .flat_map(|y| (0..tiles_x).map(move |x| (x, y)))
+            .collect();
 
         chunks
             .zip(tiles)
@@ -177,7 +179,12 @@ impl<'a> UpdateEncoder<'a> {
             .collect()
     }
 
-    fn encode_tile<'b>(&self, tile_x: usize, tile_y: usize, buf: &'b mut [u8]) -> Result<EncodedTile<'b>, RlgrError> {
+    fn encode_tile<'b>(
+        &self,
+        tile_x: usize,
+        tile_y: usize,
+        buf: &'b mut [u8],
+    ) -> Result<EncodedTile<'b>, RlgrError> {
         #![allow(clippy::similar_names)] // It’s hard to find better names for cr, cb, etc.
 
         assert!(buf.len() >= 4096 * 3);
@@ -188,8 +195,10 @@ impl<'a> UpdateEncoder<'a> {
 
         let x = tile_x * 64;
         let y = tile_y * 64;
-        let tile_width = u32::try_from(core::cmp::min(width - x, 64)).expect("can always fit in u32");
-        let tile_height = u32::try_from(core::cmp::min(height - y, 64)).expect("can always fit in u32");
+        let tile_width =
+            u32::try_from(core::cmp::min(width - x, 64)).expect("can always fit in u32");
+        let tile_height =
+            u32::try_from(core::cmp::min(height - y, 64)).expect("can always fit in u32");
         let stride = self.bitmap.stride.get();
         let input = &self.bitmap.data[y * stride + x * bpp..];
 
@@ -198,8 +207,17 @@ impl<'a> UpdateEncoder<'a> {
         let cb = &mut [0i16; 4096];
         let cr = &mut [0i16; 4096];
 
-        to_64x64_ycbcr_tile(input, tile_width, tile_height, stride, self.bitmap.format, y, cb, cr)
-            .map_err(RlgrError::Yuv)?;
+        to_64x64_ycbcr_tile(
+            input,
+            tile_width,
+            tile_height,
+            stride,
+            self.bitmap.format,
+            y,
+            cb,
+            cr,
+        )
+        .map_err(RlgrError::Yuv)?;
 
         let (y_data, buf) = buf.split_at_mut(4096);
         let (cb_data, cr_data) = buf.split_at_mut(4096);
@@ -240,6 +258,7 @@ pub(crate) mod bench {
     pub fn rfx_enc(bitmap: &BitmapUpdate, quant: &Quant, algo: rfx::EntropyAlgorithm) {
         let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
 
-        enc.encode(&mut data).expect("cannot propagate error in benchmark");
+        enc.encode(&mut data)
+            .expect("cannot propagate error in benchmark");
     }
 }

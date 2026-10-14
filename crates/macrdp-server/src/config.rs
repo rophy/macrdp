@@ -201,7 +201,10 @@ pub fn config_dir() -> PathBuf {
         }
     }
     // No config found — return the first candidate for writes
-    candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("."))
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// All candidate config directories in priority order.

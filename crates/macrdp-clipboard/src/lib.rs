@@ -1,7 +1,7 @@
-pub mod pasteboard;
-pub mod formats;
 pub mod file;
+pub mod formats;
 pub mod html;
+pub mod pasteboard;
 pub mod transfer;
 
 use std::fmt;
@@ -11,13 +11,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory, ClipboardMessage};
+use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::*;
 use ironrdp_core::{impl_as_any, IntoOwned};
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use crate::formats::{uti_to_rdp_format_id, png_to_dib, dib_to_png, FORMAT_ID_HTML, FORMAT_ID_FILE_LIST};
+use crate::formats::{
+    dib_to_png, png_to_dib, uti_to_rdp_format_id, FORMAT_ID_FILE_LIST, FORMAT_ID_HTML,
+};
 use crate::pasteboard::PasteboardBridge;
 use crate::transfer::FileTransferManager;
 
@@ -50,7 +52,11 @@ impl fmt::Debug for MacClipboardBackend {
 impl_as_any!(MacClipboardBackend);
 
 impl MacClipboardBackend {
-    pub fn new(event_sender: mpsc::UnboundedSender<ServerEvent>, temp_dir: PathBuf, max_file_size: u64) -> Self {
+    pub fn new(
+        event_sender: mpsc::UnboundedSender<ServerEvent>,
+        temp_dir: PathBuf,
+        max_file_size: u64,
+    ) -> Self {
         std::fs::create_dir_all(&temp_dir).ok();
         Self {
             event_sender,
@@ -74,8 +80,12 @@ impl MacClipboardBackend {
                 let fmt_id = uti_to_rdp_format_id(uti)?;
                 let mut fmt = ClipboardFormat::new(ClipboardFormatId::new(fmt_id));
                 match fmt_id {
-                    FORMAT_ID_HTML => { fmt = fmt.with_name(ClipboardFormatName::HTML); }
-                    FORMAT_ID_FILE_LIST => { fmt = fmt.with_name(ClipboardFormatName::FILE_LIST); }
+                    FORMAT_ID_HTML => {
+                        fmt = fmt.with_name(ClipboardFormatName::HTML);
+                    }
+                    FORMAT_ID_FILE_LIST => {
+                        fmt = fmt.with_name(ClipboardFormatName::FILE_LIST);
+                    }
                     _ => {}
                 }
                 Some(fmt)
@@ -125,8 +135,12 @@ impl CliprdrBackend for MacClipboardBackend {
                             let fmt_id = uti_to_rdp_format_id(uti)?;
                             let mut fmt = ClipboardFormat::new(ClipboardFormatId::new(fmt_id));
                             match fmt_id {
-                                FORMAT_ID_HTML => { fmt = fmt.with_name(ClipboardFormatName::HTML); }
-                                FORMAT_ID_FILE_LIST => { fmt = fmt.with_name(ClipboardFormatName::FILE_LIST); }
+                                FORMAT_ID_HTML => {
+                                    fmt = fmt.with_name(ClipboardFormatName::HTML);
+                                }
+                                FORMAT_ID_FILE_LIST => {
+                                    fmt = fmt.with_name(ClipboardFormatName::FILE_LIST);
+                                }
                                 _ => {}
                             }
                             Some(fmt)
@@ -147,9 +161,11 @@ impl CliprdrBackend for MacClipboardBackend {
 
     fn on_request_format_list(&mut self) {
         let formats = Self::build_format_list();
-        let _ = self.event_sender.send(ServerEvent::Clipboard(
-            ClipboardMessage::SendInitiateCopy(formats),
-        ));
+        let _ = self
+            .event_sender
+            .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+                formats,
+            )));
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -193,15 +209,13 @@ impl CliprdrBackend for MacClipboardBackend {
                     None => FormatDataResponse::new_error(),
                 }
             }
-            id if id == FORMAT_ID_HTML => {
-                match pb.read_html() {
-                    Some(html_content) => {
-                        let data = crate::html::wrap_html_format(&html_content);
-                        FormatDataResponse::new_data(data)
-                    }
-                    None => FormatDataResponse::new_error(),
+            id if id == FORMAT_ID_HTML => match pb.read_html() {
+                Some(html_content) => {
+                    let data = crate::html::wrap_html_format(&html_content);
+                    FormatDataResponse::new_data(data)
                 }
-            }
+                None => FormatDataResponse::new_error(),
+            },
             id if id == FORMAT_ID_FILE_LIST => {
                 let paths = pb.read_file_urls();
                 self.transfer_manager.set_local_files(paths);
@@ -222,9 +236,11 @@ impl CliprdrBackend for MacClipboardBackend {
 
         // Convert to owned and send
         let owned: OwnedFormatDataResponse = response.into_owned();
-        let _ = self.event_sender.send(ServerEvent::Clipboard(
-            ClipboardMessage::SendFormatData(owned),
-        ));
+        let _ = self
+            .event_sender
+            .send(ServerEvent::Clipboard(ClipboardMessage::SendFormatData(
+                owned,
+            )));
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
@@ -261,12 +277,13 @@ impl CliprdrBackend for MacClipboardBackend {
             }
             Some(id) if id == FORMAT_ID_FILE_LIST => {
                 if let Ok(file_list) = response.to_file_list() {
-                    self.transfer_manager.set_incoming_descriptors(file_list.files);
+                    self.transfer_manager
+                        .set_incoming_descriptors(file_list.files);
                     let requests = self.transfer_manager.generate_contents_requests();
                     for req in requests {
-                        let _ = self.event_sender.send(
-                            ServerEvent::ClipboardFileContentsRequest(req),
-                        );
+                        let _ = self
+                            .event_sender
+                            .send(ServerEvent::ClipboardFileContentsRequest(req));
                     }
                 }
             }
@@ -296,7 +313,9 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
         let response = self.transfer_manager.handle_contents_request(&request);
         let owned: OwnedFileContentsResponse = response.into_owned();
-        let _ = self.event_sender.send(ServerEvent::ClipboardFileContents(owned));
+        let _ = self
+            .event_sender
+            .send(ServerEvent::ClipboardFileContents(owned));
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {

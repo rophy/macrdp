@@ -2,7 +2,10 @@ use ironrdp_pdu::rdp::capability_sets::{self, GeneralExtraFlags};
 
 use crate::{DesktopSize, RdpServerOptions};
 
-pub(crate) fn capabilities(opts: &RdpServerOptions, size: DesktopSize) -> Vec<capability_sets::CapabilitySet> {
+pub(crate) fn capabilities(
+    opts: &RdpServerOptions,
+    size: DesktopSize,
+) -> Vec<capability_sets::CapabilitySet> {
     vec![
         capability_sets::CapabilitySet::General(general_capabilities()),
         capability_sets::CapabilitySet::Bitmap(bitmap_capabilities(&size)),

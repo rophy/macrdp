@@ -9,8 +9,9 @@ pub struct KeyboardInjector;
 impl KeyboardInjector {
     pub fn new() -> Result<Self> {
         // Verify we can create an event source (permission check)
-        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission"))?;
+        let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+            anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
+        })?;
         Ok(Self)
     }
 

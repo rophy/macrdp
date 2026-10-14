@@ -12,7 +12,9 @@
 
 use std::path::PathBuf;
 
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF};
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSPasteboardTypeTIFF,
+};
 use objc2_foundation::{NSData, NSString};
 use tracing::{debug, warn};
 

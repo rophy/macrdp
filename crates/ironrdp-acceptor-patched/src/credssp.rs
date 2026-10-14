@@ -4,9 +4,12 @@ use ironrdp_connector::sspi::credssp::{
 };
 use ironrdp_connector::sspi::generator::{Generator, GeneratorState};
 use ironrdp_connector::sspi::negotiate::ProtocolConfig;
-use ironrdp_connector::sspi::{self, AuthIdentity, KerberosServerConfig, NegotiateConfig, NetworkRequest, Username};
+use ironrdp_connector::sspi::{
+    self, AuthIdentity, KerberosServerConfig, NegotiateConfig, NetworkRequest, Username,
+};
 use ironrdp_connector::{
-    custom_err, general_err, ConnectorError, ConnectorErrorKind, ConnectorResult, ServerName, Written,
+    custom_err, general_err, ConnectorError, ConnectorErrorKind, ConnectorResult, ServerName,
+    Written,
 };
 use ironrdp_core::{other_err, WriteBuf};
 use ironrdp_pdu::PduHint;
@@ -57,7 +60,10 @@ impl<'a> CredentialsProxyImpl<'a> {
 impl CredentialsProxy for CredentialsProxyImpl<'_> {
     type AuthenticationData = AuthIdentity;
 
-    fn auth_data_by_user(&mut self, username: &Username) -> std::io::Result<Self::AuthenticationData> {
+    fn auth_data_by_user(
+        &mut self,
+        username: &Username,
+    ) -> std::io::Result<Self::AuthenticationData> {
         if username.account_name() != self.credentials.username.account_name() {
             return Err(std::io::Error::other("invalid username"));
         }
@@ -78,10 +84,13 @@ pub(crate) async fn resolve_generator(
     loop {
         match state {
             GeneratorState::Suspended(request) => {
-                let response = network_client.send(&request).await.map_err(|err| ServerError {
-                    ts_request: None,
-                    error: sspi::Error::new(sspi::ErrorKind::InternalError, err),
-                })?;
+                let response = network_client
+                    .send(&request)
+                    .await
+                    .map_err(|err| ServerError {
+                        ts_request: None,
+                        error: sspi::Error::new(sspi::ErrorKind::InternalError, err),
+                    })?;
                 state = generator.resume(Ok(response));
             }
             GeneratorState::Completed(client_state) => break client_state,
@@ -136,7 +145,8 @@ impl<'a> CredsspSequence<'a> {
     pub fn decode_client_message(&mut self, input: &[u8]) -> ConnectorResult<Option<TsRequest>> {
         match self.state {
             CredsspState::Ongoing => {
-                let message = TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
+                let message =
+                    TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
                 debug!(?message, "Received");
                 Ok(Some(message))
             }

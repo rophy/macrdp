@@ -1,7 +1,11 @@
 #![cfg_attr(doc, doc = include_str!("../README.md"))]
-#![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
+#![doc(
+    html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg"
+)]
 
-use ironrdp_async::{single_sequence_step, Framed, FramedRead, FramedWrite, NetworkClient, StreamWrapper};
+use ironrdp_async::{
+    single_sequence_step, Framed, FramedRead, FramedWrite, NetworkClient, StreamWrapper,
+};
 use ironrdp_connector::sspi::credssp::EarlyUserAuthResult;
 use ironrdp_connector::sspi::{AuthIdentity, KerberosServerConfig, Username};
 use ironrdp_connector::{custom_err, general_err, ConnectorResult, ServerName};
@@ -30,7 +34,10 @@ where
     Continue(Framed<S>),
 }
 
-pub async fn accept_begin<S>(mut framed: Framed<S>, acceptor: &mut Acceptor) -> ConnectorResult<BeginResult<S>>
+pub async fn accept_begin<S>(
+    mut framed: Framed<S>,
+    acceptor: &mut Acceptor,
+) -> ConnectorResult<BeginResult<S>>
 where
     S: FramedRead + FramedWrite + StreamWrapper,
 {
@@ -171,14 +178,19 @@ where
             .creds
             .as_ref()
             .ok_or_else(|| general_err!("no credentials while doing credssp"))?;
-        let username = Username::new(&creds.username, None).map_err(|e| custom_err!("invalid username", e))?;
+        let username =
+            Username::new(&creds.username, None).map_err(|e| custom_err!("invalid username", e))?;
         let identity = AuthIdentity {
             username,
             password: creds.password.clone().into(),
         };
 
-        let mut sequence =
-            credssp::CredsspSequence::init(&identity, client_computer_name, public_key, kerberos_config)?;
+        let mut sequence = credssp::CredsspSequence::init(
+            &identity,
+            client_computer_name,
+            public_key,
+            kerberos_config,
+        )?;
 
         loop {
             let Some(next_pdu_hint) = sequence.next_pdu_hint()? else {
