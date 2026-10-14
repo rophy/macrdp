@@ -67,14 +67,40 @@ Clients without H.264 GFX support (bitmap-only clients) are not supported.
 ## Requirements
 
 - macOS 14 (Sonoma) or later. Apple Silicon is tested.
-- Rust 1.89 or later, and Xcode or the Command Line Tools (for the Swift runtime that
-  ScreenCaptureKit needs).
+- To build from source: Rust 1.89 or later, and Xcode or the Command Line Tools.
 - Permissions for the `macrdp-server` binary (System Settings → Privacy & Security):
   - **Screen Recording** — capture
   - **Accessibility** — keyboard and mouse injection
 
-macOS grants these permissions per binary path and file. After each rebuild, you may have
-to grant them again.
+macOS grants these permissions per binary path and signature. Release binaries keep them
+across upgrades; after each local rebuild, you may have to grant them again.
+
+---
+
+## Install
+
+Download `macrdp-vX.Y.Z-macos-arm64.tar.gz` and `SHA256SUMS` from
+[Releases](https://github.com/rophy/macrdp/releases) (Apple Silicon, signed and notarized),
+then:
+
+```bash
+shasum -a 256 -c SHA256SUMS
+tar xzf macrdp-vX.Y.Z-macos-arm64.tar.gz
+cd macrdp-vX.Y.Z-macos-arm64
+./install.sh
+```
+
+`install.sh` runs as your user (no sudo). It:
+
+- copies `macrdp-server` to `~/.local/bin` (set `PREFIX` to change)
+- creates `~/.config/macrdp/config.toml` with your user name and a random password, if it
+  does not exist
+- starts the LaunchAgent `io.github.rophy.macrdp`; logs go to `~/Library/Logs/macrdp/`
+
+Then give `macrdp-server` Screen Recording and Accessibility permission and restart it
+(`install.sh` prints the command). The binary is signed with a fixed identity, so the
+permissions stay valid after an upgrade. `./uninstall.sh` removes the binary and the
+LaunchAgent and keeps your config and logs.
 
 ---
 
@@ -198,7 +224,21 @@ Compared with upstream:
 - Audio: no silent chunks; respects the client audio mode
 - Error Info PDU and graceful disconnect sequence
 - Main display is used for capture (was: first display)
+- Signed and notarized Apple Silicon releases, install script and LaunchAgent; CI
+- Desktop UI (Tauri) removed; the server runs as a LaunchAgent
 - E2E smoke test and benchmark scripts
+
+---
+
+## Versioning and releases
+
+The version is in `Cargo.toml` (`[workspace.package] version`). Between releases, `main`
+carries the next version with `-dev` (for example `0.2.0-dev`). `macrdp-server --version`
+adds `git describe` output to builds that are not a release tag.
+
+To release: commit `version = "X.Y.Z"` to `main`. After CI passes, the release workflow
+builds, signs, notarizes and publishes `vX.Y.Z` and creates the tag. Then commit the next
+`-dev` version. A `-dev` version, or a version whose tag exists, is not released.
 
 ---
 
