@@ -36,8 +36,8 @@ pub fn request_accessibility_permission() -> bool {
         let dict = core_foundation::base::CFType::wrap_under_create_rule(
             core_foundation_sys::dictionary::CFDictionaryCreate(
                 std::ptr::null(),
-                keys.as_ptr() as *const *const _,
-                values.as_ptr() as *const *const _,
+                keys.as_ptr(),
+                values.as_ptr(),
                 1,
                 &core_foundation_sys::dictionary::kCFTypeDictionaryKeyCallBacks,
                 &core_foundation_sys::dictionary::kCFTypeDictionaryValueCallBacks,

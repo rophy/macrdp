@@ -8,7 +8,7 @@ use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::YUVBuffer;
 
 use crate::color_convert::VImageConverter;
-use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
+use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 pub struct OpenH264Encoder {
     encoder: Encoder,
@@ -53,20 +53,6 @@ impl Yuv444SplitBufs {
             aux_yuv_buf: vec![0u8; yuv420_size],
         }
     }
-}
-
-/// Calculate optimal bitrate for screen content
-fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u32 {
-    let pixels = width as f64 * height as f64;
-    // Screen content needs high bitrate for sharp text and UI edges
-    // Base bits-per-pixel at 30fps, scaled by actual fps
-    let base_bpp = match quality {
-        Quality::LowLatency => 8.0,   // ~16 Mbps for 1080p@30
-        Quality::Balanced => 16.0,    // ~33 Mbps for 1080p@30
-        Quality::HighQuality => 24.0, // ~50 Mbps for 1080p@30
-    };
-    let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
 }
 
 fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Result<Encoder> {
@@ -388,7 +374,7 @@ impl VideoEncoder for OpenH264Encoder {
         unsafe {
             let raw = self.encoder.raw_api();
             let mut bitrate_info = openh264_sys2::SBitrateInfo {
-                iLayer: openh264_sys2::SPATIAL_LAYER_ALL as i32,
+                iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
                 iBitrate: bitrate_bps as i32,
             };
             let ret = raw.set_option(
@@ -412,7 +398,7 @@ impl VideoEncoder for OpenH264Encoder {
             unsafe {
                 let raw = aux.raw_api();
                 let mut bitrate_info = openh264_sys2::SBitrateInfo {
-                    iLayer: openh264_sys2::SPATIAL_LAYER_ALL as i32,
+                    iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
                     iBitrate: aux_bitrate as i32,
                 };
                 let _ = raw.set_option(
@@ -587,15 +573,5 @@ mod tests {
         assert!(encode_rect_h264(&bgra, stride, 90, 0, 20, 10).is_err());
         // Rect extends past bottom edge
         assert!(encode_rect_h264(&bgra, stride, 0, 95, 10, 10).is_err());
-    }
-
-    #[test]
-    fn test_screen_bitrate() {
-        let br = screen_bitrate(1920, 1080, 60.0, Quality::HighQuality);
-        assert!(
-            br > 30_000_000,
-            "1080p60 HighQuality should be > 30Mbps, got {}",
-            br
-        );
     }
 }

@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
         tracing::info!(w, h, "Resolution: explicit WxH");
         (w, h)
     } else if let Ok(scale) = res_mode.parse::<u32>() {
-        let scale = scale.max(1).min(4);
+        let scale = scale.clamp(1, 4);
         let (rw, rh) = (width as u32 * scale, height as u32 * scale);
         tracing::info!(
             scale,
@@ -303,8 +303,8 @@ async fn main() -> Result<()> {
             let user = "macrdp".to_string();
             tracing::warn!("No credentials in config — using generated credentials:");
             println!("\n  ┌──────────────────────────────────┐");
-            println!("  │  Username: {:<22}│", &user);
-            println!("  │  Password: {:<22}│", &random_pass);
+            println!("  │  Username: {:<22}│", user);
+            println!("  │  Password: {:<22}│", random_pass);
             println!("  └──────────────────────────────────┘\n");
             tracing::info!("Set [username] and [password] in ~/.config/macrdp/config.toml to use fixed credentials");
             (user, random_pass)

@@ -63,7 +63,7 @@ pub fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
     let bits_per_pixel = u16::from_le_bytes([dib[14], dib[15]]);
 
     let bytes_per_pixel = (bits_per_pixel / 8) as usize;
-    let row_stride = ((width as usize * bytes_per_pixel + 3) / 4) * 4;
+    let row_stride = (width as usize * bytes_per_pixel).div_ceil(4) * 4;
 
     let pixel_offset = BITMAPINFOHEADER_SIZE;
     let pixel_data = &dib[pixel_offset..];
@@ -115,8 +115,10 @@ pub fn utf16le_to_utf8(data: &[u8]) -> Option<String> {
         return Some(String::new());
     }
     let words: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&words)
         .ok()

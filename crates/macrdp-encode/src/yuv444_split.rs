@@ -132,7 +132,10 @@ pub fn yuv444_split_to_yuv420(
     let half_w = w / 2;
     let half_h = h / 2;
 
-    debug_assert!(w % 2 == 0 && h % 2 == 0, "width and height must be even");
+    debug_assert!(
+        w.is_multiple_of(2) && h.is_multiple_of(2),
+        "width and height must be even"
+    );
     debug_assert!(main_view.y.len() >= w * h);
     debug_assert!(main_view.u.len() >= half_w * half_h);
     debug_assert!(aux_view.y.len() >= w * h);

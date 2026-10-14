@@ -13,14 +13,14 @@ use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
 pub fn check_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().preflight()
+    ScreenCaptureAccess.preflight()
 }
 
 /// Request Screen Recording permission (triggers system dialog if not granted)
 /// Returns true if already granted. Note: even after granting, the app
 /// may need to be restarted for the permission to take effect.
 pub fn request_screen_recording_permission() -> bool {
-    ScreenCaptureAccess::default().request()
+    ScreenCaptureAccess.request()
 }
 
 /// Open System Settings to Privacy & Security page
@@ -365,7 +365,7 @@ fn find_main_sc_display_size() -> Result<(u32, u32)> {
         .find(|d| d.display_id() == main_id)
         .or_else(|| displays.first())
         .context("No display found")?;
-    Ok((display.width() as u32, display.height() as u32))
+    Ok((display.width(), display.height()))
 }
 
 pub fn detect_display_scale() -> Result<u32> {
@@ -373,11 +373,7 @@ pub fn detect_display_scale() -> Result<u32> {
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
     let (logical_w, _) = find_main_sc_display_size()?;
-    let scale = if logical_w > 0 {
-        physical_w / logical_w
-    } else {
-        1
-    };
+    let scale = physical_w.checked_div(logical_w).unwrap_or(1);
     Ok(scale.max(1))
 }
 
@@ -430,7 +426,7 @@ impl ScreenCapturer {
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Result<Self> {
         // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
+        let content = tokio::task::spawn_blocking(SCShareableContent::get)
             .await?
             .context("Failed to get shareable content (Screen Recording permission needed)")?;
 

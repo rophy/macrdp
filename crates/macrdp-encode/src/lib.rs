@@ -148,7 +148,7 @@ pub fn create_encoder(
     width: u32,
     height: u32,
     fps: f32,
-    quality: Quality,
+    _quality: Quality,
     preference: EncoderPreference,
     mode_444: bool,
     bitrate: u32,

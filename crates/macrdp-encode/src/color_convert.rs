@@ -199,7 +199,7 @@ impl VImageConverter {
         let uv_size = uv_w * uv_h;
         let required = y_size + uv_size * 2;
 
-        if w % 2 != 0 || h % 2 != 0 {
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(format!("width ({w}) and height ({h}) must both be even"));
         }
         if bgra.len() < (h - 1) * stride + w * 4 {
@@ -290,7 +290,7 @@ impl VImageConverter {
         let y_size = w * h;
         let uv_size = w * (h / 2); // interleaved CbCr: (w/2) samples * 2 bytes = w bytes per row, h/2 rows
 
-        if w % 2 != 0 || h % 2 != 0 {
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(format!("width ({w}) and height ({h}) must both be even"));
         }
         if bgra.len() < (h - 1) * stride + w * 4 {

@@ -10,7 +10,6 @@ pub struct PerfStats {
     keyframe_count: u32,
     total_frames: u64,
     start_time: Instant,
-    network_rtts: Vec<f64>,
 }
 
 impl PerfStats {
@@ -22,12 +21,7 @@ impl PerfStats {
             keyframe_count: 0,
             total_frames: 0,
             start_time: Instant::now(),
-            network_rtts: Vec::with_capacity(if enabled { 256 } else { 0 }),
         }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     /// Record metrics for one encoded frame.
@@ -41,14 +35,6 @@ impl PerfStats {
         if is_keyframe {
             self.keyframe_count += 1;
         }
-    }
-
-    /// Record an RTT sample.
-    pub fn record_rtt(&mut self, rtt_ms: f64) {
-        if !self.enabled {
-            return;
-        }
-        self.network_rtts.push(rtt_ms);
     }
 
     /// Print formatted performance summary to stdout.
@@ -77,9 +63,6 @@ impl PerfStats {
         let total_bytes: u64 = self.frame_sizes.iter().map(|&s| s as u64).sum();
         let avg_mbps = total_bytes as f64 * 8.0 / duration / 1_000_000.0;
 
-        // RTT stats
-        let rtt = LatencyStats::compute(&self.network_rtts);
-
         println!();
         println!("═══════════════════════════════════════════");
         println!("  macrdp Performance Report");
@@ -105,11 +88,6 @@ impl PerfStats {
         );
         println!("  Throughput:");
         println!("    Avg:    {:.1} Mbps", avg_mbps);
-        if !self.network_rtts.is_empty() {
-            println!("───────────────────────────────────────────");
-            println!("  Network RTT (ms):");
-            println!("    Mean:   {:<7.1} P95:    {:.1}", rtt.mean, rtt.p95);
-        }
         println!("═══════════════════════════════════════════");
         println!();
     }
