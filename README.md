@@ -97,15 +97,6 @@ Command-line options:
 | `--log-level <level>` | `trace`, `debug`, `info`, `warn`, `error` |
 | `--perf` | Collect performance statistics and print a summary on exit |
 
-**Build over SSH:** `.cargo/config.toml` sets `DYLD_LIBRARY_PATH` to the Swift 5.5
-libraries. If the build fails over SSH, override it:
-
-```bash
-cargo build --release --bin macrdp-server \
-  --config 'env.DYLD_LIBRARY_PATH.value="/usr/lib/swift"' \
-  --config 'env.DYLD_LIBRARY_PATH.force=true'
-```
-
 ---
 
 ## Configuration
