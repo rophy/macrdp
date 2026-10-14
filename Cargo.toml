@@ -19,7 +19,7 @@ ironrdp-displaycontrol = { path = "crates/ironrdp-displaycontrol-patched" }
 [workspace.package]
 version = "0.1.0-dev"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]

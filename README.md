@@ -1,7 +1,7 @@
 # macrdp
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
 
 An RDP server for macOS. Connect to a Mac from Windows (mstsc), Linux (FreeRDP) or any
@@ -67,7 +67,7 @@ Clients without H.264 GFX support (bitmap-only clients) are not supported.
 ## Requirements
 
 - macOS 14 (Sonoma) or later. Apple Silicon is tested.
-- Rust 1.75 or later, and Xcode or the Command Line Tools (for the Swift runtime that
+- Rust 1.89 or later, and Xcode or the Command Line Tools (for the Swift runtime that
   ScreenCaptureKit needs).
 - Permissions for the `macrdp-server` binary (System Settings → Privacy & Security):
   - **Screen Recording** — capture
