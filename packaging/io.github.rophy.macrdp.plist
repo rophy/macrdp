@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.rophy.macrdp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@BIN@</string>
+        <string>--config</string>
+        <string>@CONF@</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@LOG_DIR@</string>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/stderr.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
