@@ -25,11 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all --check
-      # The forked IronRDP crates keep upstream's lint set; lint only our crates.
-      - name: Clippy (macrdp crates)
-        run: >-
-          cargo clippy --workspace --exclude ironrdp-server --exclude ironrdp-acceptor
-          --all-targets --locked --no-deps -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
       - name: Build release binary

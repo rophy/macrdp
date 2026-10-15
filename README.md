@@ -185,10 +185,7 @@ crates/
 ├── macrdp-encode/                  H.264 encoders (VideoToolbox, OpenH264), AVC444
 ├── macrdp-input/                   keyboard and mouse injection
 ├── macrdp-audio/                   system audio → rdpsnd
-├── macrdp-clipboard/               clipboard and file transfer
-├── ironrdp-server-gfx/             RDP server (IronRDP fork with GFX, ZGFX, takeover, …)
-├── ironrdp-acceptor-patched/       connection acceptor (IronRDP fork)
-└── ironrdp-displaycontrol-patched/ DisplayControl channel (IronRDP fork)
+└── macrdp-clipboard/               clipboard and file transfer
 tests/
 ├── e2e_test.sh                     smoke test from a Linux client
 └── bench/                          macrdp vs macOS Screen Sharing benchmark
@@ -245,8 +242,10 @@ builds, signs, notarizes and publishes `vX.Y.Z` and creates the tag. Then commit
 ## Credits
 
 - **[x6nux/macrdp](https://github.com/x6nux/macrdp)** — the upstream project.
-- **[IronRDP](https://github.com/Devolutions/IronRDP)** — Rust RDP implementation. The
-  server and acceptor crates here are forks of IronRDP crates.
+- **[IronRDP](https://github.com/Devolutions/IronRDP)** — Rust RDP implementation. macrdp
+  uses the `macrdp` branch of the fork [rophy/IronRDP](https://github.com/rophy/IronRDP),
+  which adds the GFX/H.264 pipeline, ZGFX, session takeover and other changes to the
+  server, acceptor and DisplayControl crates.
 - **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — reference for AVC444 encoding and
   the client used for testing.
 - **[RustDesk](https://github.com/rustdesk/rustdesk)** — ideas for capture and input.

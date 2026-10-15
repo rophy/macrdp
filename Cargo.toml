@@ -7,14 +7,26 @@ members = [
     "crates/macrdp-encode",
     "crates/macrdp-audio",
     "crates/macrdp-clipboard",
-    "crates/ironrdp-server-gfx",
-    "crates/ironrdp-acceptor-patched",
 ]
 
+# IronRDP with macrdp's changes: branch "macrdp" of https://github.com/rophy/IronRDP.
+# All ironrdp crates come from the same commit, so that each crate exists only once.
 [patch.crates-io]
-ironrdp-server = { path = "crates/ironrdp-server-gfx" }
-ironrdp-acceptor = { path = "crates/ironrdp-acceptor-patched" }
-ironrdp-displaycontrol = { path = "crates/ironrdp-displaycontrol-patched" }
+ironrdp-acceptor = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-ainput = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-async = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-cliprdr = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-connector = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-core = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-displaycontrol = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-dvc = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-error = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-graphics = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-pdu = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-rdpsnd = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-server = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-svc = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
+ironrdp-tokio = { git = "https://github.com/rophy/IronRDP", rev = "81ba019228895f1697172e1ee69fa4c67137d997" }
 
 [workspace.package]
 version = "0.2.0-dev"
