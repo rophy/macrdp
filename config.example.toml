@@ -5,9 +5,9 @@
 # ─── Network ───────────────────────────────────────────────────────────────────
 
 # TCP port to listen on
-# Default: 3389 (standard RDP port, may require sudo)
+# Default: 3389 (standard RDP port)
 # Options: any valid port number (1024-65535 recommended)
-port = 13389
+port = 3389
 
 # ─── Authentication ────────────────────────────────────────────────────────────
 
