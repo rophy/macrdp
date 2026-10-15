@@ -1,6 +1,6 @@
 use ironrdp_async::NetworkClient;
 use ironrdp_connector::sspi::credssp::{
-    CredSspServer, CredentialsProxy, ServerError, ServerMode, ServerState, TsRequest,
+    CredSspServer, CredentialsProxy, NStatusCode, ServerError, ServerMode, ServerState, TsRequest,
 };
 use ironrdp_connector::sspi::generator::{Generator, GeneratorState};
 use ironrdp_connector::sspi::negotiate::ProtocolConfig;
@@ -168,10 +168,16 @@ impl<'a> CredsspSequence<'a> {
         let (ts_request, next_state) = match result {
             Ok(ServerState::ReplyNeeded(ts_request)) => (Some(ts_request), CredsspState::Ongoing),
             Ok(ServerState::Finished(_id)) => (None, CredsspState::Finished),
-            Err(err) => (
-                err.ts_request.map(|ts_request| *ts_request),
-                CredsspState::ServerError(err.error),
-            ),
+            Err(err) => {
+                let ts_request = err.ts_request.map(|ts_request| {
+                    let mut ts_request = *ts_request;
+                    if let Some(code) = client_error_code(&err.error) {
+                        ts_request.error_code = Some(code);
+                    }
+                    ts_request
+                });
+                (ts_request, CredsspState::ServerError(err.error))
+            }
         };
 
         self.state = next_state;
@@ -190,5 +196,40 @@ impl<'a> CredsspSequence<'a> {
         } else {
             Ok(Written::Nothing)
         }
+    }
+}
+
+/// Error code for the client when CredSSP fails. A wrong password fails the NTLM MIC check
+/// (`MessageAltered`) and an unknown user gives `LogonDenied`. Windows sends
+/// STATUS_LOGON_FAILURE for both; clients show "credentials did not work" only for that code.
+/// For other errors, the code that sspi set stays.
+fn client_error_code(error: &sspi::Error) -> Option<NStatusCode> {
+    match error.error_type {
+        sspi::ErrorKind::MessageAltered | sspi::ErrorKind::LogonDenied => {
+            Some(NStatusCode::LOGON_FAILURE)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_logon_is_reported_as_logon_failure() {
+        for kind in [
+            sspi::ErrorKind::MessageAltered,
+            sspi::ErrorKind::LogonDenied,
+        ] {
+            let error = sspi::Error::new(kind, "test");
+            assert_eq!(client_error_code(&error), Some(NStatusCode::LOGON_FAILURE));
+        }
+    }
+
+    #[test]
+    fn other_errors_keep_the_sspi_code() {
+        let error = sspi::Error::new(sspi::ErrorKind::InternalError, "test");
+        assert_eq!(client_error_code(&error), None);
     }
 }
