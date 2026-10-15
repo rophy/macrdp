@@ -567,33 +567,11 @@ impl Sequence for Acceptor {
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
 
-                    warn!(
-                        client_user = %creds.username,
-                        client_domain = ?creds.domain,
-                        server_user = ?self.creds.as_ref().map(|c| &c.username),
-                        protocol = ?protocol,
-                        "Credential check (non-hybrid)"
-                    );
-
-                    // Compare username and password only, ignore domain mismatch.
-                    // Accept empty client password — Windows mstsc sends empty creds on
-                    // first connect before prompting the user. Rejecting causes mstsc to
-                    // show an error instead of a login dialog.
-                    let creds_match = self.creds.as_ref().is_some_and(|server_creds| {
-                        creds.password.is_empty()
-                            || (server_creds.username == creds.username
-                                && server_creds.password == creds.password)
-                    });
-
-                    if !creds_match {
+                    if !credentials_match(self.creds.as_ref(), &creds) {
                         warn!(
                             client_user = %creds.username,
                             client_domain = ?creds.domain,
-                            server_user = ?self.creds.as_ref().map(|c| &c.username),
-                            client_pass_len = creds.password.len(),
-                            server_pass_len = ?self.creds.as_ref().map(|c| c.password.len()),
-                            client_pass_bytes = ?creds.password.as_bytes(),
-                            server_pass_bytes = ?self.creds.as_ref().map(|c| c.password.as_bytes()),
+                            ?protocol,
                             "Credential mismatch — rejecting"
                         );
                         let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
@@ -854,9 +832,47 @@ fn create_gcc_blocks(
     }
 }
 
+/// Checks the credentials of a client that did not use NLA. Username and password must
+/// match; the domain is ignored. An empty password is not accepted.
+fn credentials_match(server: Option<&Credentials>, client: &Credentials) -> bool {
+    server.is_some_and(|server| {
+        !client.password.is_empty()
+            && server.username == client.username
+            && server.password == client.password
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn creds(username: &str, password: &str) -> Credentials {
+        Credentials {
+            username: username.to_owned(),
+            password: password.to_owned(),
+            domain: None,
+        }
+    }
+
+    #[test]
+    fn credentials_match_requires_same_user_and_password() {
+        let server = creds("admin", "secret");
+        assert!(credentials_match(Some(&server), &creds("admin", "secret")));
+        assert!(!credentials_match(Some(&server), &creds("admin", "wrong")));
+        assert!(!credentials_match(Some(&server), &creds("other", "secret")));
+    }
+
+    #[test]
+    fn credentials_match_rejects_empty_password() {
+        let server = creds("admin", "secret");
+        assert!(!credentials_match(Some(&server), &creds("admin", "")));
+        assert!(!credentials_match(Some(&server), &creds("attacker", "")));
+    }
+
+    #[test]
+    fn credentials_match_rejects_when_server_has_no_credentials() {
+        assert!(!credentials_match(None, &creds("admin", "")));
+    }
 
     #[test]
     fn gcc_blocks_always_include_dynamic_dst_supported() {
