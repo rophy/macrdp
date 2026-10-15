@@ -50,10 +50,12 @@ fi
 # 3. Wrong password rejected
 echo "[3] Wrong password rejected"
 BAD_OUT=$(timeout 10 "$XFREERDP" /v:"${ADDR}" /u:${USER} /p:wrong /cert:ignore /auth-only 2>&1) || true
-if echo "$BAD_OUT" | grep -qi "logon\|credentials\|denied\|ERRCONNECT\|failed"; then
-    pass "Bad password rejected"
+# The server must answer with STATUS_LOGON_FAILURE, as Windows does; mstsc then asks for
+# the password again instead of falling back to TLS-only security.
+if echo "$BAD_OUT" | grep -q "ERRCONNECT_LOGON_FAILURE"; then
+    pass "Bad password rejected with logon failure"
 else
-    fail "Bad password should be rejected"
+    fail "Bad password should be rejected with ERRCONNECT_LOGON_FAILURE"
 fi
 
 # 4. Full RDP connection with GFX (headless via xvfb)
@@ -95,6 +97,22 @@ if command -v xvfb-run &>/dev/null; then
         pass "Second connection rejected quickly (${REJECT_TIME}s)"
     else
         fail "Second connection hung for ${REJECT_TIME}s"
+    fi
+else
+    echo "  SKIP: xvfb-run not available"
+fi
+
+# 6. TLS-only security (no NLA) with an empty password must not get a session
+echo "[6] TLS-only, empty password rejected"
+if command -v xvfb-run &>/dev/null; then
+    # A session stays up until timeout ends the client (exit 124); a rejected one ends early.
+    TLS_RC=0
+    TLS_OUT=$(timeout 15 xvfb-run -a "$XFREERDP" /v:"${ADDR}" /u:${USER} /p: /sec:tls \
+        /cert:ignore /gfx /timeout:5000 </dev/null 2>&1) || TLS_RC=$?
+    if [[ $TLS_RC -ne 124 ]] && echo "$TLS_OUT" | grep -q "ERRCONNECT"; then
+        pass "TLS-only empty password rejected"
+    else
+        fail "TLS-only empty password should be rejected"
     fi
 else
     echo "  SKIP: xvfb-run not available"
