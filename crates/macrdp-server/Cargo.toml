@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 rcgen = "0.13"
 dirs = "6"
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

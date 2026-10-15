@@ -280,26 +280,7 @@ async fn main() -> Result<()> {
     let (username, password) = match (&config.username, &config.password) {
         (Some(u), Some(p)) => (u.clone(), p.expose().to_owned()),
         _ => {
-            // Generate a random password from PID + timestamp entropy
-            let seed = std::process::id() as u64
-                ^ std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
-            let random_pass: String = (0..8)
-                .map(|i| {
-                    let v = ((seed
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(i * 1442695040888963407))
-                        >> (i * 5 + 3))
-                        % 36;
-                    if v < 10 {
-                        (b'0' + v as u8) as char
-                    } else {
-                        (b'a' + (v - 10) as u8) as char
-                    }
-                })
-                .collect();
+            let random_pass = generate_password()?;
             let user = "macrdp".to_string();
             tracing::warn!("No credentials in config — using generated credentials:");
             println!("\n  ┌──────────────────────────────────┐");
@@ -379,5 +360,38 @@ fn check_permissions() {
         tracing::warn!(
             "If you already granted permission, this is likely a debug-build identity change."
         );
+    }
+}
+
+/// 16 random characters from [A-Za-z0-9], from the OS secure random source.
+fn generate_password() -> Result<String> {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const LEN: usize = 16;
+    let mut pass = String::with_capacity(LEN);
+    let mut buf = [0u8; 32];
+    while pass.len() < LEN {
+        getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("secure random source: {e}"))?;
+        // Reject bytes >= 248 (4 * 62) so that each character is equally likely.
+        for &b in buf.iter().filter(|&&b| b < 248) {
+            if pass.len() == LEN {
+                break;
+            }
+            pass.push(CHARSET[usize::from(b) % CHARSET.len()] as char);
+        }
+    }
+    Ok(pass)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_password() {
+        let a = generate_password().unwrap();
+        let b = generate_password().unwrap();
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric()), "{a}");
+        assert_ne!(a, b);
     }
 }
