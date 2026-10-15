@@ -278,7 +278,7 @@ async fn main() -> Result<()> {
 
     // Set credentials — required for RDP authentication
     let (username, password) = match (&config.username, &config.password) {
-        (Some(u), Some(p)) => (u.clone(), p.clone()),
+        (Some(u), Some(p)) => (u.clone(), p.expose().to_owned()),
         _ => {
             // Generate a random password from PID + timestamp entropy
             let seed = std::process::id() as u64

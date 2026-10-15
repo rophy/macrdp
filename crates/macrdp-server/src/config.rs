@@ -1,5 +1,6 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -64,6 +65,23 @@ impl Default for ClipboardConfig {
     }
 }
 
+/// A string that `Debug` does not print, so logs do not show it.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"***\"")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -74,7 +92,7 @@ pub struct ServerConfig {
     /// Resolution height (0 = auto-detect from display)
     pub height: u32,
     pub username: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<Secret>,
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub idle_timeout_secs: u64,
@@ -274,6 +292,14 @@ mod tests {
         assert_eq!(config.port, 13389);
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
-        assert_eq!(config.password.as_deref(), Some("secret"));
+        assert_eq!(config.password.as_ref().map(Secret::expose), Some("secret"));
+    }
+
+    #[test]
+    fn test_debug_hides_password() {
+        let config: ServerConfig = toml::from_str(r#"password = "hunter2""#).unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains(r#"password: Some("***")"#), "{debug}");
     }
 }
