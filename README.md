@@ -138,7 +138,7 @@ macrdp uses the first `config.toml` it finds in:
 | Key | Default | Meaning |
 |---|---|---|
 | `port` | `3389` | TCP port |
-| `username`, `password` | none | Login. If not set, any credentials are accepted. |
+| `username`, `password` | none | Login. If not set, the server makes a random password for user `macrdp` at each start and prints it to stdout. |
 | `width`, `height` | `0` (auto) | Fixed resolution. `0` follows the display and the client. |
 | `resolution` | `auto` | Capture size, e.g. `"3840x2160"` for a sharper image on Retina displays |
 | `frame_rate` | `60` | Target frame rate |
