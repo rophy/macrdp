@@ -125,6 +125,7 @@ static EXTENDED_SCANCODE_MAP: LazyLock<HashMap<u8, u16>> = LazyLock::new(|| {
         (0x38, 0x36),    // Right Alt → Right Command (⌘) — consistent with Left Alt→Left Cmd
         (0x5B, 0x3A),    // Left Win → Left Option (⌥) — by position (between Ctrl and Alt/Cmd)
         (0x5C, 0x3D),    // Right Win → Right Option (⌥)
+        (0x5D, 0x6E),    // Menu (Apps) → kVK_ContextualMenu
         // Arrow keys
         (0x48, 0x7E), // Up
         (0x50, 0x7D), // Down
@@ -172,6 +173,11 @@ mod tests {
         assert_eq!(scancode_to_keycode(0x50, true), Some(0x7D)); // Arrow Down
         assert_eq!(scancode_to_keycode(0x4B, true), Some(0x7B)); // Arrow Left
         assert_eq!(scancode_to_keycode(0x4D, true), Some(0x7C)); // Arrow Right
+    }
+
+    #[test]
+    fn test_menu_key() {
+        assert_eq!(scancode_to_keycode(0x5D, true), Some(0x6E));
     }
 
     #[test]
