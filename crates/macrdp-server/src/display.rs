@@ -861,6 +861,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Capture interval; sets the EGFX frame window.
+    fn frame_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1) / self.capture_config.frame_rate.max(1)
+    }
+
     /// A PointerPosition update when the Mac cursor moved by itself.
     fn poll_cursor_position(&mut self) -> Option<DisplayUpdate> {
         let (x, y) = get_cursor_position();
@@ -1173,7 +1178,7 @@ impl MacDisplayUpdates {
             && self.gfx.avc444.load(Ordering::SeqCst)
             && self.encoder.as_ref().is_some_and(|e| e.supports_444());
 
-        let state = gfx::can_submit(&self.gfx, surface_id, use_444);
+        let state = gfx::can_submit(&self.gfx, surface_id, use_444, self.frame_interval());
         if let Err(FrameSubmissionError::UnknownSurface { .. }) = state {
             // The pipeline dropped our surface: create a new one with the next frame.
             gfx::forget_surface(&self.gfx);
@@ -1226,7 +1231,11 @@ impl MacDisplayUpdates {
             Ok(()) => {
                 self.surface_frames += 1;
                 if self.surface_frames == 1 || self.surface_frames.is_multiple_of(600) {
+                    let (window, base_rtt_ms, queue_depth) = gfx::window_stats(&self.gfx);
                     tracing::info!(
+                        window,
+                        base_rtt_ms,
+                        queue_depth,
                         surface_frames = self.surface_frames,
                         is_keyframe,
                         avc444 = matches!(encoded, Encoded::Avc444(_)),
@@ -1353,7 +1362,7 @@ impl MacDisplayUpdates {
             );
             return;
         }
-        if let Err(e) = gfx::can_submit(&self.gfx, surface_id, avc444) {
+        if let Err(e) = gfx::can_submit(&self.gfx, surface_id, avc444, self.frame_interval()) {
             tracing::debug!(error = %e, "Cached keyframe not replayed");
             return;
         }

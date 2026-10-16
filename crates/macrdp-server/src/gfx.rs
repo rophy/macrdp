@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use ironrdp_egfx::pdu::{
     Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV103Flags, CapabilitiesV104Flags,
@@ -20,6 +21,8 @@ use ironrdp_server::{
 };
 use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
+
+use crate::frame_window::FrameWindow;
 
 /// H.264 quantization parameter and quality written into each AVC420 region.
 const REGION_QP: u8 = 22;
@@ -42,6 +45,8 @@ pub struct GfxShared {
     /// loop: a resize ends one display loop and starts the next one on the
     /// same EGFX channel, which still has this surface.
     pub surface: Mutex<Option<SurfaceInfo>>,
+    /// EGFX frame window of the current channel. Lock order: pipeline, then this.
+    pub window: Mutex<FrameWindow>,
 }
 
 /// An EGFX surface that was created and mapped to the output.
@@ -133,7 +138,14 @@ impl GraphicsPipelineHandler for MacGfxHandler {
         tracing::info!(?negotiated, avc444, "EGFX channel ready");
         self.shared.avc444.store(avc444, Ordering::SeqCst);
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        lock(&self.shared.window).reset();
         self.shared.ready.store(true, Ordering::SeqCst);
+    }
+
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, _total_frames_decoded: u32) {
+        // Called with the pipeline mutex held (lock order: pipeline, window).
+        let rtt = lock(&self.shared.window).on_ack(frame_id, queue_depth, Instant::now());
+        tracing::trace!(frame_id, queue_depth, ?rtt, "EGFX frame acknowledged");
     }
 
     fn on_close(&mut self) {
@@ -182,6 +194,7 @@ impl GfxServerFactory for MacGfxFactory {
         self.shared.ready.store(false, Ordering::SeqCst);
         self.shared.avc444.store(false, Ordering::SeqCst);
         *lock(&self.shared.surface) = None;
+        lock(&self.shared.window).reset();
         *lock(&self.shared.handle) = Some(Arc::clone(&handle));
         Some((GfxDvcBridge::new(Arc::clone(&handle)), handle))
     }
@@ -231,8 +244,10 @@ pub fn submit_avc420(
 ) -> Result<(), FrameSubmissionError> {
     let handle = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
     let mut server = lock(&handle);
-    server.try_send_avc420_frame(surface, data, &full_region(w, h), ts_ms)?;
-    flush(shared, &mut server)
+    let frame_id = server.try_send_avc420_frame(surface, data, &full_region(w, h), ts_ms)?;
+    flush(shared, &mut server)?;
+    lock(&shared.window).on_sent(frame_id, Instant::now());
+    Ok(())
 }
 
 /// Queue one AVC444 frame (luma + chroma streams) and send it to the wire.
@@ -254,23 +269,60 @@ pub fn submit_avc444(
     } else {
         (Some(chroma), Some(&regions[..]))
     };
-    server.try_send_avc444_frame(surface, luma, &regions, chroma_data, chroma_regions, ts_ms)?;
-    flush(shared, &mut server)
+    let frame_id = server.try_send_avc444_frame(
+        surface,
+        luma,
+        &regions,
+        chroma_data,
+        chroma_regions,
+        ts_ms,
+    )?;
+    flush(shared, &mut server)?;
+    lock(&shared.window).on_sent(frame_id, Instant::now());
+    Ok(())
 }
 
 /// Ok(()) if a frame could be accepted now (call before encoding).
+/// `frame_interval` is the capture interval; it sets the frame window.
 pub fn can_submit(
     shared: &GfxShared,
     surface: u16,
     avc444: bool,
+    frame_interval: Duration,
 ) -> Result<(), FrameSubmissionError> {
     let handle = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
-    let server = lock(&handle);
+    let mut server = lock(&handle);
+    apply_window(shared, &mut server, frame_interval);
     if avc444 {
         server.avc444_submission_state(surface)
     } else {
         server.avc420_submission_state(surface)
     }
+}
+
+/// Set the pipeline's frame window from `FrameWindow`.
+///
+/// ironrdp-server sets the client's core Frame Acknowledge value (mstsc: 1) as
+/// a ceiling on the EGFX window after each capability exchange. That value is
+/// for surface-command frames (MS-RDPRFX 2.2.1.3), not EGFX, so it is removed here.
+fn apply_window(shared: &GfxShared, server: &mut GraphicsPipelineServer, frame_interval: Duration) {
+    let want = lock(&shared.window).target(frame_interval);
+    let had = server.max_frames_in_flight();
+    if had != want {
+        server.set_client_frame_ack_limit(None);
+        server.set_max_frames_in_flight(want);
+        tracing::debug!(from = had, to = want, "EGFX frame window");
+    }
+}
+
+/// Current frame window, base RTT (ms) and last client queue depth, for logs.
+pub fn window_stats(shared: &GfxShared) -> (u32, Option<f32>, u32) {
+    let window = current_handle(shared)
+        .map(|h| lock(&h).max_frames_in_flight())
+        .unwrap_or(0);
+    let w = lock(&shared.window);
+    let base = w.base_rtt().map(|d| d.as_secs_f32() * 1000.0);
+    (window, base, w.last_queue_depth)
 }
 
 /// Whether the current connection's EGFX channel allows AVC420 (H.264).
@@ -344,7 +396,7 @@ mod tests {
         let factory = MacGfxFactory::new(Arc::clone(&shared));
         let (_bridge, _handle) = factory.build_server_with_handle().unwrap();
         assert!(matches!(
-            can_submit(&shared, 0, false),
+            can_submit(&shared, 0, false, Duration::from_millis(16)),
             Err(FrameSubmissionError::NotReady)
         ));
     }
@@ -353,7 +405,7 @@ mod tests {
     fn cannot_submit_without_connection() {
         let shared = GfxShared::default();
         assert!(matches!(
-            can_submit(&shared, 0, false),
+            can_submit(&shared, 0, false, Duration::from_millis(16)),
             Err(FrameSubmissionError::NotReady)
         ));
     }
