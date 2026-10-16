@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::color_convert::VImageConverter;
+use crate::color_convert::{bt709, VImageConverter};
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 // --- FFI declarations ---
@@ -792,18 +792,16 @@ impl VtEncoder {
                     let (b10, g10, r10) = (*p10 as i32, *p10.add(1) as i32, *p10.add(2) as i32);
                     let (b11, g11, r11) = (*p11 as i32, *p11.add(1) as i32, *p11.add(2) as i32);
 
-                    *y_dst0.add(c0) = ((77 * r00 + 150 * g00 + 29 * b00) >> 8) as u8;
-                    *y_dst0.add(c1) = ((77 * r01 + 150 * g01 + 29 * b01) >> 8) as u8;
-                    *y_dst1.add(c0) = ((77 * r10 + 150 * g10 + 29 * b10) >> 8) as u8;
-                    *y_dst1.add(c1) = ((77 * r11 + 150 * g11 + 29 * b11) >> 8) as u8;
+                    *y_dst0.add(c0) = bt709::y(r00, g00, b00);
+                    *y_dst0.add(c1) = bt709::y(r01, g01, b01);
+                    *y_dst1.add(c0) = bt709::y(r10, g10, b10);
+                    *y_dst1.add(c1) = bt709::y(r11, g11, b11);
 
                     let rb = (r00 + r01 + r10 + r11) >> 2;
                     let gb = (g00 + g01 + g10 + g11) >> 2;
                     let bb = (b00 + b01 + b10 + b11) >> 2;
-                    *uv_dst.add(col * 2) =
-                        (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    *uv_dst.add(col * 2 + 1) =
-                        (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
+                    *uv_dst.add(col * 2) = bt709::cb(rb, gb, bb);
+                    *uv_dst.add(col * 2 + 1) = bt709::cr(rb, gb, bb);
                 }
             }
 
@@ -902,7 +900,7 @@ impl VtEncoder {
     }
 
     /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
-    /// BT.601 full range: Y=0-255, UV=0-255.
+    /// BT.709 full range: Y=0-255, UV=0-255.
     #[allow(dead_code)]
     fn create_nv12_from_bgra(
         session: VTCompressionSessionRef,
@@ -945,7 +943,7 @@ impl VtEncoder {
             let rows = sh.min(h);
             let cols = sw.min(w);
 
-            // Y plane: full resolution, BT.601 full range
+            // Y plane: full resolution, BT.709 full range
             for row in 0..rows {
                 let bgra_row = row * stride;
                 let y_row = row * y_bpr;
@@ -954,11 +952,11 @@ impl VtEncoder {
                     let b = data[px] as i32;
                     let g = data[px + 1] as i32;
                     let r = data[px + 2] as i32;
-                    *y_base.add(y_row + col) = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
+                    *y_base.add(y_row + col) = bt709::y(r, g, b);
                 }
             }
 
-            // UV plane: half resolution, 2x2 averaged, BT.601 full range
+            // UV plane: half resolution, 2x2 averaged, BT.709 full range
             let uv_rows = rows / 2;
             let uv_cols = cols / 2;
             for row in 0..uv_rows {
@@ -983,8 +981,8 @@ impl VtEncoder {
                     rb >>= 2;
                     gb >>= 2;
                     bb >>= 2; // /4
-                    let u = (((-43 * rb - 85 * gb + 128 * bb) >> 8) + 128).clamp(0, 255) as u8;
-                    let v = (((128 * rb - 107 * gb - 21 * bb) >> 8) + 128).clamp(0, 255) as u8;
+                    let u = bt709::cb(rb, gb, bb);
+                    let v = bt709::cr(rb, gb, bb);
                     let off = uv_row_off + col * 2;
                     *uv_base.add(off) = u;
                     *uv_base.add(off + 1) = v;

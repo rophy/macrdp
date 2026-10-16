@@ -6,6 +6,32 @@
 
 use std::ffi::c_void;
 
+/// BGRA -> Y'CbCr with the BT.709 matrix, full range (Y, Cb, Cr all 0-255).
+///
+/// RDP clients convert the AVC420/AVC444 picture back to RGB with BT.709,
+/// full range: FreeRDP `primitives` (YUV2R = Y + 1.5748 Cr, ...), and with
+/// AVC444 mstsc shows colored text 4-8 dB closer to the source with BT.709
+/// than with BT.601. Every converter here must use these numbers.
+pub mod bt709 {
+    /// Y = 0.2126 R + 0.7152 G + 0.0722 B (x256, rounded).
+    #[inline(always)]
+    pub fn y(r: i32, g: i32, b: i32) -> u8 {
+        ((54 * r + 183 * g + 19 * b + 128) >> 8).clamp(0, 255) as u8
+    }
+
+    /// Cb = (B - Y) / 1.8556 + 128.
+    #[inline(always)]
+    pub fn cb(r: i32, g: i32, b: i32) -> u8 {
+        (((-29 * r - 99 * g + 128 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+    }
+
+    /// Cr = (R - Y) / 1.5748 + 128.
+    #[inline(always)]
+    pub fn cr(r: i32, g: i32, b: i32) -> u8 {
+        (((128 * r - 116 * g - 12 * b + 128) >> 8) + 128).clamp(0, 255) as u8
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FFI types — matching Apple's vImage_Types.h definitions exactly
 // ---------------------------------------------------------------------------
@@ -64,11 +90,11 @@ const KV_IMAGE_NO_FLAGS: u32 = 0;
 
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
-    /// Pre-computed BT.601 matrix constant provided by Apple.
-    /// Declared as: `extern const vImage_ARGBToYpCbCrMatrix *kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4`
+    /// Pre-computed BT.709 matrix constant provided by Apple.
+    /// Declared as: `extern const vImage_ARGBToYpCbCrMatrix *kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2`
     /// i.e. this symbol IS the pointer itself.
-    #[link_name = "kvImage_ARGBToYpCbCrMatrix_ITU_R_601_4"]
-    static MATRIX_BT601_PTR: *const VImageARGBToYpCbCrMatrix;
+    #[link_name = "kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2"]
+    static MATRIX_BT709_PTR: *const VImageARGBToYpCbCrMatrix;
 
     /// Build conversion info from a colour matrix + pixel range + format pair.
     fn vImageConvert_ARGBToYpCbCr_GenerateConversion(
@@ -118,7 +144,7 @@ pub struct VImageConverter {
 }
 
 impl VImageConverter {
-    /// Create a new converter using BT.601 full-range (0-255 for Y/Cb/Cr).
+    /// Create a new converter using BT.709 full-range (0-255 for Y/Cb/Cr), see [`bt709`].
     pub fn new() -> Result<Self, String> {
         // Full-range: Yp_bias=0, CbCr_bias=128, all max=255, all min=0
         let pixel_range = VImageYpCbCrPixelRange {
@@ -142,7 +168,7 @@ impl VImageConverter {
         // Generate I420 conversion info
         let err = unsafe {
             vImageConvert_ARGBToYpCbCr_GenerateConversion(
-                MATRIX_BT601_PTR,
+                MATRIX_BT709_PTR,
                 &pixel_range as *const _,
                 &mut i420_info as *mut _,
                 KV_IMAGE_ARGB8888,
@@ -159,7 +185,7 @@ impl VImageConverter {
         // Generate NV12 conversion info
         let err = unsafe {
             vImageConvert_ARGBToYpCbCr_GenerateConversion(
-                MATRIX_BT601_PTR,
+                MATRIX_BT709_PTR,
                 &pixel_range as *const _,
                 &mut nv12_info as *mut _,
                 KV_IMAGE_ARGB8888,
@@ -443,7 +469,7 @@ mod tests {
             .bgra_to_nv12(&bgra, w, h, stride, &mut y_out, &mut uv_out)
             .expect("bgra_to_nv12 failed");
 
-        // For uniform gray (128,128,128), BT.601 full-range Y should be ~128
+        // For uniform gray (128,128,128), full-range Y should be ~128
         // Allow some tolerance for rounding differences
         for (i, &y) in y_out.iter().enumerate() {
             assert!(
@@ -464,6 +490,96 @@ mod tests {
                 (cr as i32 - 128).unsigned_abs() <= 2,
                 "Cr[{i}] = {cr}, expected ~128 for gray"
             );
+        }
+    }
+
+    #[test]
+    fn vimage_uses_bt709_full_range() {
+        let converter = VImageConverter::new().expect("VImageConverter::new failed");
+        let (w, h): (u32, u32) = (16, 16);
+        let stride = w as usize * 4;
+        // Saturated colors: the matrix shows most here.
+        for (r, g, b) in [
+            (221, 0, 0),
+            (0, 0, 204),
+            (255, 255, 0),
+            (255, 0, 255),
+            (0, 170, 0),
+            (32, 80, 192),
+        ] {
+            let mut bgra = vec![255u8; stride * h as usize];
+            for px in bgra.as_chunks_mut::<4>().0 {
+                px[0] = b as u8;
+                px[1] = g as u8;
+                px[2] = r as u8;
+            }
+            let mut y_out = vec![0u8; (w * h) as usize];
+            let mut uv_out = vec![0u8; (w * h / 2) as usize];
+            converter
+                .bgra_to_nv12(&bgra, w, h, stride, &mut y_out, &mut uv_out)
+                .unwrap();
+            let near = |a: u8, e: u8| (i32::from(a) - i32::from(e)).abs() <= 1;
+            assert!(
+                near(y_out[0], bt709::y(r, g, b)),
+                "Y {} vs {} for {r},{g},{b}",
+                y_out[0],
+                bt709::y(r, g, b)
+            );
+            assert!(
+                near(uv_out[0], bt709::cb(r, g, b)),
+                "Cb {} vs {} for {r},{g},{b}",
+                uv_out[0],
+                bt709::cb(r, g, b)
+            );
+            assert!(
+                near(uv_out[1], bt709::cr(r, g, b)),
+                "Cr {} vs {} for {r},{g},{b}",
+                uv_out[1],
+                bt709::cr(r, g, b)
+            );
+        }
+    }
+
+    #[test]
+    fn bt709_values() {
+        assert_eq!(
+            (bt709::y(0, 0, 0), bt709::cb(0, 0, 0), bt709::cr(0, 0, 0)),
+            (0, 128, 128)
+        );
+        assert_eq!(
+            (
+                bt709::y(255, 255, 255),
+                bt709::cb(255, 255, 255),
+                bt709::cr(255, 255, 255)
+            ),
+            (255, 128, 128)
+        );
+        // Pure red: Y 0.2126 * 255 = 54, Cr = 255
+        assert_eq!(bt709::y(255, 0, 0), 54);
+        assert_eq!(bt709::cr(255, 0, 0), 255);
+        // Pure blue: Y 0.0722 * 255 = 18-19, Cb = 255
+        assert!((18..=19).contains(&bt709::y(0, 0, 255)));
+        assert_eq!(bt709::cb(0, 0, 255), 255);
+        // Within 1 of the exact BT.709 full-range values.
+        for r in (0..=255).step_by(15) {
+            for g in (0..=255).step_by(15) {
+                for b in (0..=255).step_by(15) {
+                    let (rf, gf, bf) = (f64::from(r), f64::from(g), f64::from(b));
+                    let y = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+                    let cb = ((bf - y) / 1.8556 + 128.0).clamp(0.0, 255.0);
+                    let cr = ((rf - y) / 1.5748 + 128.0).clamp(0.0, 255.0);
+                    for (got, want) in [
+                        (bt709::y(r, g, b), y),
+                        (bt709::cb(r, g, b), cb),
+                        (bt709::cr(r, g, b), cr),
+                    ] {
+                        assert!(
+                            (f64::from(got) - want).abs() <= 1.0,
+                            "{r},{g},{b}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
         }
     }
 

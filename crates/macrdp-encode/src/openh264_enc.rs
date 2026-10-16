@@ -7,7 +7,7 @@ use bytes::Bytes;
 use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::YUVBuffer;
 
-use crate::color_convert::VImageConverter;
+use crate::color_convert::{bt709, VImageConverter};
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 pub struct OpenH264Encoder {
@@ -159,15 +159,12 @@ fn bgra_to_yuv420_padded(
             let g = bgra[bgra_offset + 1] as i32;
             let r = bgra[bgra_offset + 2] as i32;
 
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[row * ew + col] = y.clamp(0, 255) as u8;
+            y_plane[row * ew + col] = bt709::y(r, g, b);
 
             if row % 2 == 0 && col % 2 == 0 {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
                 let uv_idx = (row / 2) * uv_w + (col / 2);
-                u_plane[uv_idx] = u.clamp(0, 255) as u8;
-                v_plane[uv_idx] = v.clamp(0, 255) as u8;
+                u_plane[uv_idx] = bt709::cb(r, g, b);
+                v_plane[uv_idx] = bt709::cr(r, g, b);
             }
         }
     }
@@ -476,17 +473,14 @@ pub fn encode_rect_h264(
             let g = bgra[src_off + 1] as i32;
             let r = bgra[src_off + 2] as i32;
 
-            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            yuv_buf[row * enc_w as usize + col] = y.clamp(0, 255) as u8;
+            yuv_buf[row * enc_w as usize + col] = bt709::y(r, g, b);
 
             if row % 2 == 0 && col % 2 == 0 {
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
                 let uv_w = enc_w as usize / 2;
                 let uv_idx = (row / 2) * uv_w + (col / 2);
-                yuv_buf[y_size + uv_idx] = u.clamp(0, 255) as u8;
+                yuv_buf[y_size + uv_idx] = bt709::cb(r, g, b);
                 yuv_buf[y_size + (enc_w as usize / 2) * (enc_h as usize / 2) + uv_idx] =
-                    v.clamp(0, 255) as u8;
+                    bt709::cr(r, g, b);
             }
         }
     }
