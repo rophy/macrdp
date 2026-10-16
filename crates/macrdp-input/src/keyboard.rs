@@ -3,7 +3,7 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode}
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 use crate::flags::{merge, ModifierState};
-use crate::keymap::scancode_to_keycode;
+use crate::keymap::{keypad_navigation_keycode, scancode_to_keycode, SCANCODE_NUM_LOCK};
 
 pub struct KeyboardInjector {
     state: ModifierState,
@@ -90,9 +90,24 @@ impl KeyboardInjector {
         self.state.flags()
     }
 
+    /// Set Caps Lock and Num Lock from an RDP Synchronize event (sent on connect and focus).
+    pub fn synchronize(&mut self, caps_lock: bool, num_lock: bool) {
+        self.state.set_locks(caps_lock, num_lock);
+        tracing::debug!(caps_lock, num_lock, "Keyboard locks synchronized");
+    }
+
     /// Inject a key press or release event
     pub fn inject_key(&mut self, scancode: u8, extended: bool, pressed: bool) -> Result<()> {
-        let keycode = match scancode_to_keycode(scancode, extended) {
+        if scancode == SCANCODE_NUM_LOCK && !extended && pressed {
+            self.state.toggle_num_lock();
+        }
+        // With Num Lock off the keypad keys move the cursor, as on Windows.
+        let keypad_nav = if !extended && !self.state.num_lock() {
+            keypad_navigation_keycode(scancode)
+        } else {
+            None
+        };
+        let keycode = match keypad_nav.or_else(|| scancode_to_keycode(scancode, extended)) {
             Some(kc) => kc,
             None => {
                 tracing::warn!(scancode, extended, "Unknown scancode, ignoring");

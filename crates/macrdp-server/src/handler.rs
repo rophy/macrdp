@@ -1,3 +1,4 @@
+use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_server::{
     KeyboardEvent, MouseButton as RdpMouseButton, MouseEvent, RdpServerInputHandler,
 };
@@ -198,8 +199,11 @@ impl RdpServerInputHandler for MacInputHandler {
             KeyboardEvent::Released { code, extended } => kb.inject_key(code, extended, false),
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
-            KeyboardEvent::Synchronize(_flags) => {
-                tracing::debug!("Keyboard synchronize event (ignored)");
+            KeyboardEvent::Synchronize(flags) => {
+                kb.synchronize(
+                    flags.contains(SynchronizeFlags::CAPS_LOCK),
+                    flags.contains(SynchronizeFlags::NUM_LOCK),
+                );
                 Ok(())
             }
         };

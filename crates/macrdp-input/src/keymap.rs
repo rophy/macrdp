@@ -9,6 +9,29 @@ pub fn scancode_to_keycode(scancode: u8, extended: bool) -> Option<u16> {
     }
 }
 
+/// Keypad key with Num Lock off (non-extended scancode) → macOS navigation keycode,
+/// like Windows: 7 Home, 8 Up, 9 PgUp, 4 Left, 5 Clear, 6 Right, 1 End, 2 Down,
+/// 3 PgDn, 0 Insert (Help), . Delete. Other keys: None (use the normal map).
+pub fn keypad_navigation_keycode(scancode: u8) -> Option<u16> {
+    Some(match scancode {
+        0x47 => 0x73, // Home
+        0x48 => 0x7E, // Up
+        0x49 => 0x74, // Page Up
+        0x4B => 0x7B, // Left
+        0x4C => 0x47, // Clear (VK_CLEAR)
+        0x4D => 0x7C, // Right
+        0x4F => 0x77, // End
+        0x50 => 0x7D, // Down
+        0x51 => 0x79, // Page Down
+        0x52 => 0x72, // Insert → Help
+        0x53 => 0x75, // Delete
+        _ => return None,
+    })
+}
+
+/// RDP scancode of Num Lock (non-extended)
+pub const SCANCODE_NUM_LOCK: u8 = 0x45;
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -173,6 +196,15 @@ mod tests {
         assert_eq!(scancode_to_keycode(0x50, true), Some(0x7D)); // Arrow Down
         assert_eq!(scancode_to_keycode(0x4B, true), Some(0x7B)); // Arrow Left
         assert_eq!(scancode_to_keycode(0x4D, true), Some(0x7C)); // Arrow Right
+    }
+
+    #[test]
+    fn test_keypad_navigation() {
+        assert_eq!(keypad_navigation_keycode(0x47), Some(0x73)); // 7 → Home
+        assert_eq!(keypad_navigation_keycode(0x50), Some(0x7D)); // 2 → Down
+        assert_eq!(keypad_navigation_keycode(0x53), Some(0x75)); // . → Delete
+        assert_eq!(keypad_navigation_keycode(0x4E), None); // + stays
+        assert_eq!(keypad_navigation_keycode(0x1E), None); // A
     }
 
     #[test]
