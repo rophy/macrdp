@@ -53,6 +53,54 @@ pub struct GfxShared {
     pub surface: Mutex<Option<SurfaceInfo>>,
     /// EGFX frame window of the current channel. Lock order: pipeline, then this.
     pub window: Mutex<FrameWindow>,
+    /// ClearCodec sequence number the client expects next. Lock order: pipeline, then this.
+    clear_seq: Mutex<ClearSeq>,
+}
+
+/// ClearCodec sequence numbers (MS-RDPEGFX 2.2.4.1 `seqNumber`).
+///
+/// The client keeps one ClearCodec context for the connection, not one per
+/// surface or per display loop, and sets its counter back to 0 only on
+/// ResetGraphics (FreeRDP: `clear_context_reset` from `gdi_ResetGraphics`).
+/// It refuses a bitmap with another number. So the number belongs to the EGFX
+/// channel; it starts at 0 on each generation (the pipeline sends
+/// ResetGraphics before the first surface of a generation) and after each
+/// ResetGraphics, and it moves on only for bitmaps that went out.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClearSeq {
+    /// (generation, next number)
+    next: Option<(u64, u8)>,
+}
+
+impl ClearSeq {
+    /// The number for the next bitmap on channel `generation`.
+    pub fn next(&self, generation: u64) -> u8 {
+        match self.next {
+            Some((g, n)) if g == generation => n,
+            _ => 0,
+        }
+    }
+
+    /// `count` bitmaps went out on channel `generation`.
+    pub fn sent(&mut self, generation: u64, count: usize) {
+        let n = self.next(generation).wrapping_add(count as u8);
+        self.next = Some((generation, n));
+    }
+
+    /// ResetGraphics went out on channel `generation`.
+    pub fn reset(&mut self, generation: u64) {
+        self.next = Some((generation, 0));
+    }
+}
+
+/// Write sequence numbers from `first` into ClearCodec bitmap streams
+/// (byte 0 is the flags, byte 1 the sequence number).
+fn stamp_clear_seq(tiles: &mut [(TileRect, Vec<u8>)], first: u8) {
+    for (i, (_, data)) in tiles.iter_mut().enumerate() {
+        if let Some(seq) = data.get_mut(1) {
+            *seq = first.wrapping_add(i as u8);
+        }
+    }
 }
 
 /// An EGFX surface that was created and mapped to the output.
@@ -202,6 +250,7 @@ impl GfxServerFactory for MacGfxFactory {
         self.shared.avc444.store(false, Ordering::SeqCst);
         *lock(&self.shared.surface) = None;
         lock(&self.shared.window).reset();
+        *lock(&self.shared.clear_seq) = ClearSeq::default();
         *lock(&self.shared.handle) = Some(Arc::clone(&handle));
         Some((GfxDvcBridge::new(Arc::clone(&handle)), handle))
     }
@@ -345,15 +394,17 @@ pub fn submit_avc420(
 }
 
 /// Queue one frame of ClearCodec (lossless) tiles and send it to the wire.
-/// Returns the number of bytes queued.
+/// The tiles get their sequence numbers here. Returns the number of bytes queued.
 pub fn submit_clearcodec(
     shared: &GfxShared,
-    surface: u16,
-    tiles: Vec<(TileRect, Vec<u8>)>,
+    surface: SurfaceInfo,
+    mut tiles: Vec<(TileRect, Vec<u8>)>,
     ts_ms: u32,
 ) -> Result<usize, FrameSubmissionError> {
     let handle = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
     let mut server = lock(&handle);
+    let count = tiles.len();
+    stamp_clear_seq(&mut tiles, lock(&shared.clear_seq).next(surface.generation));
     let bytes = tiles.iter().map(|(_, d)| d.len()).sum();
     let tiles = tiles
         .into_iter()
@@ -368,11 +419,12 @@ pub fn submit_clearcodec(
         })
         .collect();
     let frame_id = server
-        .send_mixed_frame(surface, tiles, ts_ms)
+        .send_mixed_frame(surface.id, tiles, ts_ms)
         .ok_or(FrameSubmissionError::InvalidFrame)?;
     // ClearCodec residual data compresses well; H.264 does not.
     let t0 = Instant::now();
     let wire = flush_compressed(shared, &mut server)?;
+    lock(&shared.clear_seq).sent(surface.generation, count);
     lock(&shared.window).on_sent(frame_id, FrameKind::Other, Instant::now());
     tracing::debug!(
         frame_id,
@@ -485,6 +537,7 @@ pub fn ensure_surface(shared: &GfxShared, generation: u64, w: u16, h: u16) -> Op
                 "EGFX ResetGraphics for new desktop size"
             );
             server.resize(w, h);
+            lock(&shared.clear_seq).reset(generation);
         }
         SurfacePlan::Create => {}
     }
@@ -568,6 +621,58 @@ mod tests {
             client.decompress(&compressed, &mut out).unwrap();
             assert_eq!(out, pdu);
         }
+    }
+
+    #[test]
+    fn clear_seq_belongs_to_the_channel() {
+        let mut seq = ClearSeq::default();
+        assert_eq!(seq.next(1), 0);
+        seq.sent(1, 3);
+        // A new display loop on the same channel (resize to the same size, or
+        // a new surface without ResetGraphics) goes on from the client's number.
+        assert_eq!(seq.next(1), 3);
+        // ResetGraphics sets the client back to 0.
+        seq.reset(1);
+        assert_eq!(seq.next(1), 0);
+        seq.sent(1, 255);
+        seq.sent(1, 2);
+        assert_eq!(seq.next(1), 1);
+        // A new channel starts with ResetGraphics.
+        assert_eq!(seq.next(2), 0);
+    }
+
+    #[test]
+    fn clear_seq_is_written_into_the_bitmaps() {
+        let r = TileRect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 32,
+        };
+        let mut tiles = vec![(r, vec![0x00, 0x00, 0xAA]), (r, vec![0x00, 0x00])];
+        stamp_clear_seq(&mut tiles, 255);
+        assert_eq!(tiles[0].1, vec![0x00, 255, 0xAA]);
+        assert_eq!(tiles[1].1, vec![0x00, 0]);
+    }
+
+    #[test]
+    fn failed_clearcodec_submit_keeps_the_sequence() {
+        // The pipeline refuses the frame (not ready): no number is used up.
+        let shared = Arc::new(GfxShared::default());
+        let factory = MacGfxFactory::new(Arc::clone(&shared));
+        let (_bridge, _handle) = factory.build_server_with_handle().unwrap();
+        let tile = (
+            TileRect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 32,
+            },
+            vec![0, 0],
+        );
+        let surface = SurfaceInfo { generation: 1, ..S };
+        assert!(submit_clearcodec(&shared, surface, vec![tile], 0).is_err());
+        assert_eq!(shared.clear_seq.lock().unwrap().next(1), 0);
     }
 
     #[test]

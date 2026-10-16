@@ -170,11 +170,14 @@ enum FrameResult {
 }
 
 /// Whether the next frame must be a keyframe, after `result`.
-/// A drop keeps the earlier state: a keyframe that was due stays due.
-fn keyframe_due(was_due: bool, result: FrameResult) -> bool {
+/// A drop keeps the earlier state: a keyframe that was due stays due. A
+/// keyframe that was asked for (`requested`: new surface, resume, scene
+/// change) and dropped by the encoder is due too: the encoder clears its
+/// request when it takes the frame, and no periodic keyframe follows.
+fn keyframe_due(was_due: bool, requested: bool, result: FrameResult) -> bool {
     match result {
         FrameResult::Sent => false,
-        FrameResult::Dropped => was_due,
+        FrameResult::Dropped => was_due || requested,
         FrameResult::Lost => true,
     }
 }
@@ -433,9 +436,17 @@ struct RefineState {
     last_frame: Option<BgraFrame>,
     /// When to refine
     due: Option<tokio::time::Instant>,
-    /// ClearCodec encoder of the current surface (its sequence numbers), by
-    /// (EGFX generation, surface id)
-    clear: Option<((u64, u16), ironrdp_graphics::clearcodec::ClearCodecEncoder)>,
+}
+
+/// What the next H.264 frame updates on the client (AVC420 regions).
+#[derive(Debug, PartialEq, Eq)]
+enum Regions {
+    /// The whole frame
+    Whole,
+    /// These tiles
+    Tiles(Vec<TileRect>),
+    /// Nothing changed: no frame to send
+    Nothing,
 }
 
 impl RefineState {
@@ -454,17 +465,21 @@ impl RefineState {
         Self::grid(&mut self.h264_dirty, frame.width, frame.height).mark_dirty(&frame.dirty_rects);
     }
 
-    /// Regions for the next H.264 frame (empty = the whole frame).
-    fn regions(&mut self, width: u32, height: u32, new_surface: bool) -> Vec<TileRect> {
+    /// A new surface is blank: the next H.264 frame must cover all of it,
+    /// also when that frame is not sent at the first try.
+    fn on_new_surface(&mut self, width: u32, height: u32) {
+        Self::grid(&mut self.h264_dirty, width, height).mark_all();
+    }
+
+    /// Regions for the next H.264 frame.
+    fn regions(&mut self, width: u32, height: u32) -> Regions {
         let grid = Self::grid(&mut self.h264_dirty, width, height);
-        if new_surface {
-            grid.mark_all();
-        }
         let (cols, rows) = grid.cols_rows();
-        if grid.tiles().count() == (cols * rows) as usize {
-            return Vec::new();
+        match grid.tiles().count() {
+            0 => Regions::Nothing,
+            n if n == (cols * rows) as usize => Regions::Whole,
+            _ => Regions::Tiles(grid.rects()),
         }
-        grid.rects()
     }
 
     /// The H.264 frame reached the client: its tiles now need refinement.
@@ -635,8 +650,11 @@ impl MacDisplay {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
         }
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
+        let (w, h) = clamp_size(
+            u32::from(width),
+            u32::from(height),
+            (self.max_width, self.max_height),
+        );
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
             tracing::info!(
                 old_w = self.width,
@@ -722,7 +740,10 @@ impl RdpServerDisplay for MacDisplay {
             return;
         };
         let (w, h) = monitor.dimensions();
-        let (w, h) = (w as u16, h as u16);
+        // Compare after the clamp: at the maximum size, a larger layout (a
+        // client window larger than the Mac display) changes nothing and must
+        // not restart the display loop.
+        let (w, h) = clamp_size(w, h, (self.max_width, self.max_height));
         if w == self.width && h == self.height {
             return;
         }
@@ -799,6 +820,8 @@ impl RdpServerDisplay for MacDisplay {
             held_frame: None,
             retry_at: tokio::time::Instant::now(),
             last_send_failed: false,
+            // A new or reused encoder starts with a keyframe.
+            keyframe_requested: true,
             avc_checked: None,
             need_bgra_capture: false,
             full_bitmap_next: true,
@@ -862,6 +885,8 @@ struct MacDisplayUpdates {
     surface_frames: u64,
     /// The last encoded frame did not reach the client: next frame must be a keyframe.
     last_send_failed: bool,
+    /// A keyframe was asked for and not sent yet
+    keyframe_requested: bool,
     /// (EGFX generation, AVC420 allowed) of the last capability check
     avc_checked: Option<(u64, bool)>,
     /// Bitmap updates need BGRA, but capture gives NV12: restart capture before the next frame.
@@ -1033,6 +1058,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Ask the encoder for a keyframe (see `keyframe_due`).
+    fn request_keyframe(&mut self) {
+        if let Some(encoder) = &mut self.encoder {
+            encoder.force_keyframe();
+        }
+        self.keyframe_requested = true;
+    }
+
     /// Capture interval; sets the EGFX frame window.
     fn frame_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(1) / self.capture_config.frame_rate.max(1)
@@ -1099,9 +1132,7 @@ impl MacDisplayUpdates {
             }
             SuppressState::Resumed => {
                 tracing::info!("Client shows output again — sending a keyframe");
-                if let Some(encoder) = &mut self.encoder {
-                    encoder.force_keyframe();
-                }
+                self.request_keyframe();
                 self.full_bitmap_next = true;
                 // Send the newest frame now.
                 self.retry_at = tokio::time::Instant::now();
@@ -1242,6 +1273,7 @@ impl MacDisplayUpdates {
             ProgressiveAction::SceneChange { bitrate, dirty_pct } => {
                 encoder.set_bitrate(bitrate);
                 encoder.force_keyframe();
+                self.keyframe_requested = true;
                 tracing::info!(
                     dirty_pct = format!("{:.0}", dirty_pct),
                     reduced_mbps = bitrate as f64 / 1_000_000.0,
@@ -1338,13 +1370,28 @@ impl MacDisplayUpdates {
                 "EGFX surface created"
             );
             self.surface_frames = 0;
-            if let Some(encoder) = &mut self.encoder {
-                encoder.force_keyframe();
+            self.request_keyframe();
+            if let Some(r) = &mut self.refine {
+                r.on_new_surface(frame.width, frame.height);
             }
             if std::mem::take(&mut self.replay_pending) {
                 self.replay_keyframe(surface_id, w, h, generation);
             }
         }
+
+        let regions = match &mut self.refine {
+            Some(r) => r.regions(frame.width, frame.height),
+            None => Regions::Whole,
+        };
+        let regions = match regions {
+            Regions::Whole => Vec::new(),
+            Regions::Tiles(tiles) => tiles,
+            Regions::Nothing => {
+                // The dirty rectangles hit no tile (all empty or outside).
+                tracing::debug!("Display: no tile changed, frame not sent");
+                return true;
+            }
+        };
 
         let use_444 = self.mode_444
             && self.gfx.avc444.load(Ordering::SeqCst)
@@ -1377,7 +1424,8 @@ impl MacDisplayUpdates {
             Err(result) => {
                 // Keep the frame and try it again; a keyframe only when the
                 // encoder may have moved on without output.
-                self.last_send_failed = keyframe_due(self.last_send_failed, result);
+                self.last_send_failed =
+                    keyframe_due(self.last_send_failed, self.keyframe_requested, result);
                 return false;
             }
         };
@@ -1386,10 +1434,6 @@ impl MacDisplayUpdates {
         let is_keyframe = encoded.is_keyframe();
 
         let ts_ms = self.start.elapsed().as_millis() as u32;
-        let regions = match &mut self.refine {
-            Some(r) => r.regions(frame.width, frame.height, created),
-            None => Vec::new(),
-        };
         let result = match &encoded {
             Encoded::Avc420(f) => {
                 gfx::submit_avc420(&self.gfx, surface_id, &f.data, &regions, w, h, ts_ms)
@@ -1421,7 +1465,13 @@ impl MacDisplayUpdates {
                         "EGFX H.264 frames sent"
                     );
                 }
-                self.last_send_failed = keyframe_due(self.last_send_failed, FrameResult::Sent);
+                self.last_send_failed = keyframe_due(
+                    self.last_send_failed,
+                    self.keyframe_requested,
+                    FrameResult::Sent,
+                );
+                // The encoder took the request with this frame.
+                self.keyframe_requested = false;
                 self.delivered = true;
                 if let Some(r) = &mut self.refine {
                     r.on_sent(frame);
@@ -1438,7 +1488,11 @@ impl MacDisplayUpdates {
             }
             Err(e) => {
                 // The encoder moved on but the client did not get this frame.
-                self.last_send_failed = keyframe_due(self.last_send_failed, FrameResult::Lost);
+                self.last_send_failed = keyframe_due(
+                    self.last_send_failed,
+                    self.keyframe_requested,
+                    FrameResult::Lost,
+                );
                 tracing::warn!(
                     display_frame = self.display_frame_count,
                     error = %e,
@@ -1509,66 +1563,24 @@ impl MacDisplayUpdates {
             return;
         }
         let t0 = Instant::now();
-        let encoder = match &mut state.clear {
-            Some((key, enc)) if *key == (surface.generation, surface.id) => enc,
-            slot => {
-                &mut slot
-                    .insert((
-                        (surface.generation, surface.id),
-                        ironrdp_graphics::clearcodec::ClearCodecEncoder::new(),
-                    ))
-                    .1
-            }
-        };
-        let (cols, rows) = pending.cols_rows();
-        let (mut total, mut picked, mut bytes) = (0, 0, 0);
-        let mut tiles: Vec<(TileRect, Vec<u8>)> = Vec::new();
-        let read = frame.read(|data, stride| {
-            for row in 0..rows {
-                let lossless: Vec<bool> = (0..cols)
-                    .map(|c| {
-                        pending.is_set(c, row)
-                            && refine::is_text_like(data, stride, pending.tile_rect(c, row))
-                    })
-                    .collect();
-                for c in 0..cols {
-                    if pending.is_set(c, row) {
-                        pending.unset(c, row);
-                        total += 1;
-                        picked += usize::from(lossless[c as usize]);
-                    }
-                }
-                let runs = pending.runs_larger_than(refine::GLYPH_MAX_PIXELS, |c, r| {
-                    r == row && lossless[c as usize]
-                });
-                for rect in runs {
-                    let px = refine::copy_rect(data, stride, rect);
-                    let encoded = encoder.encode(&px, rect.w, rect.h);
-                    bytes += encoded.len();
-                    tiles.push((rect, encoded));
-                }
-                if bytes >= REFINE_CHUNK_BYTES {
-                    break;
-                }
-            }
-        });
-        if read.is_none() {
+        let read = frame.read(|data, stride| take_refine_chunk(pending, data, stride));
+        let Some(chunk) = read else {
             // The pixels cannot be read: give up on these tiles.
             pending.clear();
             return;
-        }
+        };
         if !pending.is_empty() {
             state.due = Some(tokio::time::Instant::now());
         }
-        if tiles.is_empty() {
+        if chunk.tiles.is_empty() {
             return;
         }
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ts_ms = self.start.elapsed().as_millis() as u32;
-        match gfx::submit_clearcodec(&self.gfx, surface.id, tiles, ts_ms) {
+        match gfx::submit_clearcodec(&self.gfx, surface, chunk.tiles, ts_ms) {
             Ok(bytes) => tracing::debug!(
-                tiles = total,
-                lossless = picked,
+                tiles = chunk.total,
+                lossless = chunk.picked,
                 bytes,
                 encode_ms = format!("{encode_ms:.1}"),
                 "Refine: sent lossless tiles"
@@ -1818,6 +1830,66 @@ impl MacDisplayUpdates {
     }
 }
 
+/// A requested desktop size, limited to `max`.
+fn clamp_size(width: u32, height: u32, max: (u16, u16)) -> (u16, u16) {
+    let clamp = |v: u32, m: u16| u16::try_from(v).unwrap_or(u16::MAX).min(m);
+    (clamp(width, max.0), clamp(height, max.1))
+}
+
+/// One chunk of lossless refinement (see `take_refine_chunk`).
+struct RefineChunk {
+    /// ClearCodec bitmaps (sequence numbers are set when they are sent)
+    tiles: Vec<(TileRect, Vec<u8>)>,
+    /// Pending tiles looked at
+    total: usize,
+    /// Of those, tiles sent lossless
+    picked: usize,
+}
+
+/// Take whole tile rows from `pending` until the ClearCodec data reaches
+/// `REFINE_CHUNK_BYTES`. Text-like tiles of those rows are encoded; the other
+/// tiles (pictures) stay H.264 and leave `pending` too.
+fn take_refine_chunk(pending: &mut TileGrid, data: &[u8], stride: usize) -> RefineChunk {
+    // A new encoder each time: its glyph cache starts empty, so it never
+    // refers to a glyph the client may not have.
+    let mut encoder = ironrdp_graphics::clearcodec::ClearCodecEncoder::new();
+    let (cols, rows) = pending.cols_rows();
+    let mut chunk = RefineChunk {
+        tiles: Vec::new(),
+        total: 0,
+        picked: 0,
+    };
+    let mut bytes = 0;
+    for row in 0..rows {
+        let lossless: Vec<bool> = (0..cols)
+            .map(|c| {
+                pending.is_set(c, row)
+                    && refine::is_text_like(data, stride, pending.tile_rect(c, row))
+            })
+            .collect();
+        for c in 0..cols {
+            if pending.is_set(c, row) {
+                pending.unset(c, row);
+                chunk.total += 1;
+                chunk.picked += usize::from(lossless[c as usize]);
+            }
+        }
+        let runs = pending.runs_larger_than(refine::GLYPH_MAX_PIXELS, |c, r| {
+            r == row && lossless[c as usize]
+        });
+        for rect in runs {
+            let px = refine::copy_rect(data, stride, rect);
+            let encoded = encoder.encode(&px, rect.w, rect.h);
+            bytes += encoded.len();
+            chunk.tiles.push((rect, encoded));
+        }
+        if bytes >= REFINE_CHUNK_BYTES {
+            break;
+        }
+    }
+    chunk
+}
+
 /// Coalesce a frame with the frames that already wait behind it: the newest frame wins,
 /// with the dirty rects of all of them (bitmap updates send only the dirty area).
 /// `Idle` events in between are skipped.
@@ -1928,19 +2000,199 @@ mod tests {
         );
     }
 
+    /// A 128x64 BGRA frame (4x2 tiles of 32 px): `photo` tiles get a new color
+    /// per pixel, the others two colors (text-like).
+    fn refine_frame(dirty: &[(u32, u32, u32, u32)], photo: &[(u32, u32)]) -> CapturedFrame {
+        let (w, h) = (128u32, 64u32);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let px = if photo.contains(&(x / 32, y / 32)) {
+                    let v = y * w + x;
+                    [v as u8, (v >> 8) as u8, (v * 7) as u8, 255]
+                } else if (x + y) % 5 == 0 {
+                    [0, 0, 0, 255]
+                } else {
+                    [255, 255, 255, 255]
+                };
+                data[i..i + 4].copy_from_slice(&px);
+            }
+        }
+        CapturedFrame {
+            width: w,
+            height: h,
+            data: FrameData::Raw(Bytes::from(data)),
+            stride: (w * 4) as usize,
+            timestamp_us: 0,
+            dirty_rects: dirty
+                .iter()
+                .map(|&(x, y, width, height)| macrdp_capture::Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+                .collect(),
+        }
+    }
+
+    fn tile(c: u16, r: u16, n: u16) -> TileRect {
+        TileRect {
+            x: c * 32,
+            y: r * 32,
+            w: n * 32,
+            h: 32,
+        }
+    }
+
+    #[test]
+    fn refine_first_frame_covers_the_whole_surface() {
+        let mut r = RefineState::default();
+        let f = refine_frame(&[(40, 40, 2, 2)], &[]);
+        r.on_captured(&f);
+        assert_eq!(r.regions(128, 64), Regions::Whole);
+    }
+
+    #[test]
+    fn refine_regions_are_the_changed_tiles() {
+        let mut r = RefineState::default();
+        let f = refine_frame(&[], &[]);
+        r.on_captured(&f);
+        r.on_sent(&f);
+        let f = refine_frame(&[(40, 40, 2, 2)], &[]);
+        r.on_captured(&f);
+        assert_eq!(r.regions(128, 64), Regions::Tiles(vec![tile(1, 1, 1)]));
+    }
+
+    #[test]
+    fn refine_no_changed_tile_is_not_the_whole_frame() {
+        let mut r = RefineState::default();
+        let f = refine_frame(&[], &[]);
+        r.on_captured(&f);
+        r.on_sent(&f);
+        // Zero-size and outside rectangles touch no tile.
+        let f = refine_frame(&[(10, 10, 0, 5), (500, 10, 4, 4)], &[]);
+        r.on_captured(&f);
+        assert_eq!(r.regions(128, 64), Regions::Nothing);
+    }
+
+    #[test]
+    fn refine_new_surface_covers_all_until_sent() {
+        let mut r = RefineState::default();
+        let f = refine_frame(&[], &[]);
+        r.on_captured(&f);
+        r.on_sent(&f);
+        r.on_new_surface(128, 64);
+        // The first frame on the new surface was not sent (skipped or dropped):
+        // the next one still covers the whole surface.
+        let f = refine_frame(&[(40, 40, 2, 2)], &[]);
+        r.on_captured(&f);
+        assert_eq!(r.regions(128, 64), Regions::Whole);
+        assert_eq!(r.regions(128, 64), Regions::Whole);
+        r.on_sent(&f);
+        let f = refine_frame(&[(0, 0, 2, 2)], &[]);
+        r.on_captured(&f);
+        assert_eq!(r.regions(128, 64), Regions::Tiles(vec![tile(0, 0, 1)]));
+    }
+
+    #[test]
+    fn refine_sent_tiles_become_pending() {
+        let mut r = RefineState::default();
+        let f = refine_frame(&[], &[]);
+        r.on_captured(&f);
+        r.on_sent(&f);
+        let pending = r.pending.as_ref().unwrap();
+        assert_eq!(pending.tiles().count(), 8);
+        assert!(r.due.is_some() && r.last_frame.is_some());
+        // Dirty tiles of a frame not sent yet are not pending.
+        r.pending.as_mut().unwrap().clear();
+        let f = refine_frame(&[(40, 40, 2, 2)], &[]);
+        r.on_captured(&f);
+        assert!(r.pending.as_ref().unwrap().is_empty());
+        r.on_sent(&f);
+        assert!(r.pending.as_ref().unwrap().is_set(1, 1));
+        assert_eq!(r.pending.as_ref().unwrap().tiles().count(), 1);
+        assert_eq!(r.regions(128, 64), Regions::Nothing);
+    }
+
+    #[test]
+    fn refine_chunk_sends_text_and_skips_pictures() {
+        let f = refine_frame(&[], &[(1, 0)]);
+        let FrameData::Raw(data) = &f.data else {
+            unreachable!()
+        };
+        let mut pending = TileGrid::new(128, 64);
+        pending.mark_all();
+        let chunk = take_refine_chunk(&mut pending, data, f.stride);
+        assert!(pending.is_empty());
+        assert_eq!((chunk.total, chunk.picked), (8, 7));
+        let rects: Vec<TileRect> = chunk.tiles.iter().map(|(r, _)| *r).collect();
+        // Row 0: tile 0 alone is a glyph-size run, so it takes the picture tile
+        // next to it; tiles 2-3 are one run. Row 1: one run.
+        assert_eq!(rects, vec![tile(0, 0, 2), tile(2, 0, 2), tile(0, 1, 4)]);
+        let mut decoder = ironrdp_graphics::clearcodec::ClearCodecDecoder::new();
+        for (r, bitmap) in &chunk.tiles {
+            let px = decoder.decode(bitmap, r.w, r.h).unwrap();
+            assert_eq!(px.len(), r.w as usize * r.h as usize * 4);
+        }
+    }
+
+    #[test]
+    fn refine_chunk_stops_at_the_budget() {
+        // A large text-like frame: several chunks, each of whole rows.
+        let (w, h) = (1024u32, 1024u32);
+        let data: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let v = if i.wrapping_mul(2_654_435_761) >> 30 == 0 {
+                    0
+                } else {
+                    255
+                };
+                [v, v, v, 255]
+            })
+            .collect();
+        let mut pending = TileGrid::new(w, h);
+        pending.mark_all();
+        let all = pending.tiles().count();
+        let mut seen = 0;
+        let mut chunks = 0;
+        while !pending.is_empty() {
+            let chunk = take_refine_chunk(&mut pending, &data, (w * 4) as usize);
+            let bytes: usize = chunk.tiles.iter().map(|(_, d)| d.len()).sum();
+            assert!(chunk.total.is_multiple_of(32), "whole rows");
+            if !pending.is_empty() {
+                assert!(bytes >= REFINE_CHUNK_BYTES);
+            }
+            seen += chunk.total;
+            chunks += 1;
+        }
+        assert_eq!(seen, all);
+        assert!(chunks > 1);
+    }
+
+    #[test]
+    fn layout_larger_than_the_display_is_the_display_size() {
+        assert_eq!(clamp_size(1300, 760, (1280, 720)), (1280, 720));
+        assert_eq!(clamp_size(1024, 600, (1280, 720)), (1024, 600));
+        assert_eq!(clamp_size(70_000, 600, (1280, 720)), (1280, 600));
+    }
+
     #[test]
     fn keyframe_due_after_frame() {
         // A frame the encoder dropped is not a reference: no keyframe for it ...
-        assert!(!keyframe_due(false, FrameResult::Dropped));
+        assert!(!keyframe_due(false, false, FrameResult::Dropped));
         // ... but a keyframe that was due (e.g. the dropped frame was the forced
         // keyframe) stays due.
-        assert!(keyframe_due(true, FrameResult::Dropped));
+        assert!(keyframe_due(true, false, FrameResult::Dropped));
+        // A keyframe asked for (new surface, scene change) and dropped is due.
+        assert!(keyframe_due(false, true, FrameResult::Dropped));
         // The encoder moved on without the client: keyframe.
-        assert!(keyframe_due(false, FrameResult::Lost));
-        assert!(keyframe_due(true, FrameResult::Lost));
+        assert!(keyframe_due(false, false, FrameResult::Lost));
+        assert!(keyframe_due(true, false, FrameResult::Lost));
         // The client got the frame.
-        assert!(!keyframe_due(true, FrameResult::Sent));
-        assert!(!keyframe_due(false, FrameResult::Sent));
+        assert!(!keyframe_due(true, true, FrameResult::Sent));
+        assert!(!keyframe_due(false, false, FrameResult::Sent));
     }
 
     fn run(level: &mut BitrateLevel, t0: Instant, ms: u64, delay: Option<f32>) -> f64 {
