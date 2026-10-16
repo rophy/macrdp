@@ -12,22 +12,22 @@ members = [
 # IronRDP master with macrdp's changes: branch "macrdp-v2" of https://github.com/rophy/IronRDP.
 # All ironrdp crates come from the same commit, so that each crate exists only once.
 [patch.crates-io]
-ironrdp-acceptor = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-ainput = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-async = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-cliprdr = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-connector = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-core = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-displaycontrol = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-dvc = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-egfx = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-error = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-graphics = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-pdu = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-rdpsnd = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-server = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-svc = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
-ironrdp-tokio = { git = "https://github.com/rophy/IronRDP", rev = "c473d8c88e4202fc4ba6e315b3d3b78396edadb2" }
+ironrdp-acceptor = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-ainput = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-async = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-cliprdr = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-connector = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-core = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-displaycontrol = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-dvc = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-egfx = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-error = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-graphics = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-pdu = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-rdpsnd = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-server = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-svc = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
+ironrdp-tokio = { git = "https://github.com/rophy/IronRDP", rev = "3f357e8e7828066984b480783ec220c3b2420382" }
 
 [workspace.package]
 version = "0.2.0-dev"
