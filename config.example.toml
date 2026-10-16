@@ -12,7 +12,8 @@ port = 3389
 # ─── Authentication ────────────────────────────────────────────────────────────
 
 # RDP login credentials (NLA/Hybrid/CredSSP)
-# Both fields are optional — if omitted, any credentials are accepted
+# If either field is missing, the server makes a random password for user "macrdp"
+# at each start and prints it to stdout.
 username = "admin"
 password = "123456"
 

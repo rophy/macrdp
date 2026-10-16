@@ -5,7 +5,7 @@
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
 
 An RDP server for macOS. Connect to a Mac from Windows (mstsc), Linux (FreeRDP) or any
-other RDP client that supports the RDP graphics pipeline with H.264.
+other RDP client that supports the RDP graphics pipeline (EGFX), preferably with H.264.
 
 This is a fork of [x6nux/macrdp](https://github.com/x6nux/macrdp). The fork adds dynamic
 resolution, session reconnect and takeover, adaptive frame rate, a separate cursor channel,
@@ -36,14 +36,13 @@ Measured on an M1 Mac (1280x720, Wi-Fi), client in a Linux VM
 
 - **H.264 over RDP GFX** — AVC420, or AVC444 for full chroma. Hardware encoder
   (VideoToolbox) or software encoder (OpenH264).
-- **Dirty-rect encoding** — small changes encode only the changed region.
 - **Adaptive frame rate and bitrate** — capture drops to 5 fps when the screen is idle and
   returns to full rate on activity. Bitrate ramps up after scene changes.
 - **Separate cursor channel** — the cursor is sent as RDP pointer updates, not in the video.
 - **Dynamic resolution** — follows the client window size (DisplayControl channel).
 - **Session reconnect and takeover** — one session at a time. A new connection that
-  authenticates replaces the current session; the encoder is reused and a keyframe is
-  replayed.
+  authenticates (NLA) replaces the current session; the old client gets the error
+  "disconnected by other connection". The encoder is reused and a keyframe is replayed.
 - **Audio** — system audio over `rdpsnd` (PCM 48 kHz stereo). Silent periods are not sent.
   The server respects the client's audio mode (see [Audio](#audio)).
 - **Clipboard** — text and file copy/paste between client and Mac.
@@ -60,7 +59,9 @@ Measured on an M1 Mac (1280x720, Wi-Fi), client in a Linux VM
 | Windows `mstsc` (Windows 10 22H2) | Works with default settings |
 | FreeRDP 3.x with H.264 | Use `/gfx:AVC420` (or `/gfx:AVC444`); add `/sound` for audio |
 
-Clients without H.264 GFX support (bitmap-only clients) are not supported.
+The client must support the RDP graphics pipeline (EGFX). If a client opens EGFX with AVC
+(H.264) disabled, for example FreeRDP `/gfx` without `:AVC420`, the server sends bitmap
+updates. A client without EGFX gets no video.
 
 ---
 
@@ -199,7 +200,10 @@ cargo test --workspace
 ```
 
 `MACRDP_USER=… MACRDP_PASS=… tests/e2e_test.sh <host> [port]` runs a smoke test with
-FreeRDP 3 from a Linux machine (`XFREERDP` selects the client binary).
+FreeRDP 3 (with H.264) from a Linux machine: login, session takeover, bitmap, AVC420,
+AVC444, no-audio and dynamic-resolution sessions. `XFREERDP` selects the client binary;
+set `MACRDP_AVC444=1` when the server runs with `chroma_mode = "avc444"`, and `MACRDP_LOG`
+to the server log if the script can read it.
 `tests/bench` has the benchmark (see its README).
 
 ---
@@ -208,17 +212,20 @@ FreeRDP 3 from a Linux machine (`XFREERDP` selects the client binary).
 
 Compared with upstream:
 
-- Dynamic resolution through the DisplayControl channel
+- Built on IronRDP upstream `master`: H.264 goes through its EGFX server (`ironrdp-egfx`,
+  with ZGFX compression and frame-acknowledge flow control)
+- Dynamic resolution through the DisplayControl channel, with a new EGFX surface at each
+  size
 - Session reconnect (warm reset, encoder reuse, keyframe replay) and session takeover
   (a new authenticated connection replaces the current one)
 - Activity-based adaptive frame rate; fix: capture size is kept when the frame rate changes
-- Adaptive bitrate and progressive rendering after scene changes
-- Dirty-rect H.264 encoding
+- Adaptive bitrate (from the frame-acknowledge round trip) and progressive rendering after
+  scene changes
+- Encoding stops while the client does not show the output (Suppress Output PDU)
 - Separate cursor channel (RDP pointer PDUs)
-- ZGFX bulk compression for GFX PDUs
-- Multi-monitor protocol plumbing (monitor layout; capture is still the main display)
+- Bitmap updates for EGFX clients with AVC disabled
 - Audio: no silent chunks; respects the client audio mode
-- Error Info PDU and graceful disconnect sequence
+- Error Info PDU when screen capture cannot start
 - Main display is used for capture (was: first display)
 - Signed and notarized Apple Silicon releases, install script and LaunchAgent; CI
 - Desktop UI (Tauri) removed; the server runs as a LaunchAgent
@@ -242,9 +249,10 @@ builds, signs, notarizes and publishes `vX.Y.Z` and creates the tag. Then commit
 
 - **[x6nux/macrdp](https://github.com/x6nux/macrdp)** — the upstream project.
 - **[IronRDP](https://github.com/Devolutions/IronRDP)** — Rust RDP implementation. macrdp
-  uses the `macrdp` branch of the fork [rophy/IronRDP](https://github.com/rophy/IronRDP),
-  which adds the GFX/H.264 pipeline, ZGFX, session takeover and other changes to the
-  server, acceptor and DisplayControl crates.
+  uses the `macrdp-v2` branch of the fork [rophy/IronRDP](https://github.com/rophy/IronRDP):
+  upstream `master` plus three small changes to the server and acceptor crates (logon
+  failure status for a wrong NLA password, no rdpsnd when the client asks for no audio,
+  Error Info when the display cannot start).
 - **[FreeRDP](https://github.com/FreeRDP/FreeRDP)** — reference for AVC444 encoding and
   the client used for testing.
 - **[RustDesk](https://github.com/rustdesk/rustdesk)** — ideas for capture and input.
