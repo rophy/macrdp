@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
         mode_444,
         show_cursor,
         bitrate_override,
-        coord_mapper,
+        coord_mapper.clone(),
         shared_audio_tx.clone(),
         perf_stats.clone(),
         std::sync::Arc::clone(&gfx_shared),
@@ -265,6 +265,7 @@ async fn main() -> Result<()> {
     let connection_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
         Some(Box::new(MacConnectionHandler {
             pending_resize: display.pending_resize(),
+            coord_mapper: coord_mapper.clone(),
             audio_gate: shared_audio_tx.map(macrdp_audio::AudioPlaybackGate::new),
         }));
 
@@ -399,6 +400,8 @@ fn generate_password() -> Result<String> {
 struct MacConnectionHandler {
     /// A resize of the previous connection does not apply to the new one.
     pending_resize: display::PendingResize,
+    /// Cursor positions of the previous client do not apply to the new one.
+    coord_mapper: handler::MouseCoordMapper,
     /// Stops audio capture for clients that do not want audio played on their side.
     audio_gate: Option<macrdp_audio::AudioPlaybackGate>,
 }
@@ -406,6 +409,7 @@ struct MacConnectionHandler {
 impl ConnectionHandler for MacConnectionHandler {
     fn on_connection_info(&mut self, info: &ironrdp_server::ConnectionInfo) {
         self.pending_resize.clear();
+        self.coord_mapper.forget_client_moves();
         if let Some(gate) = &mut self.audio_gate {
             gate.on_connection_info(info);
         }
@@ -422,16 +426,21 @@ mod tests {
         use ironrdp_server::ConnectionInfo;
 
         let pending = display::PendingResize::default();
+        let mapper = handler::MouseCoordMapper::new(1280, 720, 1280, 720);
         let mut handler = MacConnectionHandler {
             pending_resize: pending.clone(),
+            coord_mapper: mapper.clone(),
             audio_gate: None,
         };
         let info = ConnectionInfo::new(0x409, KeyboardType::IBM_ENHANCED, String::new());
 
         // Left over from the previous connection: dropped when a new one starts.
         pending.set(1280, 720);
+        mapper.note_client_move((640, 360));
         handler.on_connection_info(&info);
         assert_eq!(pending.take(), None);
+        // The old client's cursor position is not an echo for the new client.
+        assert!(!mapper.is_client_move((640, 360)));
 
         // Within a connection, a layout that arrives later is kept for the update loop,
         // also across the next display start (updates() does not clear it).

@@ -131,6 +131,14 @@ impl MouseCoordMapper {
         moves.any(|(pos, at)| *pos == mac && now.duration_since(*at) <= CLIENT_MOVE_WINDOW)
     }
 
+    /// Forget the client's recent cursor positions. Call after a PointerPosition
+    /// is sent (the client cursor is now at the server's position, so an old
+    /// client position is no longer where the client shows its cursor) and when
+    /// a new connection starts (the old client's positions do not apply).
+    pub fn forget_client_moves(&self) {
+        self.0.lock().unwrap().recent_client_moves.clear();
+    }
+
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
         let old_w = s.rdp_w;
@@ -254,12 +262,43 @@ mod tests {
     #[test]
     fn client_moves_are_recognised_as_echo() {
         let m = MouseCoordMapper::new(1280, 720, 1280, 720);
-        m.note_client_move((625, 190));
-        m.note_client_move((626, 191));
-        assert!(m.is_client_move((625, 190)));
-        assert!(m.is_client_move((626, 191)));
+        let t0 = Instant::now();
+        m.note_client_move_at((625, 190), t0);
+        m.note_client_move_at((626, 191), t0);
+        let t1 = t0 + Duration::from_millis(16);
+        assert!(m.is_client_move_at((625, 190), t1));
+        assert!(m.is_client_move_at((626, 191), t1));
         // A position the client never caused (local user, app warp) is not an echo.
-        assert!(!m.is_client_move((625, 188)));
+        assert!(!m.is_client_move_at((625, 188), t1));
+    }
+
+    #[test]
+    fn local_move_back_to_the_client_position_is_sent() {
+        // Client moves to P and stops; a local move to Q is sent; later a local
+        // move back to P must be sent too (the client shows its cursor at Q).
+        let m = MouseCoordMapper::new(1280, 720, 1280, 720);
+        let t0 = Instant::now();
+        let (p, q) = ((640, 360), (900, 300));
+        m.note_client_move_at(p, t0);
+        assert!(!m.is_client_move_at(q, t0 + Duration::from_secs(1)));
+        m.forget_client_moves(); // the tick sent Q
+        assert!(!m.is_client_move_at(p, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn round_trip_may_differ_by_one_pixel_when_the_session_is_smaller() {
+        // 900x560 session on a 1280x720 Mac: about 1.42 Mac px per session px, so
+        // to_rdp is many-to-one and map(to_rdp(m)) can land 1 px off m. The client
+        // moves its cursor to the sent point and may send it back as a move; that
+        // move is a client move, so the server does not echo it again (no loop).
+        let m = MouseCoordMapper::new(1280, 720, 900, 560);
+        let mac = (900, 299);
+        let (rx, ry) = m.to_rdp(mac.0, mac.1);
+        let back = m.map(rx, ry);
+        assert_eq!(back, (900, 298));
+        let t0 = Instant::now();
+        m.note_client_move_at(back, t0);
+        assert!(m.is_client_move_at(back, t0 + Duration::from_millis(16)));
     }
 
     #[test]
