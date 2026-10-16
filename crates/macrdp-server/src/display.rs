@@ -361,9 +361,22 @@ enum LoopEvent {
     CursorTick,
     /// The screen is quiet: send the changed text tiles losslessly.
     Refine,
+    /// The refinement frame is compressed (None: compression failed)
+    RefineReady(Option<gfx::CompressedPdus>),
     /// Time to try the held frame again.
     Retry,
     Frame(Option<CapturedFrame>),
+}
+
+/// A refinement frame that waits for its compression (see `gfx::ClearFrame`).
+struct RefineJob {
+    frame: gfx::ClearFrame,
+    compressed: tokio::sync::oneshot::Receiver<Option<gfx::CompressedPdus>>,
+    /// Tells the compression to stop: the frame went out as it is
+    cancel: Arc<AtomicBool>,
+    /// Pending tiles looked at, and of those sent lossless (for the log)
+    tiles: (usize, usize),
+    started: Instant,
 }
 
 /// Result of handling one captured frame.
@@ -827,6 +840,7 @@ impl RdpServerDisplay for MacDisplay {
             full_bitmap_next: true,
             mode_444: self.mode_444,
             refine: (self.refine && !self.mode_444).then(RefineState::default),
+            refine_job: None,
             base_bitrate: self.base_bitrate,
             last_applied_bitrate: self.base_bitrate,
             bitrate_level: BitrateLevel::default(),
@@ -896,6 +910,8 @@ struct MacDisplayUpdates {
     mode_444: bool,
     /// Lossless refinement state; None when it is off
     refine: Option<RefineState>,
+    /// Refinement frame being compressed
+    refine_job: Option<RefineJob>,
     /// Encoder bitrate at full network quality
     base_bitrate: u32,
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
@@ -928,6 +944,8 @@ struct MacDisplayUpdates {
 
 impl Drop for MacDisplayUpdates {
     fn drop(&mut self) {
+        // The pipeline counts the frame as sent: send it.
+        self.flush_refine_job();
         if let Some(enc) = self.encoder.take() {
             *self.encoder_cache.lock().unwrap() = Some(enc);
         }
@@ -984,8 +1002,13 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 self.retry_at
             };
             let refine_at = self.refine.as_ref().and_then(|r| r.due);
+            let mut job = self.refine_job.take();
+            let has_job = job.is_some();
             let event = tokio::select! {
                 biased;
+                done = async { (&mut job.as_mut().expect("checked").compressed).await }, if has_job => {
+                    LoopEvent::RefineReady(done.ok().flatten())
+                }
                 _ = async { cursor_iv.as_mut().expect("checked").tick().await }, if has_cursor => {
                     LoopEvent::CursorTick
                 }
@@ -995,6 +1018,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     if refine_at.is_some() && !suppressed => LoopEvent::Refine,
             };
             self.cursor_interval = cursor_iv;
+            self.refine_job = job;
 
             let frame = match event {
                 LoopEvent::CursorTick => {
@@ -1011,6 +1035,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 LoopEvent::Refine => {
                     self.refine_quiet_screen();
+                    continue;
+                }
+                LoopEvent::RefineReady(compressed) => {
+                    if let Some(job) = self.refine_job.take() {
+                        self.send_refine_job(job, compressed);
+                    }
                     continue;
                 }
                 LoopEvent::Retry if suppressed => continue,
@@ -1348,6 +1378,8 @@ impl MacDisplayUpdates {
     /// Encode a frame as full-frame H.264 and submit it to the EGFX pipeline.
     /// Returns false if the frame did not reach the pipeline (the caller keeps it).
     fn send_h264(&mut self, frame: &CapturedFrame, generation: u64) -> bool {
+        // A refinement frame still being compressed goes first, as it is.
+        self.flush_refine_job();
         let (Ok(w), Ok(h)) = (u16::try_from(frame.width), u16::try_from(frame.height)) else {
             return true;
         };
@@ -1539,6 +1571,11 @@ impl MacDisplayUpdates {
             // A frame still waits: it comes first, then a new quiet period.
             return;
         }
+        if self.refine_job.is_some() {
+            // The last chunk is not sent yet.
+            state.due = Some(tokio::time::Instant::now() + REFINE_POLL);
+            return;
+        }
         let Some(frame) = &state.last_frame else {
             return;
         };
@@ -1577,12 +1614,62 @@ impl MacDisplayUpdates {
         }
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ts_ms = self.start.elapsed().as_millis() as u32;
-        match gfx::submit_clearcodec(&self.gfx, surface, chunk.tiles, ts_ms) {
-            Ok(bytes) => tracing::debug!(
-                tiles = chunk.total,
-                lossless = chunk.picked,
-                bytes,
-                encode_ms = format!("{encode_ms:.1}"),
+        let frame = match gfx::take_clearcodec(&self.gfx, surface, chunk.tiles, ts_ms) {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::warn!(error = %e, "Refine: frame not sent");
+                return;
+            }
+        };
+        tracing::debug!(
+            frame_id = frame.frame_id,
+            bytes = frame.bytes,
+            encode_ms = format!("{encode_ms:.1}"),
+            "Refine: frame taken, compressing"
+        );
+        // Compression takes 10-30 ms: off the display loop, so that a new
+        // frame does not wait for it.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (pdus, stop) = (frame.pdus(), Arc::clone(&cancel));
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(gfx::compress_clearcodec(&pdus, &stop));
+        });
+        self.refine_job = Some(RefineJob {
+            frame,
+            compressed: rx,
+            cancel,
+            tiles: (chunk.total, chunk.picked),
+            started: Instant::now(),
+        });
+    }
+
+    /// Send the refinement frame now: compressed if that is done, else as it is.
+    fn flush_refine_job(&mut self) {
+        let Some(mut job) = self.refine_job.take() else {
+            return;
+        };
+        let compressed = match job.compressed.try_recv() {
+            Ok(compressed) => compressed,
+            Err(_) => {
+                job.cancel.store(true, Ordering::Relaxed);
+                None
+            }
+        };
+        self.send_refine_job(job, compressed);
+    }
+
+    fn send_refine_job(&mut self, job: RefineJob, compressed: Option<gfx::CompressedPdus>) {
+        let was_compressed = compressed.is_some();
+        match gfx::send_clearcodec(&self.gfx, &job.frame, compressed) {
+            Ok(wire) => tracing::debug!(
+                frame_id = job.frame.frame_id,
+                tiles = job.tiles.0,
+                lossless = job.tiles.1,
+                bytes = job.frame.bytes,
+                wire,
+                compressed = was_compressed,
+                wait_ms = format!("{:.1}", job.started.elapsed().as_secs_f64() * 1000.0),
                 "Refine: sent lossless tiles"
             ),
             Err(e) => tracing::warn!(error = %e, "Refine: frame not sent"),

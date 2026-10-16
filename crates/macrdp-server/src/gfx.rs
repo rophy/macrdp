@@ -265,48 +265,30 @@ fn flush(
     send_messages(shared, server, msgs)
 }
 
-/// Like `flush`, but each PDU is ZGFX-compressed on its own.
+/// Compress one ZGFX-wrapped (uncompressed) EGFX PDU on its own.
 ///
 /// The pipeline sends PDUs uncompressed (see `build_server_with_handle`). A
 /// PDU compressed with a new compressor refers only to its own bytes, so the
 /// client decodes it correctly whatever else it put into its ZGFX history
 /// before, and in whatever order the other messages reach it.
-/// Returns the size of the compressed messages.
-fn flush_compressed(
-    shared: &GfxShared,
-    server: &mut GraphicsPipelineServer,
-) -> Result<usize, FrameSubmissionError> {
-    let msgs = server
-        .drain_output()
-        .into_iter()
-        .map(compress_message)
-        .collect::<Result<Vec<_>, _>>()?;
-    let size = msgs.iter().map(|m| m.size()).sum();
-    send_messages(shared, server, msgs)?;
-    Ok(size)
-}
-
-/// Compress one ZGFX-wrapped (uncompressed) EGFX message on its own.
-fn compress_message(msg: DvcMessage) -> Result<DvcMessage, FrameSubmissionError> {
-    let fail = |what: &str, e: &dyn std::fmt::Display| {
-        tracing::warn!(error = %e, "EGFX {what} failed");
-        FrameSubmissionError::InvalidFrame
-    };
-    let mut wrapped = vec![0u8; msg.size()];
-    msg.encode(&mut WriteCursor::new(&mut wrapped))
-        .map_err(|e| fail("PDU encode", &e))?;
+fn compress_wrapped(wrapped: &[u8]) -> Result<Vec<u8>, String> {
     // The wrapped PDU has raw segments only: a new decompressor unwraps it.
     let mut pdu = Vec::with_capacity(wrapped.len());
     zgfx::Decompressor::new()
-        .decompress(&wrapped, &mut pdu)
-        .map_err(|e| fail("ZGFX unwrap", &e))?;
-    let bytes =
-        zgfx::compress_and_wrap_egfx(&pdu, &mut zgfx::Compressor::new(), CompressionMode::Auto)
-            .map_err(|e| fail("ZGFX compress", &e))?;
-    Ok(Box::new(ZgfxMessage {
-        bytes,
-        name: msg.name(),
-    }))
+        .decompress(wrapped, &mut pdu)
+        .map_err(|e| format!("ZGFX unwrap: {e}"))?;
+    zgfx::compress_and_wrap_egfx(&pdu, &mut zgfx::Compressor::new(), CompressionMode::Auto)
+        .map_err(|e| format!("ZGFX compress: {e}"))
+}
+
+/// Encode a DVC message into its bytes.
+fn message_bytes(msg: &DvcMessage) -> Result<Vec<u8>, FrameSubmissionError> {
+    let mut out = vec![0u8; msg.size()];
+    msg.encode(&mut WriteCursor::new(&mut out)).map_err(|e| {
+        tracing::warn!(error = %e, "EGFX PDU encode failed");
+        FrameSubmissionError::InvalidFrame
+    })?;
+    Ok(out)
 }
 
 /// A ZGFX-wrapped EGFX PDU.
@@ -342,6 +324,15 @@ fn send_messages(
         return Ok(());
     }
     let channel_id = server.channel_id().ok_or(FrameSubmissionError::NotReady)?;
+    send_on_channel(shared, channel_id, msgs)
+}
+
+/// Hand EGFX messages for DVC channel `channel_id` to the server event loop.
+fn send_on_channel(
+    shared: &GfxShared,
+    channel_id: u32,
+    msgs: Vec<DvcMessage>,
+) -> Result<(), FrameSubmissionError> {
     let messages = ironrdp_dvc::encode_dvc_messages(channel_id, msgs, ChannelFlags::empty())
         .map_err(|e| {
             tracing::warn!(error = %e, "EGFX DVC encode failed");
@@ -393,16 +384,42 @@ pub fn submit_avc420(
     Ok(())
 }
 
-/// Queue one frame of ClearCodec (lossless) tiles and send it to the wire.
-/// The tiles get their sequence numbers here. Returns the number of bytes queued.
-pub fn submit_clearcodec(
+/// A ClearCodec frame taken from the pipeline and not sent yet.
+///
+/// Its tiles show the H.264 frame sent before it, so no other EGFX message
+/// may go out before it: send it (`send_clearcodec`) before the next frame.
+pub struct ClearFrame {
+    /// Pipeline of the connection the frame belongs to
+    handle: GfxServerHandle,
+    channel_id: u32,
+    /// The ZGFX-wrapped, uncompressed PDUs and their names
+    pdus: Arc<Vec<(Vec<u8>, &'static str)>>,
+    pub frame_id: u32,
+    /// ClearCodec data in the frame
+    pub bytes: usize,
+}
+
+/// PDUs of a `ClearFrame`, compressed (see `compress_clearcodec`).
+pub type CompressedPdus = Vec<(Vec<u8>, &'static str)>;
+
+impl ClearFrame {
+    /// The PDUs to compress (on another thread).
+    pub fn pdus(&self) -> Arc<Vec<(Vec<u8>, &'static str)>> {
+        Arc::clone(&self.pdus)
+    }
+}
+
+/// Queue one frame of ClearCodec (lossless) tiles in the pipeline and take its
+/// PDUs out. The tiles get their sequence numbers here.
+pub fn take_clearcodec(
     shared: &GfxShared,
     surface: SurfaceInfo,
     mut tiles: Vec<(TileRect, Vec<u8>)>,
     ts_ms: u32,
-) -> Result<usize, FrameSubmissionError> {
+) -> Result<ClearFrame, FrameSubmissionError> {
     let handle = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
     let mut server = lock(&handle);
+    let channel_id = server.channel_id().ok_or(FrameSubmissionError::NotReady)?;
     let count = tiles.len();
     stamp_clear_seq(&mut tiles, lock(&shared.clear_seq).next(surface.generation));
     let bytes = tiles.iter().map(|(_, d)| d.len()).sum();
@@ -421,19 +438,65 @@ pub fn submit_clearcodec(
     let frame_id = server
         .send_mixed_frame(surface.id, tiles, ts_ms)
         .ok_or(FrameSubmissionError::InvalidFrame)?;
-    // ClearCodec residual data compresses well; H.264 does not.
-    let t0 = Instant::now();
-    let wire = flush_compressed(shared, &mut server)?;
+    // From here the frame goes out: as it is, or compressed.
+    let pdus = server
+        .drain_output()
+        .iter()
+        .map(|m| Ok((message_bytes(m)?, m.name())))
+        .collect::<Result<Vec<_>, FrameSubmissionError>>()?;
     lock(&shared.clear_seq).sent(surface.generation, count);
     lock(&shared.window).on_sent(frame_id, FrameKind::Other, Instant::now());
-    tracing::debug!(
+    drop(server);
+    Ok(ClearFrame {
+        handle,
+        channel_id,
+        pdus: Arc::new(pdus),
         frame_id,
         bytes,
-        wire,
-        zgfx_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1000.0),
-        "EGFX ClearCodec frame sent"
-    );
-    Ok(bytes)
+    })
+}
+
+/// ZGFX-compress the PDUs of a `ClearFrame` (ClearCodec residual data
+/// compresses well; H.264 does not). Slow (10-30 ms for 64 KiB): call it off
+/// the display loop. Stops early when `cancel` is set (the frame went out as
+/// it is). A PDU that fails to compress stays as it is.
+pub fn compress_clearcodec(
+    pdus: &[(Vec<u8>, &'static str)],
+    cancel: &AtomicBool,
+) -> Option<CompressedPdus> {
+    let mut out = Vec::with_capacity(pdus.len());
+    for (wrapped, name) in pdus {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let bytes = compress_wrapped(wrapped).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "EGFX ClearCodec PDU not compressed");
+            wrapped.clone()
+        });
+        out.push((bytes, *name));
+    }
+    Some(out)
+}
+
+/// Send a `ClearFrame`: `compressed` PDUs if given, else the PDUs as they are.
+/// Returns the bytes sent. A frame of an older connection is dropped.
+pub fn send_clearcodec(
+    shared: &GfxShared,
+    frame: &ClearFrame,
+    compressed: Option<CompressedPdus>,
+) -> Result<usize, FrameSubmissionError> {
+    let current = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
+    if !Arc::ptr_eq(&current, &frame.handle) {
+        return Err(FrameSubmissionError::NotReady);
+    }
+    let pdus = compressed.unwrap_or_else(|| frame.pdus.as_ref().clone());
+    let wire = pdus.iter().map(|(b, _)| b.len()).sum();
+    let msgs = pdus
+        .into_iter()
+        .map(|(bytes, name)| Box::new(ZgfxMessage { bytes, name }) as DvcMessage)
+        .collect();
+    send_on_channel(shared, frame.channel_id, msgs)?;
+    Ok(wire)
 }
 
 /// Queue one AVC444 frame (luma + chroma streams) and send it to the wire.
@@ -595,22 +658,14 @@ mod tests {
     use super::*;
     use ironrdp_egfx::pdu::{CapabilitiesV81Flags, CapabilitiesV8Flags};
 
-    fn wire_bytes(msg: &DvcMessage) -> Vec<u8> {
-        let mut out = vec![0u8; msg.size()];
-        msg.encode(&mut WriteCursor::new(&mut out)).unwrap();
-        out
-    }
-
     #[test]
     fn compressed_message_decodes_after_any_history() {
         // One segment and a multipart message (more than 65535 bytes).
         for len in [20_000usize, 150_000] {
             let pdu: Vec<u8> = (0..len).map(|i| ((i / 7) % 13) as u8).collect();
-            let msg: DvcMessage = Box::new(ZgfxMessage {
-                bytes: zgfx::wrap_uncompressed(&pdu),
-                name: "test",
-            });
-            let compressed = wire_bytes(&compress_message(msg).unwrap());
+            let pdus = vec![(zgfx::wrap_uncompressed(&pdu), "test")];
+            let compressed = compress_clearcodec(&pdus, &AtomicBool::new(false)).unwrap();
+            let compressed = &compressed[0].0;
             assert!(compressed.len() < pdu.len() / 4, "{}", compressed.len());
             // A client that already has other data in its history.
             let mut client = zgfx::Decompressor::new();
@@ -618,9 +673,15 @@ mod tests {
             let other = zgfx::wrap_uncompressed(&[0x55; 3000]);
             client.decompress(&other, &mut out).unwrap();
             out.clear();
-            client.decompress(&compressed, &mut out).unwrap();
+            client.decompress(compressed, &mut out).unwrap();
             assert_eq!(out, pdu);
         }
+    }
+
+    #[test]
+    fn cancelled_compression_gives_nothing() {
+        let pdus = vec![(zgfx::wrap_uncompressed(&[1, 2, 3]), "test")];
+        assert!(compress_clearcodec(&pdus, &AtomicBool::new(true)).is_none());
     }
 
     #[test]
@@ -656,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_clearcodec_submit_keeps_the_sequence() {
+    fn refused_clearcodec_frame_keeps_the_sequence() {
         // The pipeline refuses the frame (not ready): no number is used up.
         let shared = Arc::new(GfxShared::default());
         let factory = MacGfxFactory::new(Arc::clone(&shared));
@@ -671,7 +732,7 @@ mod tests {
             vec![0, 0],
         );
         let surface = SurfaceInfo { generation: 1, ..S };
-        assert!(submit_clearcodec(&shared, surface, vec![tile], 0).is_err());
+        assert!(take_clearcodec(&shared, surface, vec![tile], 0).is_err());
         assert_eq!(shared.clear_seq.lock().unwrap().next(1), 0);
     }
 
