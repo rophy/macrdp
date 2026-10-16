@@ -1,8 +1,9 @@
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
+use std::time::{Duration, Instant};
 
 use crate::keyboard::set_event_flags;
 
@@ -49,6 +50,77 @@ impl WheelAccumulator {
     }
 }
 
+/// Largest move (points, each axis) between the clicks of a double click.
+/// Windows uses a 4x4 rectangle (SM_CXDOUBLECLK).
+const CLICK_DISTANCE: f64 = 4.0;
+
+/// Counts multiple clicks (double, triple) for `kCGMouseEventClickState`.
+/// RDP sends only presses and releases; macOS apps read the click count
+/// from the event, so the injector must set it.
+#[derive(Debug, Default)]
+pub struct ClickCounter {
+    last: Option<LastClick>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastClick {
+    button: MouseButton,
+    at: Instant,
+    x: f64,
+    y: f64,
+    count: i64,
+}
+
+impl ClickCounter {
+    /// A press of `button` at (x, y): returns its click count (1 = single click).
+    pub fn press(
+        &mut self,
+        button: MouseButton,
+        x: f64,
+        y: f64,
+        now: Instant,
+        interval: Duration,
+    ) -> i64 {
+        let count = match self.last {
+            Some(l)
+                if l.button == button
+                    && now.duration_since(l.at) <= interval
+                    && (x - l.x).abs() <= CLICK_DISTANCE
+                    && (y - l.y).abs() <= CLICK_DISTANCE =>
+            {
+                l.count + 1
+            }
+            _ => 1,
+        };
+        self.last = Some(LastClick {
+            button,
+            at: now,
+            x,
+            y,
+            count,
+        });
+        count
+    }
+
+    /// The click count for a release of `button` (same as its press).
+    pub fn release(&self, button: MouseButton) -> i64 {
+        match self.last {
+            Some(l) if l.button == button => l.count,
+            _ => 1,
+        }
+    }
+}
+
+/// The user's double-click time (System Settings).
+fn double_click_interval() -> Duration {
+    let secs = objc2_app_kit::NSEvent::doubleClickInterval();
+    if secs.is_finite() && secs > 0.0 {
+        Duration::from_secs_f64(secs)
+    } else {
+        Duration::from_millis(500)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollAxis {
     Vertical,
@@ -58,6 +130,7 @@ pub enum ScrollAxis {
 pub struct MouseInjector {
     vertical: WheelAccumulator,
     horizontal: WheelAccumulator,
+    clicks: ClickCounter,
 }
 
 impl MouseInjector {
@@ -68,6 +141,7 @@ impl MouseInjector {
         Ok(Self {
             vertical: WheelAccumulator::default(),
             horizontal: WheelAccumulator::default(),
+            clicks: ClickCounter::default(),
         })
     }
 
@@ -91,7 +165,7 @@ impl MouseInjector {
     }
 
     pub fn button_event(
-        &self,
+        &mut self,
         button: MouseButton,
         pressed: bool,
         x: u16,
@@ -112,9 +186,21 @@ impl MouseInjector {
         let event = CGEvent::new_mouse_event(source, event_type, point, cg_button)
             .map_err(|_| anyhow::anyhow!("Failed to create mouse button event"))?;
         set_event_flags(&event, flags);
+        let clicks = if pressed {
+            self.clicks.press(
+                button,
+                point.x,
+                point.y,
+                Instant::now(),
+                double_click_interval(),
+            )
+        } else {
+            self.clicks.release(button)
+        };
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, clicks);
 
         event.post(CGEventTapLocation::HID);
-        tracing::trace!(?button, pressed, x, y, "Mouse button event");
+        tracing::trace!(?button, pressed, x, y, clicks, "Mouse button event");
         Ok(())
     }
 
@@ -155,7 +241,7 @@ impl MouseInjector {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Right,
@@ -165,6 +251,37 @@ pub enum MouseButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DC: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn quick_clicks_count_up() {
+        let mut c = ClickCounter::default();
+        let t = Instant::now();
+        assert_eq!(c.press(MouseButton::Left, 100.0, 100.0, t, DC), 1);
+        assert_eq!(c.release(MouseButton::Left), 1);
+        let t2 = t + Duration::from_millis(110);
+        assert_eq!(c.press(MouseButton::Left, 101.0, 99.0, t2, DC), 2);
+        assert_eq!(c.release(MouseButton::Left), 2);
+        let t3 = t2 + Duration::from_millis(110);
+        assert_eq!(c.press(MouseButton::Left, 101.0, 99.0, t3, DC), 3);
+    }
+
+    #[test]
+    fn slow_far_or_other_button_clicks_start_again() {
+        let mut c = ClickCounter::default();
+        let t = Instant::now();
+        c.press(MouseButton::Left, 100.0, 100.0, t, DC);
+        let late = t + Duration::from_millis(600);
+        assert_eq!(c.press(MouseButton::Left, 100.0, 100.0, late, DC), 1);
+        let t2 = late + Duration::from_millis(100);
+        assert_eq!(c.press(MouseButton::Left, 110.0, 100.0, t2, DC), 1);
+        let t3 = t2 + Duration::from_millis(100);
+        assert_eq!(c.press(MouseButton::Right, 110.0, 100.0, t3, DC), 1);
+        assert_eq!(c.release(MouseButton::Left), 1);
+        let t4 = t3 + Duration::from_millis(100);
+        assert_eq!(c.press(MouseButton::Right, 110.0, 100.0, t4, DC), 2);
+    }
 
     #[test]
     fn one_notch_is_three_lines() {

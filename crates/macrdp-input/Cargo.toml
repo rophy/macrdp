@@ -13,3 +13,4 @@ core-graphics-types = "0.2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 foreign-types = "0.5"
+objc2-app-kit = { version = "0.3", features = ["NSEvent"] }

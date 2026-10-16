@@ -2219,6 +2219,7 @@ dependencies = [
  "core-graphics",
  "core-graphics-types",
  "foreign-types",
+ "objc2-app-kit",
  "tracing",
 ]
 
