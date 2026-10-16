@@ -256,6 +256,9 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        // A resize left over from an earlier connection does not apply to this one:
+        // capture starts at the current size.
+        self.pending_resize.lock().unwrap().take();
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
