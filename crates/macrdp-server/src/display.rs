@@ -126,27 +126,62 @@ fn plan_frame(can_submit: Result<(), FrameSubmissionError>, last_send_failed: bo
     }
 }
 
-/// Encoder bitrate for a measured EGFX frame round-trip time (send to FrameAcknowledge).
-///
-/// Same steps as the old fork's `GfxState` network quality: full rate below 15 ms,
-/// 80 % below 30 ms, 50 % below 60 ms, 30 % below 100 ms, else 15 %.
-/// No measurement yet: full rate.
-fn adaptive_bitrate(base: u32, rtt_ms: Option<f32>) -> u32 {
-    let Some(rtt) = rtt_ms else {
-        return base;
-    };
-    let quality = if rtt < 15.0 {
-        1.0
-    } else if rtt < 30.0 {
-        0.8
-    } else if rtt < 60.0 {
-        0.5
-    } else if rtt < 100.0 {
-        0.3
-    } else {
-        0.15
-    };
-    (f64::from(base) * quality).round() as u32
+/// Upper RTT bound (ms) of each quality level; the last level has no bound.
+/// Same steps as the old fork's `GfxState` network quality.
+const LEVEL_RTT_LIMIT_MS: [f32; 4] = [15.0, 30.0, 60.0, 100.0];
+/// Encoder bitrate share of each level: full rate below 15 ms, 80 % below 30 ms,
+/// 50 % below 60 ms, 30 % below 100 ms, else 15 %.
+const LEVEL_QUALITY: [f64; 5] = [1.0, 0.8, 0.5, 0.3, 0.15];
+/// Step up only when the RTT stays below the next-better level's limit times this.
+const STEP_UP_MARGIN: f32 = 0.8;
+/// ... for at least this long without a break.
+const STEP_UP_DWELL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Quality level that follows the EGFX frame round-trip time (send to
+/// FrameAcknowledge). On a LAN the RTT swings between samples, so the level is
+/// damped: it steps down at once when the RTT exceeds the current level's limit,
+/// and steps up one level at a time, after the RTT stayed clearly below the
+/// next-better limit for `STEP_UP_DWELL`.
+#[derive(Debug, Default)]
+struct BitrateLevel {
+    /// Index into `LEVEL_QUALITY`; 0 = best.
+    level: usize,
+    /// Since when the RTT is below the step-up limit (continuously).
+    below_since: Option<Instant>,
+}
+
+impl BitrateLevel {
+    /// Level that a single RTT sample asks for.
+    fn level_for(rtt_ms: f32) -> usize {
+        LEVEL_RTT_LIMIT_MS
+            .iter()
+            .position(|limit| rtt_ms < *limit)
+            .unwrap_or(LEVEL_RTT_LIMIT_MS.len())
+    }
+
+    /// Feed one RTT sample; returns the bitrate share (0..=1) to use.
+    /// No measurement yet (`None`): full rate.
+    fn update(&mut self, rtt_ms: Option<f32>, now: Instant) -> f64 {
+        let Some(rtt) = rtt_ms else {
+            self.level = 0;
+            self.below_since = None;
+            return LEVEL_QUALITY[0];
+        };
+        let wanted = Self::level_for(rtt);
+        if wanted > self.level {
+            self.level = wanted;
+            self.below_since = None;
+        } else if self.level > 0 && rtt < LEVEL_RTT_LIMIT_MS[self.level - 1] * STEP_UP_MARGIN {
+            let since = *self.below_since.get_or_insert(now);
+            if now.duration_since(since) >= STEP_UP_DWELL {
+                self.level -= 1;
+                self.below_since = None;
+            }
+        } else {
+            self.below_since = None;
+        }
+        LEVEL_QUALITY[self.level]
+    }
 }
 
 /// The client must keep asking for no output this long before output stops.
@@ -563,6 +598,7 @@ impl RdpServerDisplay for MacDisplay {
             mode_444: self.mode_444,
             base_bitrate: self.base_bitrate,
             last_applied_bitrate: self.base_bitrate,
+            bitrate_level: BitrateLevel::default(),
             last_keyframe: Arc::clone(&self.last_keyframe),
             replay_pending: true,
             display_suppressed: Arc::clone(&self.display_suppressed),
@@ -622,6 +658,7 @@ struct MacDisplayUpdates {
     base_bitrate: u32,
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
     last_applied_bitrate: u32,
+    bitrate_level: BitrateLevel,
     /// Last keyframe that reached a client (shared across connections)
     last_keyframe: KeyframeSlot,
     /// Send the cached keyframe on the first surface of this connection
@@ -1138,18 +1175,21 @@ impl MacDisplayUpdates {
         sent
     }
 
-    /// Follow the EGFX frame round-trip time, with 10 % hysteresis.
+    /// Follow the damped EGFX frame round-trip time (see `BitrateLevel`).
+    /// The levels are at least 15 % of the base rate apart, so a level change
+    /// always changes the bitrate; no extra bitrate hysteresis is needed.
     fn apply_adaptive_bitrate(&mut self) {
         let Some(encoder) = &mut self.encoder else {
             return;
         };
-        let target = adaptive_bitrate(self.base_bitrate, gfx::rtt_ms(&self.gfx));
-        let change = (f64::from(target) - f64::from(self.last_applied_bitrate)).abs();
-        if target != self.last_applied_bitrate && change > f64::from(self.base_bitrate) * 0.1 {
+        let rtt = gfx::rtt_ms(&self.gfx);
+        let quality = self.bitrate_level.update(rtt, Instant::now());
+        let target = (f64::from(self.base_bitrate) * quality).round() as u32;
+        if target != self.last_applied_bitrate {
             tracing::info!(
                 from_mbps = self.last_applied_bitrate as f64 / 1_000_000.0,
                 to_mbps = target as f64 / 1_000_000.0,
-                rtt_ms = ?gfx::rtt_ms(&self.gfx),
+                rtt_ms = ?rtt,
                 "Adaptive bitrate adjustment"
             );
             encoder.set_bitrate(target);
@@ -1483,17 +1523,69 @@ mod tests {
         );
     }
 
+    fn run(level: &mut BitrateLevel, t0: Instant, ms: u64, rtt: Option<f32>) -> f64 {
+        level.update(rtt, t0 + std::time::Duration::from_millis(ms))
+    }
+
     #[test]
-    fn adaptive_bitrate_policy() {
-        // Thresholds of the old fork's GfxState::adaptive_bitrate.
-        assert_eq!(adaptive_bitrate(10_000_000, None), 10_000_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(10.0)), 10_000_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(15.0)), 8_000_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(20.0)), 8_000_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(45.0)), 5_000_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(80.0)), 3_000_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(300.0)), 1_500_000);
-        assert_eq!(adaptive_bitrate(10_000_000, Some(1000.0)), 1_500_000);
+    fn bitrate_level_none_is_full_rate() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        assert_eq!(run(&mut l, t0, 0, None), 1.0);
+        run(&mut l, t0, 10, Some(500.0));
+        assert_eq!(run(&mut l, t0, 20, None), 1.0);
+    }
+
+    #[test]
+    fn bitrate_level_steps_down_at_once() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        assert_eq!(run(&mut l, t0, 0, Some(10.0)), 1.0);
+        assert_eq!(run(&mut l, t0, 10, Some(20.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 20, Some(45.0)), 0.5);
+        assert_eq!(run(&mut l, t0, 30, Some(80.0)), 0.3);
+        assert_eq!(run(&mut l, t0, 40, Some(300.0)), 0.15);
+    }
+
+    #[test]
+    fn bitrate_level_steps_up_only_after_dwell() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        assert_eq!(run(&mut l, t0, 0, Some(80.0)), 0.3);
+        // 40 ms is below 60 * 0.8: the dwell starts here.
+        assert_eq!(run(&mut l, t0, 100, Some(40.0)), 0.3);
+        assert_eq!(run(&mut l, t0, 2_000, Some(40.0)), 0.3);
+        // One level up after 2 s, not two.
+        assert_eq!(run(&mut l, t0, 2_100, Some(40.0)), 0.5);
+        assert_eq!(run(&mut l, t0, 2_200, Some(40.0)), 0.5);
+        // 40 ms is not below 30 * 0.8: no further step.
+        assert_eq!(run(&mut l, t0, 9_000, Some(40.0)), 0.5);
+        // A sample inside the margin band restarts the dwell.
+        let mut l = BitrateLevel::default();
+        run(&mut l, t0, 0, Some(80.0));
+        run(&mut l, t0, 100, Some(40.0));
+        run(&mut l, t0, 1_500, Some(55.0));
+        assert_eq!(run(&mut l, t0, 2_200, Some(40.0)), 0.3);
+        assert_eq!(run(&mut l, t0, 4_200, Some(40.0)), 0.5);
+    }
+
+    #[test]
+    fn bitrate_level_does_not_flap_on_lan_rtt() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        let mut changes = 0;
+        let mut last = 1.0;
+        for i in 0..600u64 {
+            let rtt = [25.0, 45.0, 70.0][(i % 3) as usize];
+            let q = run(&mut l, t0, i * 16, Some(rtt));
+            if q != last {
+                changes += 1;
+                last = q;
+            }
+        }
+        // One step down to the 70 ms level, then stable (~10 s of samples).
+        assert_eq!(changes, 3, "0.8, 0.5, 0.3 on the way down only");
+        assert_eq!(last, 0.3);
     }
 
     #[test]
