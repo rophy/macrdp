@@ -125,9 +125,6 @@ pub struct ServerConfig {
     /// When enabled, idle frames from ScreenCaptureKit are not encoded,
     /// reducing CPU/GPU usage on static screens.
     pub skip_unchanged: Option<bool>,
-    /// Seconds between keepalive IDR frames during screen idle (default: 2)
-    /// Prevents RDP client timeout when no frames are being sent.
-    pub idle_keyframe_sec: Option<u32>,
     /// Audio forwarding configuration
     #[serde(default)]
     pub audio: AudioConfig,
@@ -157,7 +154,6 @@ impl Default for ServerConfig {
             cursor_channel: None,
             bitrate_mbps: None,
             skip_unchanged: None,
-            idle_keyframe_sec: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
         }
@@ -263,18 +259,15 @@ mod tests {
         let toml_str = r#"
             port = 3389
             skip_unchanged = false
-            idle_keyframe_sec = 5
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.skip_unchanged, Some(false));
-        assert_eq!(config.idle_keyframe_sec, Some(5));
     }
 
     #[test]
     fn test_default_encoding_config() {
         let config = ServerConfig::default();
         assert!(config.skip_unchanged.is_none());
-        assert!(config.idle_keyframe_sec.is_none());
     }
 
     #[test]
@@ -290,6 +283,13 @@ mod tests {
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
         assert_eq!(config.password.as_ref().map(Secret::expose), Some("secret"));
+    }
+
+    #[test]
+    fn test_removed_idle_keyframe_sec_key_still_parses() {
+        // idle_keyframe_sec was never used and is removed; old config files that set it must load.
+        let config: ServerConfig = toml::from_str("port = 13389\nidle_keyframe_sec = 5\n").unwrap();
+        assert_eq!(config.port, 13389);
     }
 
     #[test]
