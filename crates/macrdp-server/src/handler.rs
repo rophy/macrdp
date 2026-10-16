@@ -204,13 +204,10 @@ impl RdpServerInputHandler for MacInputHandler {
             KeyboardEvent::Released { code, extended } => kb.inject_key(code, extended, false),
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
-            KeyboardEvent::Synchronize(flags) => {
-                kb.synchronize(
-                    flags.contains(SynchronizeFlags::CAPS_LOCK),
-                    flags.contains(SynchronizeFlags::NUM_LOCK),
-                );
-                Ok(())
-            }
+            KeyboardEvent::Synchronize(flags) => kb.synchronize(
+                flags.contains(SynchronizeFlags::CAPS_LOCK),
+                flags.contains(SynchronizeFlags::NUM_LOCK),
+            ),
         };
 
         if let Err(e) = result {

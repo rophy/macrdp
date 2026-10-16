@@ -70,6 +70,9 @@ const MODIFIER_KEYS: [(u16, u64, u64); 8] = [
     (0x36, COMMAND, DEV_RCMD),   // kVK_RightCommand
 ];
 
+/// Index of Left Control in `MODIFIER_KEYS`.
+const LEFT_CONTROL: usize = 2;
+
 /// Flags that macOS gives a key by itself (no modifier held). The table is
 /// what `CGEventCreateKeyboardEvent` sets for keycodes 0-127 from a clean
 /// state (macOS 15): arrows get numpad+fn, the navigation and function keys
@@ -105,6 +108,8 @@ pub struct ModifierState {
     down: u8,
     caps_lock: bool,
     num_lock: bool,
+    /// The scancode 0x45 that is down is the Pause key
+    pause_down: bool,
 }
 
 impl Default for ModifierState {
@@ -114,6 +119,7 @@ impl Default for ModifierState {
             down: 0,
             caps_lock: false,
             num_lock: true,
+            pause_down: false,
         }
     }
 }
@@ -140,14 +146,42 @@ impl ModifierState {
         }
     }
 
-    /// Set the lock states (RDP Synchronize event).
-    pub fn set_locks(&mut self, caps_lock: bool, num_lock: bool) {
+    /// RDP Synchronize event: set the lock states and release all keys
+    /// (MS-RDPBCGR 2.2.8.1.1.3.1.1.5: the server sets all keys up; the client
+    /// then sends a key down for each key that is still down). Returns the
+    /// modifier keycodes that were down: they need a key up.
+    pub fn synchronize(&mut self, caps_lock: bool, num_lock: bool) -> Vec<u16> {
         self.caps_lock = caps_lock;
         self.num_lock = num_lock;
+        self.pause_down = false;
+        let held = MODIFIER_KEYS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.down & (1 << i) != 0)
+            .map(|(_, (kc, _, _))| *kc)
+            .collect();
+        self.down = 0;
+        held
     }
 
-    pub fn toggle_num_lock(&mut self) {
+    /// Scancode 0x45 without the extended flag, pressed or released. Returns
+    /// whether to post it (as Num Lock).
+    ///
+    /// mstsc and FreeRDP send Pause as Left Ctrl with KBDFLAGS_EXTENDED1, then
+    /// 0x45 (MS-RDPBCGR 2.2.8.1.1.3.1.1.1). The server library gives only the
+    /// extended flag, so that Pause looks like Ctrl+Num Lock, which Windows
+    /// also reads as Pause. Pause is not posted (macOS has no Pause key) and
+    /// does not toggle Num Lock.
+    pub fn num_lock_scancode(&mut self, pressed: bool) -> bool {
+        if !pressed {
+            return !std::mem::take(&mut self.pause_down);
+        }
+        if self.down & (1 << LEFT_CONTROL) != 0 {
+            self.pause_down = true;
+            return false;
+        }
         self.num_lock = !self.num_lock;
+        true
     }
 
     pub fn num_lock(&self) -> bool {
@@ -243,8 +277,43 @@ mod tests {
     fn synchronize_sets_the_locks() {
         let mut s = ModifierState::new();
         assert!(s.num_lock());
-        s.set_locks(true, false);
+        assert!(s.synchronize(true, false).is_empty());
         assert_eq!(s.flags(), ALPHA_SHIFT);
+        assert!(!s.num_lock());
+    }
+
+    #[test]
+    fn synchronize_releases_held_modifiers() {
+        // Alt (Command) went down, its release went to another window.
+        let mut s = ModifierState::new();
+        s.key(0x37, true);
+        s.key(0x38, true);
+        assert_eq!(s.synchronize(false, false), vec![0x38, 0x37]);
+        assert_eq!(s.key_flags(0x05), 0);
+        assert!(s.synchronize(false, false).is_empty());
+    }
+
+    #[test]
+    fn num_lock_key_toggles() {
+        let mut s = ModifierState::new();
+        assert!(s.num_lock_scancode(true));
+        assert!(!s.num_lock());
+        assert!(s.num_lock_scancode(false));
+        assert!(s.num_lock_scancode(true));
+        assert!(s.num_lock());
+    }
+
+    #[test]
+    fn pause_is_not_num_lock() {
+        // mstsc Pause: Ctrl (EXTENDED1) down, 0x45 down, Ctrl up, 0x45 up
+        let mut s = ModifierState::new();
+        s.key(0x3B, true);
+        assert!(!s.num_lock_scancode(true));
+        s.key(0x3B, false);
+        assert!(!s.num_lock_scancode(false));
+        assert!(s.num_lock());
+        // The next Num Lock press is Num Lock again.
+        assert!(s.num_lock_scancode(true));
         assert!(!s.num_lock());
     }
 
