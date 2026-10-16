@@ -514,7 +514,6 @@ impl RdpServerDisplay for MacDisplay {
             encoder,
             encoder_cache: Arc::clone(&self.encoder_cache),
             gfx: Arc::clone(&self.gfx),
-            surface: None,
             surface_frames: 0,
             held_frame: None,
             retry_at: tokio::time::Instant::now(),
@@ -563,8 +562,6 @@ struct MacDisplayUpdates {
     /// Shared slot to return the encoder on drop for reuse across connections
     encoder_cache: EncoderSlot,
     gfx: SharedGfx,
-    /// EGFX surface in use: (surface id, EGFX generation, width, height)
-    surface: Option<(u16, u64, u16, u16)>,
     /// Newest frame not sent yet; tried again after one frame interval
     held_frame: Option<CapturedFrame>,
     /// When to try the held frame again
@@ -962,45 +959,28 @@ impl MacDisplayUpdates {
             return true;
         }
 
-        // A new channel (generation) or a new frame size needs a new surface.
-        let surface_ok = matches!(
-            self.surface,
-            Some((_, g, sw, sh)) if g == generation && sw == w && sh == h
-        );
-        if !surface_ok {
-            if matches!(self.surface, Some((_, g, _, _)) if g == generation) {
-                // Same channel, other size: reset the desktop size and drop the old surface.
-                gfx::resize(&self.gfx, w, h);
-            }
-            // The surface has the visible size, so ResetGraphics (sent before the
-            // first surface) also has the visible size; frames are cropped to it.
-            match gfx::create_surface(&self.gfx, w, h) {
-                Some(id) => {
-                    tracing::info!(
-                        surface_id = id,
-                        width = w,
-                        height = h,
-                        generation,
-                        "EGFX surface created"
-                    );
-                    self.surface = Some((id, generation, w, h));
-                    self.surface_frames = 0;
-                    if let Some(encoder) = &mut self.encoder {
-                        encoder.force_keyframe();
-                    }
-                    if std::mem::take(&mut self.replay_pending) {
-                        self.replay_keyframe(id, w, h, generation);
-                    }
-                }
-                None => {
-                    self.surface = None;
-                    return false;
-                }
-            }
-        }
-        let Some((surface_id, ..)) = self.surface else {
+        // A new channel (generation) or a new frame size needs a new surface. The
+        // surface state is shared: after a resize this is a new display loop on
+        // the same channel, which still has the old surface.
+        let Some((surface_id, created)) = gfx::ensure_surface(&self.gfx, generation, w, h) else {
             return false;
         };
+        if created {
+            tracing::info!(
+                surface_id,
+                width = w,
+                height = h,
+                generation,
+                "EGFX surface created"
+            );
+            self.surface_frames = 0;
+            if let Some(encoder) = &mut self.encoder {
+                encoder.force_keyframe();
+            }
+            if std::mem::take(&mut self.replay_pending) {
+                self.replay_keyframe(surface_id, w, h, generation);
+            }
+        }
 
         let use_444 = self.mode_444
             && self.gfx.avc444.load(Ordering::SeqCst)
@@ -1009,7 +989,7 @@ impl MacDisplayUpdates {
         let state = gfx::can_submit(&self.gfx, surface_id, use_444);
         if let Err(FrameSubmissionError::UnknownSurface { .. }) = state {
             // The pipeline dropped our surface: create a new one with the next frame.
-            self.surface = None;
+            gfx::forget_surface(&self.gfx);
         }
         match plan_frame(state, self.last_send_failed) {
             FramePlan::Skip => return false,

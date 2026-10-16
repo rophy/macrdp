@@ -38,6 +38,58 @@ pub struct GfxShared {
     pub avc444: AtomicBool,
     /// Incremented on every `on_ready` (new or re-negotiated channel).
     pub generation: AtomicU64,
+    /// Surface the display loop draws on. Kept here and not in the display
+    /// loop: a resize ends one display loop and starts the next one on the
+    /// same EGFX channel, which still has this surface.
+    pub surface: Mutex<Option<SurfaceInfo>>,
+}
+
+/// An EGFX surface that was created and mapped to the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceInfo {
+    pub id: u16,
+    /// EGFX generation (channel) the surface belongs to
+    pub generation: u64,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// What to do before a frame of a given size can be sent.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SurfacePlan {
+    /// The surface fits: send on it.
+    Reuse(u16),
+    /// Create a surface. If ResetGraphics was not sent on this channel, the
+    /// pipeline sends it first, at the surface size.
+    Create,
+    /// Send ResetGraphics for the new size (this deletes the old surface),
+    /// then create a surface.
+    ResizeThenCreate,
+}
+
+/// Decide how to get a surface for a `size` frame on channel `generation`.
+///
+/// `output` is the pipeline's graphics output size ((0, 0) before the first
+/// ResetGraphics on the channel). A channel that re-negotiated its
+/// capabilities drops its surfaces but keeps the output size; a new surface
+/// of another size then needs a ResetGraphics too.
+pub fn plan_surface(
+    prev: Option<SurfaceInfo>,
+    generation: u64,
+    size: (u16, u16),
+    output: (u16, u16),
+) -> SurfacePlan {
+    match prev {
+        Some(s) if s.generation == generation => {
+            if (s.width, s.height) == size {
+                SurfacePlan::Reuse(s.id)
+            } else {
+                SurfacePlan::ResizeThenCreate
+            }
+        }
+        _ if output != (0, 0) && output != size => SurfacePlan::ResizeThenCreate,
+        _ => SurfacePlan::Create,
+    }
 }
 
 pub type SharedGfx = Arc<GfxShared>;
@@ -122,6 +174,7 @@ impl GfxServerFactory for MacGfxFactory {
         // A new connection: the previous channel (if any) is gone.
         self.shared.ready.store(false, Ordering::SeqCst);
         self.shared.avc444.store(false, Ordering::SeqCst);
+        *lock(&self.shared.surface) = None;
         *lock(&self.shared.handle) = Some(Arc::clone(&handle));
         Some((GfxDvcBridge::new(Arc::clone(&handle)), handle))
     }
@@ -222,29 +275,45 @@ pub fn avc420_allowed(shared: &GfxShared) -> Option<bool> {
     server.is_ready().then(|| server.supports_avc420())
 }
 
-/// Create a w×h surface and map it to the output at (0, 0); returns the surface id.
-pub fn create_surface(shared: &GfxShared, w: u16, h: u16) -> Option<u16> {
+/// Get the surface for a w×h frame on channel `generation`: the current one
+/// if it fits, else a new one (after ResetGraphics when the size changed).
+/// Returns (surface id, true if the surface is new); a new surface needs a keyframe.
+pub fn ensure_surface(shared: &GfxShared, generation: u64, w: u16, h: u16) -> Option<(u16, bool)> {
     let handle = current_handle(shared)?;
     let mut server = lock(&handle);
+    let mut slot = lock(&shared.surface);
+    match plan_surface(*slot, generation, (w, h), server.output_dimensions()) {
+        SurfacePlan::Reuse(id) => return Some((id, false)),
+        SurfacePlan::ResizeThenCreate => {
+            tracing::info!(
+                old = ?server.output_dimensions(),
+                width = w,
+                height = h,
+                "EGFX ResetGraphics for new desktop size"
+            );
+            server.resize(w, h);
+        }
+        SurfacePlan::Create => {}
+    }
+    *slot = None;
     let id = server.create_surface(w, h)?;
     server.map_surface_to_output(id, 0, 0);
     if let Err(e) = flush(shared, &mut server) {
         tracing::warn!(error = %e, "EGFX surface PDUs not sent");
         return None;
     }
-    Some(id)
+    *slot = Some(SurfaceInfo {
+        id,
+        generation,
+        width: w,
+        height: h,
+    });
+    Some((id, true))
 }
 
-/// Send ResetGraphics for w×h and delete all surfaces; the caller then calls `create_surface`.
-pub fn resize(shared: &GfxShared, w: u16, h: u16) {
-    let Some(handle) = current_handle(shared) else {
-        return;
-    };
-    let mut server = lock(&handle);
-    server.resize(w, h);
-    if let Err(e) = flush(shared, &mut server) {
-        tracing::warn!(error = %e, "EGFX resize PDUs not sent");
-    }
+/// The pipeline no longer has our surface: create a new one with the next frame.
+pub fn forget_surface(shared: &GfxShared) {
+    *lock(&shared.surface) = None;
 }
 
 /// Average frame round-trip time from frame acknowledgements, if measured.
@@ -299,6 +368,77 @@ mod tests {
         let factory = MacGfxFactory::new(Arc::clone(&shared));
         let _ = factory.build_server_with_handle().unwrap();
         assert!(!shared.ready.load(Ordering::SeqCst));
+    }
+
+    const S: SurfaceInfo = SurfaceInfo {
+        id: 3,
+        generation: 7,
+        width: 1024,
+        height: 720,
+    };
+
+    #[test]
+    fn surface_first_on_new_channel() {
+        assert_eq!(
+            plan_surface(None, 7, (1024, 720), (0, 0)),
+            SurfacePlan::Create
+        );
+        // A surface of an older channel is gone with that channel.
+        assert_eq!(
+            plan_surface(Some(S), 8, (1024, 720), (0, 0)),
+            SurfacePlan::Create
+        );
+        assert_eq!(
+            plan_surface(Some(S), 8, (800, 600), (0, 0)),
+            SurfacePlan::Create
+        );
+    }
+
+    #[test]
+    fn surface_reused_at_same_size() {
+        // Also after a deactivation-reactivation that keeps the channel.
+        assert_eq!(
+            plan_surface(Some(S), 7, (1024, 720), (1024, 720)),
+            SurfacePlan::Reuse(3)
+        );
+    }
+
+    #[test]
+    fn surface_resize_on_same_channel() {
+        assert_eq!(
+            plan_surface(Some(S), 7, (1281, 801), (1024, 720)),
+            SurfacePlan::ResizeThenCreate
+        );
+        assert_eq!(
+            plan_surface(Some(S), 7, (1024, 721), (1024, 720)),
+            SurfacePlan::ResizeThenCreate
+        );
+    }
+
+    #[test]
+    fn surface_after_renegotiation_keeps_output_size() {
+        // Re-negotiated channel: no surface, but the output has the old size.
+        assert_eq!(
+            plan_surface(None, 8, (1024, 720), (1024, 720)),
+            SurfacePlan::Create
+        );
+        assert_eq!(
+            plan_surface(Some(S), 8, (800, 600), (1024, 720)),
+            SurfacePlan::ResizeThenCreate
+        );
+        assert_eq!(
+            plan_surface(None, 8, (800, 600), (1024, 720)),
+            SurfacePlan::ResizeThenCreate
+        );
+    }
+
+    #[test]
+    fn new_connection_clears_surface() {
+        let shared = Arc::new(GfxShared::default());
+        *shared.surface.lock().unwrap() = Some(S);
+        let factory = MacGfxFactory::new(Arc::clone(&shared));
+        let _ = factory.build_server_with_handle().unwrap();
+        assert!(shared.surface.lock().unwrap().is_none());
     }
 
     #[test]
