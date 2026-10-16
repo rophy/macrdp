@@ -60,6 +60,8 @@ const CLICK_DISTANCE: f64 = 4.0;
 #[derive(Debug, Default)]
 pub struct ClickCounter {
     last: Option<LastClick>,
+    /// Click count of each button that is down
+    down: Vec<(MouseButton, i64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,14 +101,17 @@ impl ClickCounter {
             y,
             count,
         });
+        self.down.retain(|(b, _)| *b != button);
+        self.down.push((button, count));
         count
     }
 
-    /// The click count for a release of `button` (same as its press).
-    pub fn release(&self, button: MouseButton) -> i64 {
-        match self.last {
-            Some(l) if l.button == button => l.count,
-            _ => 1,
+    /// The click count for a release of `button` (same as its press, also
+    /// when another button was pressed in between).
+    pub fn release(&mut self, button: MouseButton) -> i64 {
+        match self.down.iter().position(|(b, _)| *b == button) {
+            Some(i) => self.down.swap_remove(i).1,
+            None => 1,
         }
     }
 }
@@ -281,6 +286,20 @@ mod tests {
         assert_eq!(c.release(MouseButton::Left), 1);
         let t4 = t3 + Duration::from_millis(100);
         assert_eq!(c.press(MouseButton::Right, 110.0, 100.0, t4, DC), 2);
+    }
+
+    #[test]
+    fn release_keeps_its_press_count_across_other_buttons() {
+        let mut c = ClickCounter::default();
+        let t = Instant::now();
+        c.press(MouseButton::Left, 100.0, 100.0, t, DC);
+        c.release(MouseButton::Left);
+        let t2 = t + Duration::from_millis(100);
+        assert_eq!(c.press(MouseButton::Left, 100.0, 100.0, t2, DC), 2);
+        // Right press and release while Left is still down
+        c.press(MouseButton::Right, 100.0, 100.0, t2, DC);
+        assert_eq!(c.release(MouseButton::Right), 1);
+        assert_eq!(c.release(MouseButton::Left), 2);
     }
 
     #[test]
