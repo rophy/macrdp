@@ -9,7 +9,7 @@
 #     the Mac screen must change during the test)
 #   MACRDP_LOG: path of the server log, if readable here (enables the server log check of test 8)
 #   MACRDP_MAC_SHELL: command that runs a shell script from stdin on the Mac as the logged-in
-#     user, e.g. "ssh user@mac sh" (enables test 10, clipboard file copy; changes the pasteboard)
+#     user, e.g. "ssh user@mac sh" (enables test 10, clipboard file copy; leaves an empty string on the pasteboard)
 
 set -euo pipefail
 
@@ -260,11 +260,14 @@ else
             "[ -n \"\$P\" ] && cat \"\$P\"" | mac >"$LOGDIR/clip/mac.out" 2>/dev/null || true
         echo "CLIENT2MAC $(head -1 "$LOGDIR/clip/mac.out")"
         kill $R 2>/dev/null; wait $R 2>/dev/null
-        printf "%s\n" "rm -f /tmp/macrdp-e2e-clip.txt" | mac || true
     '
     CLIP_OUT=$(XFREERDP="$XFREERDP" ADDR="$ADDR" USER="$USER" PASS="$PASS" LOGDIR="$LOGDIR" \
         CLIP_TOKEN="$CLIP_TOKEN" MACRDP_MAC_SHELL="$MACRDP_MAC_SHELL" \
         timeout 60 xvfb-run -a bash -c "$CLIP_SCRIPT" 2>/dev/null) || true
+    # Clean up on the Mac, also after a timeout: remove the test file and leave the
+    # pasteboard holding an empty string (the test replaced its contents).
+    printf "%s\n" "rm -f /tmp/macrdp-e2e-clip.txt" "osascript -e \"set the clipboard to \\\"\\\"\"" \
+        | $MACRDP_MAC_SHELL >/dev/null 2>&1 || true
     if grep -qx "MAC2CLIENT m-${CLIP_TOKEN}" <<<"$CLIP_OUT"; then
         pass "Clipboard file copy Mac -> client"
     else
