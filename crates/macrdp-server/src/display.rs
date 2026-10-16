@@ -206,6 +206,11 @@ const UP_DWELL_MAX: std::time::Duration = std::time::Duration::from_secs(48);
 const PROBE_FAILED: std::time::Duration = std::time::Duration::from_secs(10);
 /// The up dwell goes back to the minimum after this long without a step down.
 const DWELL_RESET: std::time::Duration = std::time::Duration::from_secs(30);
+/// A quiet screen gives no samples, so the level cannot follow the link. A
+/// congestion measured that long ago is stale: step up one level for each
+/// `QUIET_STEP_UP` of quiet (a failed probe at the next motion steps down
+/// within `DOWN_SPAN`).
+const QUIET_STEP_UP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bitrate level that follows congestion: the queueing delay of stream frames
 /// (send-to-acknowledge time above the smallest one of the channel, see
@@ -220,6 +225,10 @@ struct BitrateLevel {
     last_down: Option<Instant>,
     last_up: Option<Instant>,
     up_dwell: std::time::Duration,
+    /// Since when there are too few samples to measure (quiet screen)
+    quiet_since: Option<Instant>,
+    /// Last update with enough samples
+    last_sample: Option<Instant>,
 }
 
 impl Default for BitrateLevel {
@@ -230,6 +239,8 @@ impl Default for BitrateLevel {
             last_down: None,
             last_up: None,
             up_dwell: UP_DWELL_MIN,
+            quiet_since: None,
+            last_sample: None,
         }
     }
 }
@@ -237,7 +248,8 @@ impl Default for BitrateLevel {
 impl BitrateLevel {
     /// Feed the median queueing delay (ms) and sample count of the last
     /// `DOWN_SPAN` (`short`) and of the last second (`long`); returns the
-    /// bitrate share (0..=1) to use. Too few samples (a quiet screen): no change.
+    /// bitrate share (0..=1) to use. Too few samples (a quiet screen): no
+    /// change, except one step up for each `QUIET_STEP_UP` of quiet.
     fn update(
         &mut self,
         short: Option<(f32, usize)>,
@@ -249,6 +261,27 @@ impl BitrateLevel {
             .is_some_and(|t| now.duration_since(t) >= DWELL_RESET)
         {
             self.up_dwell = UP_DWELL_MIN;
+        }
+        let measured = long.filter(|&(_, n)| n >= MIN_UP_SAMPLES);
+        let short_quiet = short.is_none_or(|(_, n)| n < MIN_DOWN_SAMPLES);
+        if measured.is_none() && short_quiet {
+            // No frames are sent on a quiet screen, so this is called again
+            // only when the screen changes: count the time since the last samples.
+            let since = *self
+                .quiet_since
+                .get_or_insert(self.last_sample.unwrap_or(now));
+            let steps =
+                (now.duration_since(since).as_secs_f64() / QUIET_STEP_UP.as_secs_f64()) as u32;
+            if steps > 0 {
+                self.quiet_since = Some(since + QUIET_STEP_UP * steps);
+                if self.level > 0 {
+                    self.level = self.level.saturating_sub(steps as usize);
+                    self.last_up = Some(now);
+                }
+            }
+        } else {
+            self.quiet_since = None;
+            self.last_sample = Some(now);
         }
         let congested =
             short.is_some_and(|(d, n)| n >= MIN_DOWN_SAMPLES && d > QUEUE_DELAY_HIGH_MS);
@@ -270,7 +303,7 @@ impl BitrateLevel {
             }
             return LEVEL_QUALITY[self.level];
         }
-        match long.filter(|&(_, n)| n >= MIN_UP_SAMPLES) {
+        match measured {
             Some((d, _)) if d < QUEUE_DELAY_LOW_MS && self.level > 0 => {
                 let since = *self.below_since.get_or_insert(now);
                 if now.duration_since(since) >= self.up_dwell {
@@ -2293,7 +2326,7 @@ mod tests {
         let mut l = BitrateLevel::default();
         assert_eq!(run(&mut l, t0, 0, None), 1.0);
         assert_eq!(run(&mut l, t0, 10, Some(500.0)), 0.8);
-        // Quiet screen: no samples, no change.
+        // Quiet screen: no samples, no change for a while.
         assert_eq!(run(&mut l, t0, 5_000, None), 0.8);
         // Too few samples count as none.
         let few = Some((500.0, 3));
@@ -2301,6 +2334,38 @@ mod tests {
             l.update(few, few, t0 + std::time::Duration::from_secs(9)),
             0.8
         );
+    }
+
+    #[test]
+    fn bitrate_level_steps_up_after_a_long_quiet() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        for i in 0..3 {
+            run(&mut l, t0, i * 600, Some(500.0));
+        }
+        assert_eq!(run(&mut l, t0, 1_300, Some(500.0)), 0.3);
+        // Quiet after the samples at 1.3 s: one level up for each 10 s.
+        assert_eq!(run(&mut l, t0, 2_000, None), 0.3);
+        assert_eq!(run(&mut l, t0, 11_200, None), 0.3);
+        assert_eq!(run(&mut l, t0, 11_300, None), 0.5);
+        assert_eq!(run(&mut l, t0, 21_000, None), 0.5);
+        assert_eq!(run(&mut l, t0, 21_300, None), 0.8);
+        // Motion again with a full link: down at once (probe failed).
+        assert_eq!(run(&mut l, t0, 21_400, Some(500.0)), 0.5);
+    }
+
+    #[test]
+    fn bitrate_level_counts_quiet_time_without_calls() {
+        // On a quiet screen no frame is sent and nothing calls `update`.
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        for i in 0..3 {
+            run(&mut l, t0, i * 600, Some(500.0));
+        }
+        assert_eq!(run(&mut l, t0, 1_300, Some(500.0)), 0.3);
+        assert_eq!(run(&mut l, t0, 21_400, None), 0.8);
+        assert_eq!(run(&mut l, t0, 22_000, None), 0.8);
+        assert_eq!(run(&mut l, t0, 31_300, None), 1.0);
     }
 
     #[test]
