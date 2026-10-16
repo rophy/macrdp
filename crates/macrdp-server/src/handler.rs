@@ -141,12 +141,11 @@ impl RdpServerInputHandler for MacInputHandler {
                         return;
                     }
                 };
-                // The event carries its position: move there first, then press or release.
+                // The event carries its position; the button event is posted there.
                 let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
-                m.move_to(mx, my)
-                    .and_then(|()| m.button_event(button, pressed, mx, my))
+                m.button_event(button, pressed, mx, my)
             }
             MouseEvent::VerticalScroll { value } => m.scroll(value),
             _ => {
