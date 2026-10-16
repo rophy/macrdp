@@ -471,6 +471,14 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        tracing::info!(
+            monitors = ?layout
+                .monitors()
+                .iter()
+                .map(|m| (m.dimensions(), m.is_primary()))
+                .collect::<Vec<_>>(),
+            "DisplayControl layout received"
+        );
         if self.fixed_resolution {
             tracing::debug!("Ignoring DisplayControl layout — resolution is fixed by config");
             return;
