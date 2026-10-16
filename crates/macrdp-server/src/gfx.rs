@@ -555,7 +555,7 @@ pub fn can_submit(
 /// a ceiling on the EGFX window after each capability exchange. That value is
 /// for surface-command frames (MS-RDPRFX 2.2.1.3), not EGFX, so it is removed here.
 fn apply_window(shared: &GfxShared, server: &mut GraphicsPipelineServer, frame_interval: Duration) {
-    let want = lock(&shared.window).target(frame_interval);
+    let want = lock(&shared.window).target(frame_interval, Instant::now());
     let had = server.max_frames_in_flight();
     if had != want {
         server.set_client_frame_ack_limit(None);

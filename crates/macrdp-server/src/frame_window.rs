@@ -8,14 +8,22 @@
 //! round trip (about 20 fps on a LAN).
 //!
 //! The window here is the number of frames that fill one base round trip at
-//! the capture rate, plus one. The base round trip is the smallest
-//! send-to-acknowledge time of the channel: the path and decode time without
-//! queueing. It is not a recent minimum: when the client decodes slower than
-//! the capture rate (mstsc in a VM shows ~33 fps), every frame waits in the
-//! client and a recent minimum grows with the window (measured: 20 -> 120 ms
-//! base, window 3 -> 8, ack RTT 170 ms). A larger window then only adds delay.
-//! Limit: if the path gets slower during a session, the window stays at the
-//! size of the faster path (never below `MIN_WINDOW`) until the next connection.
+//! the capture rate, plus one. The base round trip is the send-to-acknowledge
+//! time of the path and decode without queueing. It is not a recent minimum:
+//! when the client decodes slower than the capture rate (mstsc in a VM shows
+//! ~33 fps), every frame waits in the client and a recent minimum grows with
+//! the window (measured: 20 -> 120 ms base, window 3 -> 8, ack RTT 170 ms). A
+//! larger window then only adds delay.
+//!
+//! A lower RTT lowers the base at once. A higher one can be a slower path or
+//! queueing in the client; only a probe tells them apart. When all stream
+//! frames of the last second came back `PROBE_MARGIN` above the base, the
+//! window drops to 1 for `PROBE_SAMPLES` frames: each is sent when no other
+//! frame is in flight, so nothing waits before it in the client, and the
+//! smallest of their RTTs is the base RTT of the path now (lower or higher).
+//! One sample is not enough: mstsc acknowledges a frame sent alone after 15
+//! to 79 ms (measured). A probe that finds no slower path doubles the time
+//! to the next one (a slow client keeps all RTTs high and would probe often).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -34,6 +42,33 @@ const SUSPEND_QUEUE_DEPTH: u32 = 0xFFFF_FFFF;
 const STREAM_GAP: Duration = Duration::from_millis(100);
 /// Queueing-delay samples are kept for this long.
 pub const DELAY_SPAN: Duration = Duration::from_secs(1);
+/// A probe starts when all stream RTTs of the last `DELAY_SPAN` are this much above the base.
+const PROBE_MARGIN: Duration = Duration::from_millis(15);
+/// ... and there are at least this many of them.
+const PROBE_MIN_SAMPLES: usize = 10;
+/// Frames sent alone per probe.
+const PROBE_SAMPLES: u8 = 3;
+/// Shortest time from one probe to the next ...
+const PROBE_INTERVAL_MIN: Duration = Duration::from_secs(4);
+/// ... and longest, after probes that found no slower path.
+const PROBE_INTERVAL_MAX: Duration = Duration::from_secs(32);
+/// A probe that takes longer than this (no frames, lost acknowledgements) ends.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Base RTT probe state.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    #[default]
+    Idle,
+    /// Window 1. `pending` is the frame sent alone and not acknowledged yet;
+    /// `best` the smallest RTT of the `got` frames measured.
+    Running {
+        since: Instant,
+        pending: Option<u32>,
+        got: u8,
+        best: Option<Duration>,
+    },
+}
 
 /// What a sent EGFX frame carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +88,14 @@ pub struct FrameWindow {
     last_video: Option<Instant>,
     /// Queueing delays (RTT above the base RTT) of recent stream frames.
     delays: VecDeque<(Instant, Duration)>,
-    /// Smallest RTT of the channel.
+    /// RTTs of recent stream frames (for the probe trigger).
+    rtts: VecDeque<(Instant, Duration)>,
+    /// RTT of the path without queueing: the last probe or any lower RTT since.
     base_rtt: Option<Duration>,
+    probe: Probe,
+    last_probe: Option<Instant>,
+    /// Time from the last probe to the next one (0 = `PROBE_INTERVAL_MIN`).
+    probe_interval: Duration,
     /// Last queueDepth from the client (bytes not yet decoded).
     pub last_queue_depth: u32,
 }
@@ -80,6 +121,11 @@ impl FrameWindow {
                 .is_some_and(|t| now.duration_since(t) <= STREAM_GAP);
         if kind == FrameKind::Video {
             self.last_video = Some(now);
+            if let Probe::Running { pending, .. } = &mut self.probe {
+                if pending.is_none() && self.sent.is_empty() {
+                    *pending = Some(frame_id);
+                }
+            }
         }
         self.sent.push_back((frame_id, now, sample));
     }
@@ -99,10 +145,115 @@ impl FrameWindow {
         let rtt = now.duration_since(sent_at);
         let base = self.base_rtt.map_or(rtt, |b| b.min(rtt));
         self.base_rtt = Some(base);
+        self.probe_ack(frame_id, rtt, now);
+        let base = self.base_rtt.unwrap_or(rtt);
         if sample {
-            self.delays.push_back((now, rtt - base));
+            self.delays.push_back((now, rtt.saturating_sub(base)));
+            self.rtts.push_back((now, rtt));
         }
+        self.maybe_start_probe(now);
         Some(rtt)
+    }
+
+    /// A frame was acknowledged during a probe.
+    fn probe_ack(&mut self, frame_id: u32, rtt: Duration, now: Instant) {
+        let Probe::Running {
+            since,
+            pending: Some(id),
+            got,
+            best,
+        } = self.probe
+        else {
+            return;
+        };
+        if id == frame_id {
+            let best = best.map_or(rtt, |b| b.min(rtt));
+            if got + 1 >= PROBE_SAMPLES {
+                self.finish_probe(best, now);
+            } else {
+                self.probe = Probe::Running {
+                    since,
+                    pending: None,
+                    got: got + 1,
+                    best: Some(best),
+                };
+            }
+        } else if !self.sent.iter().any(|&(i, _, _)| i == id) {
+            // The probe frame was skipped: send another one alone.
+            self.probe = Probe::Running {
+                since,
+                pending: None,
+                got,
+                best,
+            };
+        }
+    }
+
+    /// End a probe: its smallest RTT is the base now.
+    fn finish_probe(&mut self, best: Duration, now: Instant) {
+        let old = self.base_rtt;
+        let slower = old.is_none_or(|b| best > b + PROBE_MARGIN);
+        self.probe_interval = if slower {
+            PROBE_INTERVAL_MIN
+        } else {
+            (self.probe_interval.max(PROBE_INTERVAL_MIN) * 2).min(PROBE_INTERVAL_MAX)
+        };
+        tracing::debug!(
+            rtt_ms = best.as_millis(),
+            old_ms = ?old.map(|b| b.as_millis()),
+            next_s = self.probe_interval.as_secs(),
+            "EGFX base RTT probed"
+        );
+        self.base_rtt = Some(best);
+        self.probe = Probe::Idle;
+        self.last_probe = Some(now);
+    }
+
+    /// Start a probe when every recent stream frame came back well above the base.
+    fn maybe_start_probe(&mut self, now: Instant) {
+        while self
+            .rtts
+            .front()
+            .is_some_and(|&(t, _)| now.duration_since(t) > DELAY_SPAN)
+        {
+            self.rtts.pop_front();
+        }
+        if self.probe != Probe::Idle
+            || self.last_probe.is_some_and(|t| {
+                now.duration_since(t) < self.probe_interval.max(PROBE_INTERVAL_MIN)
+            })
+            || self.rtts.len() < PROBE_MIN_SAMPLES
+        {
+            return;
+        }
+        let (Some(base), Some(lowest)) = (self.base_rtt, self.rtts.iter().map(|&(_, r)| r).min())
+        else {
+            return;
+        };
+        if lowest > base + PROBE_MARGIN {
+            self.probe = Probe::Running {
+                since: now,
+                pending: None,
+                got: 0,
+                best: None,
+            };
+            self.rtts.clear();
+        }
+    }
+
+    /// End a probe that takes too long (quiet screen, lost acknowledgements).
+    fn check_probe_timeout(&mut self, now: Instant) {
+        if let Probe::Running { since, best, .. } = self.probe {
+            if now.duration_since(since) > PROBE_TIMEOUT {
+                match best {
+                    Some(best) => self.finish_probe(best, now),
+                    None => {
+                        self.probe = Probe::Idle;
+                        self.last_probe = Some(now);
+                    }
+                }
+            }
+        }
     }
 
     /// Median queueing delay (RTT above the base RTT) of the stream frames
@@ -135,7 +286,11 @@ impl FrameWindow {
     }
 
     /// Frames that may be in flight at `frame_interval` per frame.
-    pub fn target(&self, frame_interval: Duration) -> u32 {
+    pub fn target(&mut self, frame_interval: Duration, now: Instant) -> u32 {
+        self.check_probe_timeout(now);
+        if matches!(self.probe, Probe::Running { .. }) {
+            return 1;
+        }
         let Some(base) = self.base_rtt else {
             return MIN_WINDOW;
         };
@@ -166,8 +321,8 @@ mod tests {
 
     #[test]
     fn min_window_before_any_ack() {
-        let w = FrameWindow::default();
-        assert_eq!(w.target(FRAME_60), MIN_WINDOW);
+        let mut w = FrameWindow::default();
+        assert_eq!(w.target(FRAME_60, Instant::now()), MIN_WINDOW);
     }
 
     #[test]
@@ -175,7 +330,7 @@ mod tests {
         let mut w = FrameWindow::default();
         let t0 = Instant::now();
         round_trip(&mut w, 0, t0, ms(10));
-        assert_eq!(w.target(FRAME_60), MIN_WINDOW);
+        assert_eq!(w.target(FRAME_60, Instant::now()), MIN_WINDOW);
     }
 
     #[test]
@@ -184,13 +339,13 @@ mod tests {
         let t0 = Instant::now();
         // 60 ms = 3.6 frames at 60 fps -> 4 + 1.
         round_trip(&mut w, 0, t0, ms(60));
-        assert_eq!(w.target(FRAME_60), 5);
+        assert_eq!(w.target(FRAME_60, Instant::now()), 5);
         // 30 fps: 2 frames + 1.
-        assert_eq!(w.target(ms(33)), 3);
+        assert_eq!(w.target(ms(33), Instant::now()), 3);
         // 110 ms: 7 + 1.
         let mut w2 = FrameWindow::default();
         round_trip(&mut w2, 0, t0, ms(110));
-        assert_eq!(w2.target(FRAME_60), 8);
+        assert_eq!(w2.target(FRAME_60, Instant::now()), 8);
     }
 
     #[test]
@@ -198,33 +353,145 @@ mod tests {
         let mut w = FrameWindow::default();
         let t0 = Instant::now();
         round_trip(&mut w, 0, t0, ms(500));
-        assert_eq!(w.target(FRAME_60), MAX_WINDOW);
-        assert_eq!(w.target(Duration::ZERO), MAX_WINDOW);
+        assert_eq!(w.target(FRAME_60, Instant::now()), MAX_WINDOW);
+        assert_eq!(w.target(Duration::ZERO, Instant::now()), MAX_WINDOW);
+    }
+
+    /// Server at 60 fps limited by the window; one-way delay `path(t)` each
+    /// way; the client decodes one frame at a time in `decode`. Runs from
+    /// `from` to `to` (ms since `t0`) and returns the windows used.
+    struct Sim {
+        w: FrameWindow,
+        t0: Instant,
+        next_id: u32,
+        /// (frame id, ack arrival time) in order
+        acks: VecDeque<(u32, Instant)>,
+        client_free: Instant,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            let t0 = Instant::now();
+            Self {
+                w: FrameWindow::default(),
+                t0,
+                next_id: 0,
+                acks: VecDeque::new(),
+                client_free: t0,
+            }
+        }
+
+        fn run(&mut self, from_ms: u64, to_ms: u64, path: Duration, decode: Duration) -> Vec<u32> {
+            let mut windows = Vec::new();
+            let mut tick = Duration::from_millis(from_ms);
+            while tick < Duration::from_millis(to_ms) {
+                let now = self.t0 + tick;
+                while self.acks.front().is_some_and(|&(_, at)| at <= now) {
+                    let (id, at) = self.acks.pop_front().unwrap();
+                    self.w.on_ack(id, 0, at);
+                }
+                let window = self.w.target(FRAME_60, now);
+                windows.push(window);
+                let in_flight =
+                    self.next_id - self.acks.front().map_or(self.next_id, |&(id, _)| id);
+                if in_flight < window {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    self.w.on_sent(id, FrameKind::Video, now);
+                    let start = (now + path).max(self.client_free);
+                    self.client_free = start + decode;
+                    // TCP keeps the order of the acknowledgements.
+                    let ack =
+                        (self.client_free + path).max(self.acks.back().map_or(now, |&(_, a)| a));
+                    self.acks.push_back((id, ack));
+                }
+                tick += FRAME_60;
+            }
+            windows
+        }
+    }
+
+    fn last_second(windows: &[u32]) -> &[u32] {
+        &windows[windows.len() - 60..]
     }
 
     #[test]
     fn queueing_does_not_grow_the_window() {
-        let mut w = FrameWindow::default();
-        let t0 = Instant::now();
-        round_trip(&mut w, 0, t0, ms(20));
-        // Later frames wait in the client: larger RTT, same base.
-        for id in 1..20 {
-            round_trip(&mut w, id, t0 + ms(u64::from(id) * 17), ms(90));
-        }
-        assert_eq!(w.base_rtt(), Some(ms(20)));
-        assert_eq!(w.target(FRAME_60), MIN_WINDOW);
+        // 2 ms each way, the client decodes 25 ms per frame (40 fps): frames queue in the client.
+        let mut sim = Sim::new();
+        let windows = sim.run(0, 30_000, ms(2), ms(25));
+        assert!(
+            windows[600..].iter().all(|&w| w <= MIN_WINDOW),
+            "{windows:?}"
+        );
+        assert_eq!(sim.w.base_rtt(), Some(ms(29)));
     }
 
     #[test]
-    fn slow_client_does_not_grow_the_window() {
+    fn slower_path_grows_the_window_and_faster_path_shrinks_it() {
+        let mut sim = Sim::new();
+        let fast = sim.run(0, 5_000, ms(5), ms(2));
+        assert!(last_second(&fast).iter().all(|&w| w == MIN_WINDOW));
+        // 50 ms more each way (+100 ms RTT) in the middle of the session.
+        let slow = sim.run(5_000, 15_000, ms(55), ms(2));
+        assert_eq!(*slow.last().unwrap(), MAX_WINDOW, "{slow:?}");
+        assert!(last_second(&slow).iter().all(|&w| w == MAX_WINDOW));
+        // Back to the fast path: the window goes down within a round trip.
+        let back = sim.run(15_000, 17_000, ms(5), ms(2));
+        assert!(
+            last_second(&back).iter().all(|&w| w == MIN_WINDOW),
+            "{back:?}"
+        );
+    }
+
+    #[test]
+    fn probes_back_off_when_the_path_is_the_same() {
+        // A slow client keeps the RTT high: probes at 4, 8, 16, 32, 32 s intervals.
+        let mut sim = Sim::new();
+        let windows = sim.run(0, 120_000, ms(2), ms(25));
+        let probes = windows
+            .windows(2)
+            .filter(|p| p[0] != 1 && p[1] == 1)
+            .count();
+        assert!((4..=6).contains(&probes), "{probes} probes");
+        assert_eq!(sim.w.probe_interval, PROBE_INTERVAL_MAX);
+    }
+
+    #[test]
+    fn probe_takes_the_smallest_of_its_samples() {
         let mut w = FrameWindow::default();
         let t0 = Instant::now();
-        round_trip(&mut w, 0, t0, ms(20));
-        // The client stays behind for a long time: all later RTTs are high.
-        for id in 1..2000 {
-            round_trip(&mut w, id, t0 + ms(u64::from(id) * 30), ms(120));
+        w.base_rtt = Some(ms(10));
+        w.probe = Probe::Running {
+            since: t0,
+            pending: None,
+            got: 0,
+            best: None,
+        };
+        let mut t = t0;
+        for (id, rtt) in [(1, 70), (2, 40), (3, 55)] {
+            assert_eq!(w.target(FRAME_60, t), 1);
+            round_trip(&mut w, id, t, ms(rtt));
+            t += ms(rtt + 1);
         }
-        assert_eq!(w.target(FRAME_60), MIN_WINDOW);
+        assert_eq!(w.base_rtt(), Some(ms(40)));
+        assert_eq!(w.probe, Probe::Idle);
+        assert_eq!(w.probe_interval, PROBE_INTERVAL_MIN);
+    }
+
+    #[test]
+    fn probe_without_acks_is_given_up() {
+        let mut w = FrameWindow::default();
+        let t0 = Instant::now();
+        w.base_rtt = Some(ms(10));
+        w.probe = Probe::Running {
+            since: t0,
+            pending: None,
+            got: 0,
+            best: None,
+        };
+        assert_eq!(w.target(FRAME_60, t0 + ms(10)), 1);
+        assert_eq!(w.target(FRAME_60, t0 + PROBE_TIMEOUT + ms(1)), MIN_WINDOW);
     }
 
     #[test]
@@ -234,7 +501,7 @@ mod tests {
         round_trip(&mut w, 0, t0, ms(10));
         w.reset();
         round_trip(&mut w, 1, t0, ms(80));
-        assert_eq!(w.target(FRAME_60), 6);
+        assert_eq!(w.target(FRAME_60, Instant::now()), 6);
     }
 
     #[test]
