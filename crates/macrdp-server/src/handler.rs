@@ -17,11 +17,13 @@ const CLIENT_MOVE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
 ///
-/// Completely independent of capture/encode resolution — only cares about
-/// the RDP desktop size (what the client thinks) and the macOS logical
-/// display size (what CGEvent expects).
+/// Only cares about the RDP desktop size (what the client thinks) and the
+/// macOS logical display size (what CGEvent expects). The capture scales the
+/// display into the desktop with its aspect ratio kept and centred
+/// (ScreenCaptureKit `scalesToFit`), so a desktop of another aspect ratio has
+/// black bands; the mapping uses the same picture rectangle.
 ///
-/// Formula: `mac = rdp × logical ÷ rdp_desktop`
+/// Formula: `mac = (rdp − band) ÷ scale`, `scale = min(rdp_w ÷ logical_w, rdp_h ÷ logical_h)`
 #[derive(Debug, Clone)]
 pub struct MouseCoordMapper(Arc<Mutex<CoordState>>);
 
@@ -33,6 +35,17 @@ struct CoordState {
     rdp_h: f64,
     /// Mac positions the client's own input moved the cursor to (newest last)
     recent_client_moves: VecDeque<((u16, u16), Instant)>,
+}
+
+impl CoordState {
+    /// Scale and offsets of the display picture in the RDP desktop:
+    /// `rdp = mac × scale + offset`.
+    fn picture(&self) -> (f64, f64, f64) {
+        let scale = (self.rdp_w / self.logical_w).min(self.rdp_h / self.logical_h);
+        let off_x = (self.rdp_w - self.logical_w * scale) / 2.0;
+        let off_y = (self.rdp_h - self.logical_h * scale) / 2.0;
+        (scale, off_x, off_y)
+    }
 }
 
 impl MouseCoordMapper {
@@ -55,17 +68,20 @@ impl MouseCoordMapper {
 
     pub fn map(&self, rdp_x: u16, rdp_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        let mac_x = (rdp_x as f64 * s.logical_w / s.rdp_w) as u16;
-        let mac_y = (rdp_y as f64 * s.logical_h / s.rdp_h) as u16;
-        (mac_x, mac_y)
+        let (scale, off_x, off_y) = s.picture();
+        // A point in a black band goes to the nearest display edge.
+        let mac_x = ((rdp_x as f64 - off_x) / scale).clamp(0.0, s.logical_w - 1.0);
+        let mac_y = ((rdp_y as f64 - off_y) / scale).clamp(0.0, s.logical_h - 1.0);
+        (mac_x as u16, mac_y as u16)
     }
 
     /// Maps a macOS logical position to RDP desktop coordinates (the inverse of
     /// [`Self::map`]), for PointerPosition updates sent to the client.
     pub fn to_rdp(&self, mac_x: u16, mac_y: u16) -> (u16, u16) {
         let s = self.0.lock().unwrap();
-        let x = (mac_x as f64 * s.rdp_w / s.logical_w).round();
-        let y = (mac_y as f64 * s.rdp_h / s.logical_h).round();
+        let (scale, off_x, off_y) = s.picture();
+        let x = (mac_x as f64 * scale + off_x).round();
+        let y = (mac_y as f64 * scale + off_y).round();
         (
             x.min(s.rdp_w - 1.0).max(0.0) as u16,
             y.min(s.rdp_h - 1.0).max(0.0) as u16,
@@ -264,10 +280,40 @@ mod tests {
     fn to_rdp_maps_mac_position_into_the_rdp_desktop() {
         // 900x560 session on a 1280x720 Mac: a Mac position must not be sent unscaled.
         let m = MouseCoordMapper::new(1280, 720, 900, 560);
-        assert_eq!(m.to_rdp(0, 0), (0, 0));
         assert_eq!(m.to_rdp(640, 360), (450, 280));
-        // The far edge stays inside the desktop.
-        assert_eq!(m.to_rdp(1280, 720), (899, 559));
+        // Picture rows 26.875..533.125 (black bands above and below).
+        assert_eq!(m.to_rdp(0, 0), (0, 27));
+        assert_eq!(m.to_rdp(1279, 719), (899, 532));
+    }
+
+    #[test]
+    fn map_follows_the_letterboxed_picture() {
+        // 16:9 Mac in a 16:10 session: mstsc showed black rows 0..25 and
+        // 534..559, picture scale 900/1280 in both axes.
+        let m = MouseCoordMapper::new(1280, 720, 900, 560);
+        assert_eq!(m.map(450, 280), (640, 360));
+        assert_eq!(m.map(450, 27), (640, 0));
+        assert_eq!(m.map(450, 532), (640, 718));
+        assert_eq!(m.map(72, 349), (102, 458));
+        // In a band: clamped to the display edge.
+        assert_eq!(m.map(0, 0), (0, 0));
+        assert_eq!(m.map(899, 559), (1278, 719));
+    }
+
+    #[test]
+    fn map_pillarboxes_a_wider_session() {
+        // 16:9 Mac in a 2:1 session: bands left and right.
+        let m = MouseCoordMapper::new(1280, 720, 1440, 720);
+        assert_eq!(m.map(80, 0), (0, 0));
+        assert_eq!(m.map(720, 360), (640, 360));
+        assert_eq!(m.to_rdp(0, 0), (80, 0));
+    }
+
+    #[test]
+    fn map_scales_a_session_of_the_same_aspect_ratio() {
+        let m = MouseCoordMapper::new(1280, 720, 2560, 1440);
+        assert_eq!(m.map(1001, 575), (500, 287));
+        assert_eq!(m.to_rdp(500, 287), (1000, 574));
     }
 
     #[test]

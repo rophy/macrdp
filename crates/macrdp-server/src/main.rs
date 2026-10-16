@@ -159,8 +159,8 @@ async fn main() -> Result<()> {
     };
 
     // Mouse coordinate mapping: RDP desktop coords → macOS logical coords
-    // MouseCoordMapper maps proportionally: mac = rdp × logical ÷ rdp_desktop
-    // Completely independent of capture/encode resolution.
+    // MouseCoordMapper maps into the picture rectangle of the capture (aspect ratio kept).
+    // Only the aspect ratio of the capture matters, not its pixel size.
     // Updated by MacDisplay::request_resize() when the client negotiates a
     // different resolution.
     let coord_mapper = handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
