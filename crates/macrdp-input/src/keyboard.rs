@@ -7,6 +7,59 @@ use crate::keymap::scancode_to_keycode;
 
 pub struct KeyboardInjector {
     state: ModifierState,
+    unicode: UnicodeJoiner,
+}
+
+/// What to post for an RDP Unicode keyboard event.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnicodeAction {
+    /// Key down carrying these UTF-16 units (one character).
+    Down(Vec<u16>),
+    /// Key up.
+    Up,
+    /// Nothing to post.
+    None,
+}
+
+/// RDP sends one UTF-16 unit per Unicode event, so a character outside the
+/// BMP (emoji) comes as a high and a low surrogate. A lone surrogate is not
+/// valid text; join the pair into one key down.
+#[derive(Debug, Default)]
+pub struct UnicodeJoiner {
+    high: Option<u16>,
+}
+
+impl UnicodeJoiner {
+    pub fn feed(&mut self, unit: u16, pressed: bool) -> UnicodeAction {
+        match unit {
+            0xD800..=0xDBFF => {
+                // High surrogate: wait for the low one; its release posts nothing.
+                if pressed {
+                    self.high = Some(unit);
+                }
+                UnicodeAction::None
+            }
+            0xDC00..=0xDFFF => match (pressed, self.high) {
+                (true, Some(high)) => {
+                    self.high = None;
+                    UnicodeAction::Down(vec![high, unit])
+                }
+                (true, None) => {
+                    tracing::debug!(unit, "Low surrogate without a high surrogate, dropped");
+                    UnicodeAction::None
+                }
+                (false, _) => UnicodeAction::Up,
+            },
+            _ => {
+                if pressed {
+                    self.high = None;
+                    UnicodeAction::Down(vec![unit])
+                } else {
+                    UnicodeAction::Up
+                }
+            }
+        }
+    }
 }
 
 /// Set the flags of `event` to `ours`, keeping the bits that the injector does not manage.
@@ -23,6 +76,7 @@ impl KeyboardInjector {
         })?;
         Ok(Self {
             state: ModifierState::new(),
+            unicode: UnicodeJoiner::default(),
         })
     }
 
@@ -64,18 +118,71 @@ impl KeyboardInjector {
         Ok(())
     }
 
-    /// Inject a unicode character press/release
-    pub fn inject_unicode(&mut self, ch: u16, pressed: bool) -> Result<()> {
+    /// Inject a Unicode keyboard event (one UTF-16 unit) press/release
+    pub fn inject_unicode(&mut self, unit: u16, pressed: bool) -> Result<()> {
+        let (down, text) = match self.unicode.feed(unit, pressed) {
+            UnicodeAction::Down(text) => (true, text),
+            UnicodeAction::Up => (false, Vec::new()),
+            UnicodeAction::None => return Ok(()),
+        };
         let source = Self::source()?;
-        let event = CGEvent::new_keyboard_event(source, 0, pressed)
+        let event = CGEvent::new_keyboard_event(source, 0, down)
             .map_err(|_| anyhow::anyhow!("Failed to create unicode event"))?;
         set_event_flags(&event, self.state.flags());
 
-        if pressed {
-            event.set_string_from_utf16_unchecked(&[ch]);
+        if down {
+            event.set_string_from_utf16_unchecked(&text);
         }
 
         event.post(CGEventTapLocation::HID);
+        tracing::trace!(?text, down, "Unicode event injected");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bmp_character_is_posted_as_is() {
+        let mut j = UnicodeJoiner::default();
+        assert_eq!(j.feed(0x00E9, true), UnicodeAction::Down(vec![0x00E9]));
+        assert_eq!(j.feed(0x00E9, false), UnicodeAction::Up);
+    }
+
+    #[test]
+    fn surrogate_pair_becomes_one_character() {
+        // U+1F600 = D83D DE00; order: high down, high up, low down, low up
+        let mut j = UnicodeJoiner::default();
+        assert_eq!(j.feed(0xD83D, true), UnicodeAction::None);
+        assert_eq!(j.feed(0xD83D, false), UnicodeAction::None);
+        assert_eq!(
+            j.feed(0xDE00, true),
+            UnicodeAction::Down(vec![0xD83D, 0xDE00])
+        );
+        assert_eq!(j.feed(0xDE00, false), UnicodeAction::Up);
+    }
+
+    #[test]
+    fn surrogate_pair_with_nested_releases() {
+        let mut j = UnicodeJoiner::default();
+        assert_eq!(j.feed(0xD83D, true), UnicodeAction::None);
+        assert_eq!(
+            j.feed(0xDE00, true),
+            UnicodeAction::Down(vec![0xD83D, 0xDE00])
+        );
+        assert_eq!(j.feed(0xDE00, false), UnicodeAction::Up);
+        assert_eq!(j.feed(0xD83D, false), UnicodeAction::None);
+    }
+
+    #[test]
+    fn lone_low_surrogate_is_dropped() {
+        let mut j = UnicodeJoiner::default();
+        assert_eq!(j.feed(0xDE00, true), UnicodeAction::None);
+        // a high surrogate followed by a BMP character is dropped too
+        assert_eq!(j.feed(0xD83D, true), UnicodeAction::None);
+        assert_eq!(j.feed(0x0041, true), UnicodeAction::Down(vec![0x0041]));
+        assert_eq!(j.feed(0xDE00, true), UnicodeAction::None);
     }
 }
