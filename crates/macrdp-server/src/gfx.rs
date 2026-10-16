@@ -5,9 +5,6 @@
 //! shared handle to it; the display loop uses the free functions below to send
 //! surfaces and H.264 frames through that handle.
 
-// used by the display loop in Task 9
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -214,6 +211,15 @@ pub fn can_submit(
     } else {
         server.avc420_submission_state(surface)
     }
+}
+
+/// Whether the current connection's EGFX channel allows AVC420 (H.264).
+/// None while that channel is not open. A client can negotiate EGFX with
+/// `AVC_DISABLED`; then video must use bitmap updates.
+pub fn avc420_allowed(shared: &GfxShared) -> Option<bool> {
+    let handle = current_handle(shared)?;
+    let server = lock(&handle);
+    server.is_ready().then(|| server.supports_avc420())
 }
 
 /// Create a w×h surface and map it to the output at (0, 0); returns the surface id.

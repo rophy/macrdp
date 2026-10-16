@@ -235,6 +235,8 @@ async fn main() -> Result<()> {
     if cursor_channel {
         tracing::info!("Cursor channel enabled — cursor sent via RDP pointer PDUs");
     }
+    // EGFX graphics pipeline; one per connection, shared with the display loop.
+    let gfx_shared: gfx::SharedGfx = Default::default();
     let display = MacDisplay::new(
         width,
         height,
@@ -248,6 +250,7 @@ async fn main() -> Result<()> {
         coord_mapper,
         shared_audio_tx.clone(),
         perf_stats.clone(),
+        std::sync::Arc::clone(&gfx_shared),
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
@@ -263,8 +266,6 @@ async fn main() -> Result<()> {
                 as Box<dyn ironrdp_server::ConnectionHandler>
         });
 
-    // EGFX graphics pipeline; one per connection, shared with the display loop.
-    let gfx_shared: gfx::SharedGfx = Default::default();
     let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> = Some(Box::new(
         gfx::MacGfxFactory::new(std::sync::Arc::clone(&gfx_shared)),
     ));

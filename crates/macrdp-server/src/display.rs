@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+use ironrdp_egfx::server::FrameSubmissionError;
 use ironrdp_pdu::pointer::PointerPositionAttribute;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat as RdpPixelFormat, RdpServerDisplay,
@@ -10,10 +11,13 @@ use macrdp_capture::{
     get_cursor_position, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer,
     FrameData, ScreenCapturer,
 };
-use macrdp_encode::{self, Quality};
+use macrdp_encode::{self, Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use crate::gfx::{self, SharedGfx};
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
 
@@ -26,7 +30,6 @@ const LOW_ACTIVITY_MIN_FPS: u32 = 5;
 
 /// Progressive rendering: on scene changes (large dirty area), temporarily reduce
 /// encoder bitrate for fast initial delivery, then ramp quality back over several frames.
-#[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX uses this again
 #[derive(Debug)]
 struct ProgressiveRamp {
     trigger_fraction: f64,
@@ -35,7 +38,6 @@ struct ProgressiveRamp {
     remaining: u32,
 }
 
-#[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX uses this again
 impl ProgressiveRamp {
     fn new() -> Self {
         Self {
@@ -92,7 +94,6 @@ impl ProgressiveRamp {
     }
 }
 
-#[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX uses this again
 #[derive(Debug, PartialEq)]
 enum ProgressiveAction {
     None,
@@ -100,6 +101,70 @@ enum ProgressiveAction {
     Ramp { bitrate: u32 },
     RampComplete { bitrate: u32 },
 }
+
+/// Decide what to do with a captured frame before encoding.
+#[derive(Debug, PartialEq)]
+enum FramePlan {
+    /// The pipeline cannot take a frame now: drop it without encoding, so the
+    /// encoder state still matches what the client has.
+    Skip,
+    Encode {
+        force_keyframe: bool,
+    },
+}
+
+fn plan_frame(can_submit: Result<(), FrameSubmissionError>, last_send_failed: bool) -> FramePlan {
+    match can_submit {
+        Ok(()) => FramePlan::Encode {
+            // The client missed the previous frame: its references are stale.
+            force_keyframe: last_send_failed,
+        },
+        Err(_) => FramePlan::Skip,
+    }
+}
+
+/// What woke up the update loop.
+enum LoopEvent {
+    CursorTick,
+    /// Time to try the held frame again.
+    Retry,
+    Frame(Option<CapturedFrame>),
+}
+
+/// Result of handling one captured frame.
+enum FrameOutcome {
+    /// The server must send this update.
+    Update(DisplayUpdate),
+    /// Sent through EGFX, or dropped for good.
+    Done,
+    /// Not sent yet (EGFX not ready, backpressure, overload): keep it and try again,
+    /// so the last screen content reaches the client even when the screen stops changing.
+    Hold(CapturedFrame),
+}
+
+/// One encoded frame, ready to submit.
+enum Encoded {
+    Avc420(EncodedFrame),
+    Avc444(Avc444EncodedFrame),
+}
+
+impl Encoded {
+    fn len(&self) -> usize {
+        match self {
+            Encoded::Avc420(f) => f.data.len(),
+            Encoded::Avc444(f) => f.main_view.data.len() + f.aux_view.data.len(),
+        }
+    }
+
+    fn is_keyframe(&self) -> bool {
+        match self {
+            Encoded::Avc420(f) => f.is_keyframe,
+            Encoded::Avc444(f) => f.main_view.is_keyframe,
+        }
+    }
+}
+
+type EncoderSlot = Arc<Mutex<Option<Box<dyn VideoEncoder>>>>;
 
 /// Display adapter that bridges ScreenCapturer to ironrdp-server
 pub struct MacDisplay {
@@ -115,22 +180,23 @@ pub struct MacDisplay {
     fixed_resolution: bool,
     frame_rate: u32,
     quality: Quality,
-    /// H.264 settings: unused while video is bitmap only; H.264 on EGFX uses them again.
-    #[allow(dead_code)]
     encoder_pref: macrdp_encode::EncoderPreference,
     /// Whether AVC444 mode is requested by config
-    #[allow(dead_code)]
     mode_444: bool,
     show_cursor: bool,
-    #[allow(dead_code)]
     base_bitrate: u32,
     /// New desktop size from a Display Control layout, sent as a Resize update
     pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
     /// Shared audio sender slot — updated per connection by AudioFactory
     shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
-    #[allow(dead_code)]
     perf_stats: Option<SharedPerfStats>,
+    /// EGFX pipeline of the current connection
+    gfx: SharedGfx,
+    /// Shared encoder slot — returned here when a connection ends, reused on reconnect
+    encoder_cache: EncoderSlot,
+    /// Resolution the cached encoder was created for
+    cached_encoder_dims: (u16, u16),
 }
 
 impl MacDisplay {
@@ -148,6 +214,7 @@ impl MacDisplay {
         coord_mapper: MouseCoordMapper,
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
+        gfx: SharedGfx,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -182,6 +249,9 @@ impl MacDisplay {
             pending_resize: Arc::new(Mutex::new(None)),
             shared_audio_tx,
             perf_stats,
+            gfx,
+            encoder_cache: Arc::new(Mutex::new(None)),
+            cached_encoder_dims: (0, 0),
         }
     }
 
@@ -218,6 +288,35 @@ impl MacDisplay {
                 self.quality,
             );
             self.coord_mapper.update_rdp_size(w, h);
+        }
+    }
+
+    /// Reuse the encoder of the previous connection if the size is the same, else create one.
+    fn take_or_create_encoder(&mut self) -> Option<Box<dyn VideoEncoder>> {
+        if self.cached_encoder_dims == (self.width, self.height) {
+            if let Some(mut enc) = self.encoder_cache.lock().unwrap().take() {
+                tracing::info!("Reusing cached H.264 encoder from previous connection");
+                enc.force_keyframe();
+                return Some(enc);
+            }
+        }
+        // A cached encoder for another size is of no use.
+        self.encoder_cache.lock().unwrap().take();
+        self.cached_encoder_dims = (self.width, self.height);
+        match macrdp_encode::create_encoder(
+            self.width as u32,
+            self.height as u32,
+            self.frame_rate as f32,
+            self.quality,
+            self.encoder_pref,
+            self.mode_444,
+            self.base_bitrate,
+        ) {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                tracing::warn!("No H.264 encoder ({e:#}) — video uses bitmap updates");
+                None
+            }
         }
     }
 }
@@ -259,12 +358,24 @@ impl RdpServerDisplay for MacDisplay {
         // A resize left over from an earlier connection does not apply to this one:
         // capture starts at the current size.
         self.pending_resize.lock().unwrap().take();
+        let encoder = self.take_or_create_encoder();
+        if encoder.is_some() {
+            tracing::info!("H.264 encoder available — will use GFX path when client supports it");
+        }
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
-            // Bitmap updates need BGRA pixels.
-            pixel_format: CapturePixelFormat::Bgra,
+            // The hardware AVC420 encoder takes NV12 pixel buffers without a copy.
+            // Everything else (software encoder, AVC444, bitmap updates) needs BGRA.
+            pixel_format: if encoder.is_some()
+                && self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
+                && !self.mode_444
+            {
+                CapturePixelFormat::Nv12
+            } else {
+                CapturePixelFormat::Bgra
+            },
             show_cursor: self.show_cursor,
         };
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
@@ -287,12 +398,32 @@ impl RdpServerDisplay for MacDisplay {
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
+            shared_audio_tx: self.shared_audio_tx.clone(),
             pending_resize: Arc::clone(&self.pending_resize),
             low_activity_frames: 0,
             current_fps: self.frame_rate,
             cursor_interval,
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
+            encoder,
+            encoder_cache: Arc::clone(&self.encoder_cache),
+            gfx: Arc::clone(&self.gfx),
+            surface: None,
+            surface_frames: 0,
+            held_frame: None,
+            retry_at: tokio::time::Instant::now(),
+            last_send_failed: false,
+            avc_checked: None,
+            need_bgra_capture: false,
+            full_bitmap_next: true,
+            mode_444: self.mode_444,
+            last_applied_bitrate: self.base_bitrate,
+            progressive: ProgressiveRamp::new(),
+            display_frame_count: 0,
+            skip_next_frame: false,
+            overload_count: 0,
+            perf_stats: self.perf_stats.clone(),
+            start: Instant::now(),
         }))
     }
 }
@@ -300,6 +431,8 @@ impl RdpServerDisplay for MacDisplay {
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
+    /// Audio sender slot, to restart capture with audio
+    shared_audio_tx: Option<SharedAudioTx>,
     /// New desktop size from a Display Control layout, sent as a Resize update
     pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
     /// Consecutive frames with tiny dirty area (activity-based FPS reduction).
@@ -312,60 +445,125 @@ struct MacDisplayUpdates {
     last_cursor_pos: (u16, u16),
     /// Whether the initial DefaultPointer has been sent
     cursor_initialized: bool,
+    encoder: Option<Box<dyn VideoEncoder>>,
+    /// Shared slot to return the encoder on drop for reuse across connections
+    encoder_cache: EncoderSlot,
+    gfx: SharedGfx,
+    /// EGFX surface in use: (surface id, EGFX generation, width, height)
+    surface: Option<(u16, u64, u16, u16)>,
+    /// Newest frame not sent yet; tried again after one frame interval
+    held_frame: Option<CapturedFrame>,
+    /// When to try the held frame again
+    retry_at: tokio::time::Instant,
+    /// H.264 frames sent on the current surface
+    surface_frames: u64,
+    /// The last encoded frame did not reach the client: next frame must be a keyframe.
+    last_send_failed: bool,
+    /// (EGFX generation, AVC420 allowed) of the last capability check
+    avc_checked: Option<(u64, bool)>,
+    /// Bitmap updates need BGRA, but capture gives NV12: restart capture before the next frame.
+    need_bgra_capture: bool,
+    /// Send the whole frame as the next bitmap (screen was not painted by bitmaps before).
+    full_bitmap_next: bool,
+    mode_444: bool,
+    /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
+    last_applied_bitrate: u32,
+    progressive: ProgressiveRamp,
+    display_frame_count: u64,
+    /// Encode overload protection: drop the next frame
+    skip_next_frame: bool,
+    /// Counter for rate-limiting encode overload warnings
+    overload_count: u64,
+    /// Shared performance statistics collector (None = disabled)
+    perf_stats: Option<SharedPerfStats>,
+    /// Time base for EGFX frame timestamps
+    start: Instant,
+}
+
+impl Drop for MacDisplayUpdates {
+    fn drop(&mut self) {
+        if let Some(enc) = self.encoder.take() {
+            *self.encoder_cache.lock().unwrap() = Some(enc);
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
+    /// Returns pointer, resize and bitmap updates. H.264 frames go through the
+    /// EGFX pipeline inside this loop; a frame that is sent that way or dropped
+    /// does not end the call (returning `Ok(None)` disconnects the client).
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        if let Some((w, h)) = self.pending_resize.lock().unwrap().take() {
-            return Ok(Some(DisplayUpdate::Resize(DesktopSize {
-                width: w,
-                height: h,
-            })));
-        }
-
-        // Send initial DefaultPointer when cursor channel is active
-        if self.cursor_interval.is_some() && !self.cursor_initialized {
-            self.cursor_initialized = true;
-            let (x, y) = get_cursor_position();
-            self.last_cursor_pos = (x, y);
-            tracing::info!("Cursor channel active — sending initial pointer at ({x}, {y})");
-            return Ok(Some(DisplayUpdate::DefaultPointer));
-        }
-
-        if self.cursor_interval.is_none() {
-            let frame = match self.next_frame().await {
-                Some(f) => f,
-                None => return Ok(None),
-            };
-            return self.encode_and_send(frame);
-        }
-
         loop {
-            // Take interval out to avoid borrowing self through it during select!
-            let mut cursor_iv = self.cursor_interval.take().unwrap();
-            let result = tokio::select! {
+            if let Some((w, h)) = self.pending_resize.lock().unwrap().take() {
+                return Ok(Some(DisplayUpdate::Resize(DesktopSize {
+                    width: w,
+                    height: h,
+                })));
+            }
+
+            // Send initial DefaultPointer when cursor channel is active
+            if self.cursor_interval.is_some() && !self.cursor_initialized {
+                self.cursor_initialized = true;
+                let (x, y) = get_cursor_position();
+                self.last_cursor_pos = (x, y);
+                tracing::info!("Cursor channel active — sending initial pointer at ({x}, {y})");
+                return Ok(Some(DisplayUpdate::DefaultPointer));
+            }
+
+            if self.need_bgra_capture {
+                self.restart_capture_bgra().await;
+            }
+
+            let mut cursor_iv = self.cursor_interval.take();
+            let has_cursor = cursor_iv.is_some();
+            let has_held = self.held_frame.is_some();
+            let retry_at = self.retry_at;
+            let event = tokio::select! {
                 biased;
-                _ = cursor_iv.tick() => {
-                    self.cursor_interval = Some(cursor_iv);
+                _ = async { cursor_iv.as_mut().expect("checked").tick().await }, if has_cursor => {
+                    LoopEvent::CursorTick
+                }
+                _ = tokio::time::sleep_until(retry_at), if has_held => LoopEvent::Retry,
+                frame = self.next_frame() => LoopEvent::Frame(frame),
+            };
+            self.cursor_interval = cursor_iv;
+
+            let frame = match event {
+                LoopEvent::CursorTick => {
                     let (x, y) = get_cursor_position();
                     if (x, y) != self.last_cursor_pos {
                         self.last_cursor_pos = (x, y);
                         return Ok(Some(DisplayUpdate::PointerPosition(
-                            PointerPositionAttribute { x, y }
+                            PointerPositionAttribute { x, y },
                         )));
                     }
                     continue;
                 }
-                frame_result = self.next_frame() => {
-                    self.cursor_interval = Some(cursor_iv);
-                    frame_result
+                LoopEvent::Retry => match self.held_frame.take() {
+                    Some(frame) => frame,
+                    None => continue,
+                },
+                LoopEvent::Frame(None) => return Ok(None),
+                LoopEvent::Frame(Some(frame)) => {
+                    // A newer frame replaces a held one: H.264 frames are full frames.
+                    self.held_frame = None;
+                    self.adjust_fps_for_activity(&frame);
+                    frame
                 }
             };
-            return match result {
-                Some(frame) => self.encode_and_send(frame),
-                None => Ok(None),
-            };
+
+            match self.handle_frame(frame) {
+                FrameOutcome::Update(update) => return Ok(Some(update)),
+                FrameOutcome::Done => {}
+                FrameOutcome::Hold(frame) => {
+                    // A fixed deadline: the cursor tick must not keep pushing it back.
+                    let interval_ms = 1000 / u64::from(self.capture_config.frame_rate.max(1));
+                    self.retry_at =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(interval_ms);
+                    self.held_frame = Some(frame);
+                }
+            }
         }
     }
 }
@@ -413,6 +611,23 @@ impl MacDisplayUpdates {
         }
     }
 
+    /// Restart capture with BGRA pixels (bitmap updates cannot use NV12 buffers).
+    async fn restart_capture_bgra(&mut self) {
+        self.need_bgra_capture = false;
+        self.capture_config.pixel_format = CapturePixelFormat::Bgra;
+        let audio_tx = self
+            .shared_audio_tx
+            .as_ref()
+            .and_then(|shared| shared.lock().unwrap().clone());
+        match ScreenCapturer::new(self.capture_config.clone(), audio_tx).await {
+            Ok(capturer) => {
+                tracing::info!("Capture restarted with BGRA pixels for bitmap updates");
+                self.capturer = capturer;
+            }
+            Err(e) => tracing::warn!("Capture restart with BGRA pixels failed: {e:#}"),
+        }
+    }
+
     /// Reduce capture FPS when dirty area is consistently tiny, restore instantly on activity.
     fn adjust_fps_for_activity(&mut self, frame: &CapturedFrame) {
         let total_pixels = frame.width as u64 * frame.height as u64;
@@ -456,20 +671,320 @@ impl MacDisplayUpdates {
         }
     }
 
-    fn encode_and_send(&mut self, frame: CapturedFrame) -> ServerResult<Option<DisplayUpdate>> {
-        // Activity-based FPS reduction
-        self.adjust_fps_for_activity(&frame);
+    fn apply_progressive_bitrate(&mut self, frame: &CapturedFrame) {
+        let encoder = match &mut self.encoder {
+            Some(e) => e,
+            None => return,
+        };
 
-        // Bitmap path: requires BGRA raw bytes — PixelBuffer frames should not reach here
+        let total_pixels = frame.width as u64 * frame.height as u64;
+        let dirty_pixels: u64 = frame
+            .dirty_rects
+            .iter()
+            .map(|r| r.width as u64 * r.height as u64)
+            .sum();
+
+        match self
+            .progressive
+            .evaluate(dirty_pixels, total_pixels, self.last_applied_bitrate)
+        {
+            ProgressiveAction::SceneChange { bitrate, dirty_pct } => {
+                encoder.set_bitrate(bitrate);
+                encoder.force_keyframe();
+                tracing::info!(
+                    dirty_pct = format!("{:.0}", dirty_pct),
+                    reduced_mbps = bitrate as f64 / 1_000_000.0,
+                    "Progressive: scene change detected, starting quality ramp"
+                );
+            }
+            ProgressiveAction::Ramp { bitrate } => {
+                encoder.set_bitrate(bitrate);
+            }
+            ProgressiveAction::RampComplete { bitrate } => {
+                encoder.set_bitrate(bitrate);
+                tracing::debug!("Progressive: ramp complete, restored full bitrate");
+            }
+            ProgressiveAction::None => {}
+        }
+    }
+
+    /// Send one captured frame: as a bitmap update for the server to send, or as
+    /// H.264 through EGFX.
+    fn handle_frame(&mut self, frame: CapturedFrame) -> FrameOutcome {
+        // Encode overload protection: wait one frame interval if previous encode took too long
+        if self.skip_next_frame {
+            self.skip_next_frame = false;
+            return FrameOutcome::Hold(frame);
+        }
+
+        if self.encoder.is_none() {
+            return self.bitmap_outcome(&frame);
+        }
+
+        if !self.gfx.ready.load(Ordering::SeqCst) {
+            // H.264 encoder exists — never send bitmaps, wait for GFX to become ready.
+            // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
+            return FrameOutcome::Hold(frame);
+        }
+        let generation = self.gfx.generation.load(Ordering::SeqCst);
+
+        // A client can open EGFX with AVC disabled: then use bitmaps on this connection.
+        let avc_allowed = match self.avc_checked {
+            Some((checked, allowed)) if checked == generation => allowed,
+            _ => {
+                let Some(allowed) = gfx::avc420_allowed(&self.gfx) else {
+                    // This connection's channel is not open yet.
+                    return FrameOutcome::Hold(frame);
+                };
+                if !allowed {
+                    tracing::info!("EGFX client has AVC disabled — using bitmap updates");
+                    self.full_bitmap_next = true;
+                }
+                self.avc_checked = Some((generation, allowed));
+                allowed
+            }
+        };
+        if !avc_allowed {
+            return self.bitmap_outcome(&frame);
+        }
+
+        if self.send_h264(&frame, generation) {
+            FrameOutcome::Done
+        } else {
+            FrameOutcome::Hold(frame)
+        }
+    }
+
+    fn bitmap_outcome(&mut self, frame: &CapturedFrame) -> FrameOutcome {
+        match self.bitmap_update(frame) {
+            Some(update) => FrameOutcome::Update(update),
+            None => FrameOutcome::Done,
+        }
+    }
+
+    /// Encode a frame as full-frame H.264 and submit it to the EGFX pipeline.
+    /// Returns false if the frame did not reach the pipeline (the caller keeps it).
+    fn send_h264(&mut self, frame: &CapturedFrame, generation: u64) -> bool {
+        let (Ok(w), Ok(h)) = (u16::try_from(frame.width), u16::try_from(frame.height)) else {
+            return true;
+        };
+        if w == 0 || h == 0 {
+            return true;
+        }
+
+        // A new channel (generation) or a new frame size needs a new surface.
+        let surface_ok = matches!(
+            self.surface,
+            Some((_, g, sw, sh)) if g == generation && sw == w && sh == h
+        );
+        if !surface_ok {
+            if matches!(self.surface, Some((_, g, _, _)) if g == generation) {
+                // Same channel, other size: reset the desktop size and drop the old surface.
+                gfx::resize(&self.gfx, w, h);
+            }
+            // The surface has the visible size, so ResetGraphics (sent before the
+            // first surface) also has the visible size; frames are cropped to it.
+            match gfx::create_surface(&self.gfx, w, h) {
+                Some(id) => {
+                    tracing::info!(
+                        surface_id = id,
+                        width = w,
+                        height = h,
+                        generation,
+                        "EGFX surface created"
+                    );
+                    self.surface = Some((id, generation, w, h));
+                    self.surface_frames = 0;
+                    if let Some(encoder) = &mut self.encoder {
+                        encoder.force_keyframe();
+                    }
+                }
+                None => {
+                    self.surface = None;
+                    return false;
+                }
+            }
+        }
+        let Some((surface_id, ..)) = self.surface else {
+            return false;
+        };
+
+        let use_444 = self.mode_444
+            && self.gfx.avc444.load(Ordering::SeqCst)
+            && self.encoder.as_ref().is_some_and(|e| e.supports_444());
+
+        let state = gfx::can_submit(&self.gfx, surface_id, use_444);
+        if let Err(FrameSubmissionError::UnknownSurface { .. }) = state {
+            // The pipeline dropped our surface: create a new one with the next frame.
+            self.surface = None;
+        }
+        match plan_frame(state, self.last_send_failed) {
+            FramePlan::Skip => return false,
+            FramePlan::Encode { force_keyframe } => {
+                if force_keyframe {
+                    if let Some(encoder) = &mut self.encoder {
+                        encoder.force_keyframe();
+                    }
+                }
+            }
+        }
+
+        // Progressive rendering: detect scene change and apply quality ramp
+        self.apply_progressive_bitrate(frame);
+
+        self.display_frame_count += 1;
+        let t0 = Instant::now();
+        let Some(encoded) = self.encode(frame, use_444) else {
+            return true;
+        };
+        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let frame_bytes = encoded.len();
+        let is_keyframe = encoded.is_keyframe();
+
+        let ts_ms = self.start.elapsed().as_millis() as u32;
+        let result = match &encoded {
+            Encoded::Avc420(f) => gfx::submit_avc420(&self.gfx, surface_id, &f.data, w, h, ts_ms),
+            Encoded::Avc444(f) => gfx::submit_avc444(
+                &self.gfx,
+                surface_id,
+                &f.main_view.data,
+                &f.aux_view.data,
+                w,
+                h,
+                ts_ms,
+            ),
+        };
+        let sent = result.is_ok();
+        match result {
+            Ok(()) => {
+                self.surface_frames += 1;
+                if self.surface_frames == 1 || self.surface_frames.is_multiple_of(600) {
+                    tracing::info!(
+                        surface_frames = self.surface_frames,
+                        is_keyframe,
+                        avc444 = matches!(encoded, Encoded::Avc444(_)),
+                        rtt_ms = ?gfx::rtt_ms(&self.gfx),
+                        "EGFX H.264 frames sent"
+                    );
+                }
+                self.last_send_failed = false;
+                tracing::debug!(
+                    display_frame = self.display_frame_count,
+                    h264_bytes = frame_bytes,
+                    is_keyframe,
+                    encode_ms = format!("{:.1}", encode_ms),
+                    "Display: sent GFX frame"
+                );
+            }
+            Err(e) => {
+                // The encoder moved on but the client did not get this frame.
+                self.last_send_failed = true;
+                tracing::warn!(
+                    display_frame = self.display_frame_count,
+                    error = %e,
+                    "EGFX frame not sent — next frame is a keyframe"
+                );
+            }
+        }
+
+        if let Some(ps) = &self.perf_stats {
+            ps.lock()
+                .unwrap()
+                .record_frame(encode_ms, frame_bytes as u32, is_keyframe);
+        }
+        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
+        if encode_ms > frame_interval_ms * 0.95 {
+            self.skip_next_frame = true;
+            self.overload_count += 1;
+            // Rate-limit log: warn once per ~60 overloads
+            if self.overload_count % 60 == 1 {
+                tracing::warn!(
+                    encode_ms = format!("{:.1}", encode_ms),
+                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
+                    overload_total = self.overload_count,
+                    "encode overload — skipping frames"
+                );
+            }
+        }
+        // Keep a frame that did not reach the client: it is sent again as a keyframe.
+        sent
+    }
+
+    /// Encode a full frame: NV12 pixel buffer (zero copy), BGRA AVC444, or BGRA AVC420.
+    fn encode(&mut self, frame: &CapturedFrame, use_444: bool) -> Option<Encoded> {
+        let display_frame = self.display_frame_count;
+        let encoder = self.encoder.as_mut()?;
+        let bgra = match &frame.data {
+            FrameData::PixelBuffer(buf) => {
+                // Zero-copy VT path — encode CVPixelBuffer directly
+                return match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
+                    Ok(encoded) if !encoded.data.is_empty() => Some(Encoded::Avc420(encoded)),
+                    Ok(_) => {
+                        tracing::warn!(display_frame, "Zero-copy encode returned empty data");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(display_frame, "Zero-copy encode failed: {e}");
+                        None
+                    }
+                };
+            }
+            FrameData::Raw(bytes) => bytes,
+        };
+
+        // AVC444 dual-stream path
+        if use_444 {
+            match encoder.encode_bgra_444(bgra, frame.width, frame.height, frame.stride) {
+                Ok(encoded) if !encoded.main_view.data.is_empty() => {
+                    return Some(Encoded::Avc444(encoded));
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        display_frame,
+                        "AVC444 encode returned EMPTY data — frame dropped!"
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        display_frame,
+                        "AVC444 encode failed: {e}, falling back to AVC420"
+                    );
+                    // Fall through to AVC420 path below
+                }
+            }
+        }
+
+        // AVC420 path (default or fallback from AVC444 failure)
+        match encoder.encode_bgra(bgra, frame.width, frame.height, frame.stride) {
+            Ok(encoded) if !encoded.data.is_empty() => Some(Encoded::Avc420(encoded)),
+            Ok(_) => {
+                tracing::warn!(
+                    display_frame,
+                    "H.264 encode returned EMPTY data — frame dropped!"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(display_frame, "H.264 encode failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Bitmap update for the dirty area of a frame (whole frame when needed).
+    fn bitmap_update(&mut self, frame: &CapturedFrame) -> Option<DisplayUpdate> {
+        // Bitmap path: requires BGRA raw bytes
         let bgra_bitmap = match &frame.data {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {
-                tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
-                return Ok(Some(DisplayUpdate::DefaultPointer));
+                self.need_bgra_capture = true;
+                self.full_bitmap_next = true;
+                return None;
             }
         };
 
-        if !frame.dirty_rects.is_empty() {
+        if !self.full_bitmap_next && !frame.dirty_rects.is_empty() {
             // Find bounding box of all dirty rects to send a single update
             let mut min_x = frame.width;
             let mut min_y = frame.height;
@@ -490,12 +1005,8 @@ impl MacDisplayUpdates {
             if max_x > min_x && max_y > min_y {
                 let w = max_x - min_x;
                 let h = max_y - min_y;
-                let Some(width) = NonZeroU16::new(w as u16) else {
-                    return Ok(None);
-                };
-                let Some(height) = NonZeroU16::new(h as u16) else {
-                    return Ok(None);
-                };
+                let width = NonZeroU16::new(w as u16)?;
+                let height = NonZeroU16::new(h as u16)?;
 
                 // Extract only the dirty region from the full frame buffer
                 let bpp = 4usize;
@@ -509,11 +1020,9 @@ impl MacDisplayUpdates {
                     }
                 }
 
-                let Some(stride) = NonZeroUsize::new(dirty_stride) else {
-                    return Ok(None);
-                };
+                let stride = NonZeroUsize::new(dirty_stride)?;
 
-                let update = BitmapUpdate {
+                return Some(DisplayUpdate::Bitmap(BitmapUpdate {
                     x: min_x as u16,
                     y: min_y as u16,
                     width,
@@ -521,24 +1030,17 @@ impl MacDisplayUpdates {
                     format: RdpPixelFormat::BgrA32,
                     data: Bytes::from(dirty_data),
                     stride,
-                };
-
-                return Ok(Some(DisplayUpdate::Bitmap(update)));
+                }));
             }
         }
 
         // No dirty rects available — send full frame (first frame or fallback)
-        let Some(width) = NonZeroU16::new(frame.width as u16) else {
-            return Ok(None);
-        };
-        let Some(height) = NonZeroU16::new(frame.height as u16) else {
-            return Ok(None);
-        };
-        let Some(stride) = NonZeroUsize::new(frame.stride) else {
-            return Ok(None);
-        };
+        let width = NonZeroU16::new(frame.width as u16)?;
+        let height = NonZeroU16::new(frame.height as u16)?;
+        let stride = NonZeroUsize::new(frame.stride)?;
+        self.full_bitmap_next = false;
 
-        let update = BitmapUpdate {
+        Some(DisplayUpdate::Bitmap(BitmapUpdate {
             x: 0,
             y: 0,
             width,
@@ -546,15 +1048,43 @@ impl MacDisplayUpdates {
             format: RdpPixelFormat::BgrA32,
             data: bgra_bitmap.clone(),
             stride,
-        };
-
-        Ok(Some(DisplayUpdate::Bitmap(update)))
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_gate() {
+        assert_eq!(
+            plan_frame(
+                Err(FrameSubmissionError::Backpressured {
+                    frames_in_flight: 3,
+                    max_frames_in_flight: 3
+                }),
+                false
+            ),
+            FramePlan::Skip
+        );
+        assert_eq!(
+            plan_frame(Err(FrameSubmissionError::NotReady), false),
+            FramePlan::Skip
+        );
+        assert_eq!(
+            plan_frame(Ok(()), false),
+            FramePlan::Encode {
+                force_keyframe: false
+            }
+        );
+        assert_eq!(
+            plan_frame(Ok(()), true),
+            FramePlan::Encode {
+                force_keyframe: true
+            }
+        );
+    }
 
     #[test]
     fn test_progressive_no_trigger_below_threshold() {
