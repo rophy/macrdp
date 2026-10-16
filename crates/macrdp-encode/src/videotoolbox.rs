@@ -698,11 +698,15 @@ impl VtEncoder {
                 fps,
                 "VT session bitrate set"
             );
-            // IDR every 5 seconds — less frequent keyframes reduce bandwidth spikes
+            // No periodic keyframes. EGFX runs over TCP, so the client gets every
+            // frame; a keyframe is forced only when the client needs one (new
+            // connection or surface, output resumed, a frame not sent). A periodic
+            // IDR is ~50x a P-frame (260 KB at 720p) and stalls the stream.
+            // 0 would let the encoder choose, so set one hour.
             VTSessionSetProperty(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                cf_i32(fps as i32 * 5),
+                cf_i32((fps as i32).saturating_mul(3600)),
             );
 
             // PrioritizeEncodingSpeedOverQuality (macOS 14+) — reduce encode latency
