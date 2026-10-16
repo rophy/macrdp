@@ -7,7 +7,7 @@ pub mod transfer;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ pub struct MacClipboardBackend {
     event_sender: mpsc::UnboundedSender<ServerEvent>,
     last_change_count: Arc<AtomicI64>,
     remote_formats: Vec<ClipboardFormat>,
-    transfer_manager: FileTransferManager,
+    transfer_manager: Arc<Mutex<FileTransferManager>>,
     temp_dir: PathBuf,
     poll_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
@@ -62,7 +62,10 @@ impl MacClipboardBackend {
             event_sender,
             last_change_count: Arc::new(AtomicI64::new(0)),
             remote_formats: Vec::new(),
-            transfer_manager: FileTransferManager::new(temp_dir.clone(), max_file_size),
+            transfer_manager: Arc::new(Mutex::new(FileTransferManager::new(
+                temp_dir.clone(),
+                max_file_size,
+            ))),
             temp_dir,
             poll_handle: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
@@ -70,28 +73,64 @@ impl MacClipboardBackend {
             pending_paste_format: None,
         }
     }
+}
 
-    /// Build a format list from the current pasteboard contents.
-    fn build_format_list() -> Vec<ClipboardFormat> {
-        let pb = PasteboardBridge::new();
-        pb.available_types()
-            .iter()
-            .filter_map(|uti| {
-                let fmt_id = uti_to_rdp_format_id(uti)?;
-                let mut fmt = ClipboardFormat::new(ClipboardFormatId::new(fmt_id));
-                match fmt_id {
-                    FORMAT_ID_HTML => {
-                        fmt = fmt.with_name(ClipboardFormatName::HTML);
-                    }
-                    FORMAT_ID_FILE_LIST => {
-                        fmt = fmt.with_name(ClipboardFormatName::FILE_LIST);
-                    }
-                    _ => {}
+/// Clipboard formats we can offer for the given pasteboard types.
+fn format_list(types: &[String]) -> Vec<ClipboardFormat> {
+    types
+        .iter()
+        .filter_map(|uti| {
+            let fmt_id = uti_to_rdp_format_id(uti)?;
+            let mut fmt = ClipboardFormat::new(ClipboardFormatId::new(fmt_id));
+            match fmt_id {
+                FORMAT_ID_HTML => {
+                    fmt = fmt.with_name(ClipboardFormatName::HTML);
                 }
-                Some(fmt)
-            })
-            .collect()
+                FORMAT_ID_FILE_LIST => {
+                    fmt = fmt.with_name(ClipboardFormatName::FILE_LIST);
+                }
+                _ => {}
+            }
+            Some(fmt)
+        })
+        .collect()
+}
+
+/// Offer local files: remember them for file contents requests, and announce their
+/// descriptors. The cliprdr crate keeps this list to answer the remote's file list
+/// request and to check its file contents requests. `None` if no file can be offered.
+fn file_copy_message(
+    transfer: &Mutex<FileTransferManager>,
+    paths: Vec<PathBuf>,
+) -> Option<ClipboardMessage> {
+    let mut transfer = transfer.lock().unwrap();
+    transfer.set_local_files(paths);
+    let files = transfer.build_file_list().files;
+    if files.is_empty() {
+        return None;
     }
+    Some(ClipboardMessage::SendInitiateFileCopy(files))
+}
+
+/// The message that announces the current pasteboard contents to the remote, if any.
+fn announce_message(
+    bridge: &PasteboardBridge,
+    transfer: &Mutex<FileTransferManager>,
+) -> Option<ClipboardMessage> {
+    let mut formats = format_list(&bridge.available_types());
+    if formats
+        .iter()
+        .any(|f| f.id().value() == FORMAT_ID_FILE_LIST)
+    {
+        if let Some(msg) = file_copy_message(transfer, bridge.read_file_urls()) {
+            return Some(msg);
+        }
+        formats.retain(|f| f.id().value() != FORMAT_ID_FILE_LIST);
+    }
+    if formats.is_empty() {
+        return None;
+    }
+    Some(ClipboardMessage::SendInitiateCopy(formats))
 }
 
 impl CliprdrBackend for MacClipboardBackend {
@@ -115,6 +154,7 @@ impl CliprdrBackend for MacClipboardBackend {
         let last = self.last_change_count.clone();
         let sender = self.event_sender.clone();
         let stop = self.stop_signal.clone();
+        let transfer = self.transfer_manager.clone();
 
         self.poll_handle = Some(std::thread::spawn(move || {
             let bridge = PasteboardBridge::new();
@@ -127,29 +167,9 @@ impl CliprdrBackend for MacClipboardBackend {
                 let current = bridge.change_count();
                 let prev = last.swap(current, Ordering::SeqCst);
                 if current != prev {
-                    // Clipboard changed -- build format list and notify server
-                    let formats: Vec<ClipboardFormat> = bridge
-                        .available_types()
-                        .iter()
-                        .filter_map(|uti| {
-                            let fmt_id = uti_to_rdp_format_id(uti)?;
-                            let mut fmt = ClipboardFormat::new(ClipboardFormatId::new(fmt_id));
-                            match fmt_id {
-                                FORMAT_ID_HTML => {
-                                    fmt = fmt.with_name(ClipboardFormatName::HTML);
-                                }
-                                FORMAT_ID_FILE_LIST => {
-                                    fmt = fmt.with_name(ClipboardFormatName::FILE_LIST);
-                                }
-                                _ => {}
-                            }
-                            Some(fmt)
-                        })
-                        .collect();
-                    if !formats.is_empty() {
-                        let _ = sender.send(ServerEvent::Clipboard(
-                            ClipboardMessage::SendInitiateCopy(formats),
-                        ));
+                    // Clipboard changed -- announce the new contents
+                    if let Some(msg) = announce_message(&bridge, &transfer) {
+                        let _ = sender.send(ServerEvent::Clipboard(msg));
                     }
                 }
             }
@@ -160,12 +180,9 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_process_negotiated_capabilities(&mut self, _caps: ClipboardGeneralCapabilityFlags) {}
 
     fn on_request_format_list(&mut self) {
-        let formats = Self::build_format_list();
-        let _ = self
-            .event_sender
-            .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
-                formats,
-            )));
+        let msg = announce_message(&PasteboardBridge::new(), &self.transfer_manager)
+            .unwrap_or(ClipboardMessage::SendInitiateCopy(Vec::new()));
+        let _ = self.event_sender.send(ServerEvent::Clipboard(msg));
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -216,18 +233,6 @@ impl CliprdrBackend for MacClipboardBackend {
                 }
                 None => FormatDataResponse::new_error(),
             },
-            id if id == FORMAT_ID_FILE_LIST => {
-                let paths = pb.read_file_urls();
-                self.transfer_manager.set_local_files(paths);
-                let file_list = self.transfer_manager.build_file_list();
-                match FormatDataResponse::new_file_list(&file_list) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        tracing::warn!("Failed to encode file list: {e}");
-                        FormatDataResponse::new_error()
-                    }
-                }
-            }
             _ => {
                 tracing::warn!(format_id, "Unsupported clipboard format requested");
                 FormatDataResponse::new_error()
@@ -275,18 +280,6 @@ impl CliprdrBackend for MacClipboardBackend {
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
-            Some(id) if id == FORMAT_ID_FILE_LIST => {
-                if let Ok(file_list) = response.to_file_list() {
-                    self.transfer_manager
-                        .set_incoming_descriptors(file_list.files);
-                    let requests = self.transfer_manager.generate_contents_requests();
-                    for req in requests {
-                        let _ = self
-                            .event_sender
-                            .send(ServerEvent::ClipboardFileContentsRequest(req));
-                    }
-                }
-            }
             _ => {
                 // Fallback: content-based detection for backwards compatibility
                 if let Ok(text) = response.to_unicode_string() {
@@ -310,19 +303,38 @@ impl CliprdrBackend for MacClipboardBackend {
         }
     }
 
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], _clip_data_id: Option<u32>) {
+        // The cliprdr crate takes the file list response, checks the names, and gives the
+        // list here instead of to on_format_data_response.
+        let requests = {
+            let mut transfer = self.transfer_manager.lock().unwrap();
+            transfer.set_incoming_descriptors(files.to_vec());
+            transfer.generate_contents_requests()
+        };
+        for req in requests {
+            let _ = self.event_sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendFileContentsRequest(req),
+            ));
+        }
+    }
+
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-        let response = self.transfer_manager.handle_contents_request(&request);
-        let owned: OwnedFileContentsResponse = response.into_owned();
-        let _ = self
-            .event_sender
-            .send(ServerEvent::ClipboardFileContents(owned));
+        let response = self
+            .transfer_manager
+            .lock()
+            .unwrap()
+            .handle_contents_request(&request);
+        let _ = self.event_sender.send(ServerEvent::Clipboard(
+            ClipboardMessage::SendFileContentsResponse(response),
+        ));
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
-        self.transfer_manager.handle_contents_response(&response);
+        let mut transfer = self.transfer_manager.lock().unwrap();
+        transfer.handle_contents_response(&response);
 
-        if self.transfer_manager.all_incoming_complete() {
-            let paths = self.transfer_manager.flush_incoming_files();
+        if transfer.all_incoming_complete() {
+            let paths = transfer.flush_incoming_files();
             if !paths.is_empty() {
                 let pb = PasteboardBridge::new();
                 let new_count = pb.write_file_urls(&paths);
@@ -334,12 +346,12 @@ impl CliprdrBackend for MacClipboardBackend {
 
     fn on_lock(&mut self, _data_id: LockDataId) {
         self.locked = true;
-        self.transfer_manager.lock();
+        self.transfer_manager.lock().unwrap().lock();
     }
 
     fn on_unlock(&mut self, _data_id: LockDataId) {
         self.locked = false;
-        self.transfer_manager.unlock();
+        self.transfer_manager.lock().unwrap().unlock();
     }
 }
 
@@ -394,3 +406,50 @@ impl ServerEventSender for MacClipboardFactory {
 }
 
 impl CliprdrServerFactory for MacClipboardFactory {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_files_announced_as_file_copy() {
+        let dir = std::env::temp_dir().join(format!("macrdp-announce-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hello.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        let transfer = Mutex::new(FileTransferManager::new(dir.join("tmp"), 1024));
+
+        let msg = file_copy_message(&transfer, vec![path.clone(), dir.join("missing.bin")]);
+
+        let Some(ClipboardMessage::SendInitiateFileCopy(files)) = msg else {
+            panic!("expected SendInitiateFileCopy, got {msg:?}");
+        };
+        let got: Vec<_> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.file_size))
+            .collect();
+        assert_eq!(got, [("hello.txt", Some(11))]);
+
+        // The same files serve the file contents requests.
+        let request = FileContentsRequest {
+            stream_id: 1,
+            index: 0,
+            flags: FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: None,
+        };
+        let response = transfer.lock().unwrap().handle_contents_request(&request);
+        assert_eq!(response.data_as_size().unwrap(), 11);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_file_copy_without_readable_files() {
+        let dir = std::env::temp_dir().join(format!("macrdp-announce2-{}", std::process::id()));
+        let transfer = Mutex::new(FileTransferManager::new(dir.join("tmp"), 1024));
+        assert!(file_copy_message(&transfer, vec![dir.join("missing.bin")]).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

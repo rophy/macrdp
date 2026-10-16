@@ -9,9 +9,12 @@ license.workspace = true
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt"] }
-ironrdp-server = "0.10"
-ironrdp-rdpsnd = "0.7"
+ironrdp-server = "0.13"
+ironrdp-rdpsnd = "0.9"
 macrdp-capture = { path = "../macrdp-capture" }
 
 [dev-dependencies]
 approx = "0.5"
+ironrdp-core = "0.2"
+ironrdp-pdu = "0.9"
+ironrdp-svc = "0.8"

@@ -25,6 +25,7 @@ impl PerfStats {
     }
 
     /// Record metrics for one encoded frame.
+    #[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX records frames again
     pub fn record_frame(&mut self, encode_ms: f64, frame_bytes: u32, is_keyframe: bool) {
         if !self.enabled {
             return;

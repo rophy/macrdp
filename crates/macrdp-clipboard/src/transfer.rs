@@ -53,12 +53,7 @@ impl FileTransferManager {
             .filter_map(|path| {
                 let meta = fs::metadata(path).ok()?;
                 let name = path.file_name()?.to_string_lossy().to_string();
-                Some(FileDescriptor {
-                    name,
-                    file_size: Some(meta.len()),
-                    attributes: None,
-                    last_write_time: None,
-                })
+                Some(FileDescriptor::new(name).with_file_size(meta.len()))
             })
             .collect();
         PackedFileList { files }
@@ -95,7 +90,7 @@ impl FileTransferManager {
                     FileContentsResponse::new_error(stream_id)
                 }
             }
-        } else if request.flags.contains(FileContentsFlags::DATA) {
+        } else if request.flags.contains(FileContentsFlags::RANGE) {
             match read_file_range(
                 path,
                 request.position,
@@ -132,7 +127,7 @@ impl FileTransferManager {
 
             requests.push(FileContentsRequest {
                 stream_id: size_stream,
-                index: index as u32,
+                index: index as i32,
                 flags: FileContentsFlags::SIZE,
                 position: 0,
                 requested_size: 8,
@@ -147,8 +142,8 @@ impl FileTransferManager {
             let size = desc.file_size.unwrap_or(0) as u32;
             requests.push(FileContentsRequest {
                 stream_id: data_stream,
-                index: index as u32,
-                flags: FileContentsFlags::DATA,
+                index: index as i32,
+                flags: FileContentsFlags::RANGE,
                 position: 0,
                 requested_size: size,
                 data_id: None,
@@ -313,7 +308,7 @@ mod tests {
         let request = FileContentsRequest {
             stream_id: 2,
             index: 0,
-            flags: FileContentsFlags::DATA,
+            flags: FileContentsFlags::RANGE,
             position: 2,
             requested_size: 3,
             data_id: None,
@@ -355,25 +350,15 @@ mod tests {
         let mut mgr = FileTransferManager::new(dir.clone(), 1024 * 1024);
 
         let descriptors = vec![
-            FileDescriptor {
-                name: "a.txt".to_string(),
-                file_size: Some(5),
-                attributes: None,
-                last_write_time: None,
-            },
-            FileDescriptor {
-                name: "b.txt".to_string(),
-                file_size: Some(3),
-                attributes: None,
-                last_write_time: None,
-            },
+            FileDescriptor::new("a.txt").with_file_size(5),
+            FileDescriptor::new("b.txt").with_file_size(3),
         ];
         mgr.set_incoming_descriptors(descriptors);
 
         let requests = mgr.generate_contents_requests();
         assert_eq!(requests.len(), 4);
         assert!(requests[0].flags.contains(FileContentsFlags::SIZE));
-        assert!(requests[1].flags.contains(FileContentsFlags::DATA));
+        assert!(requests[1].flags.contains(FileContentsFlags::RANGE));
 
         let data_stream_a = requests[1].stream_id;
         let data_stream_b = requests[3].stream_id;

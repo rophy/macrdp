@@ -1,4 +1,6 @@
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{
+    KeyboardEvent, MouseButton as RdpMouseButton, MouseEvent, RdpServerInputHandler,
+};
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
 use std::sync::{Arc, Mutex};
 
@@ -124,45 +126,31 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.last_mouse_y = my;
                 m.move_to(mx, my)
             }
-            MouseEvent::LeftPressed => m.button_event(
-                MouseButton::Left,
-                true,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::LeftReleased => m.button_event(
-                MouseButton::Left,
-                false,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::RightPressed => m.button_event(
-                MouseButton::Right,
-                true,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::RightReleased => m.button_event(
-                MouseButton::Right,
-                false,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::MiddlePressed => m.button_event(
-                MouseButton::Middle,
-                true,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
-            MouseEvent::MiddleReleased => m.button_event(
-                MouseButton::Middle,
-                false,
-                self.last_mouse_x,
-                self.last_mouse_y,
-            ),
+            MouseEvent::Button {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                let button = match button {
+                    RdpMouseButton::Left => MouseButton::Left,
+                    RdpMouseButton::Right => MouseButton::Right,
+                    RdpMouseButton::Middle => MouseButton::Middle,
+                    other => {
+                        tracing::debug!(button = ?other, pressed, "Mouse button not supported (ignored)");
+                        return;
+                    }
+                };
+                // The event carries its position: move there first, then press or release.
+                let (mx, my) = self.coord_mapper.map(x, y);
+                self.last_mouse_x = mx;
+                self.last_mouse_y = my;
+                m.move_to(mx, my)
+                    .and_then(|()| m.button_event(button, pressed, mx, my))
+            }
             MouseEvent::VerticalScroll { value } => m.scroll(value),
             _ => {
-                tracing::trace!(?event, "Unhandled mouse event");
+                tracing::debug!(?event, "Unhandled mouse event");
                 Ok(())
             }
         };

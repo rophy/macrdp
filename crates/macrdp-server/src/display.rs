@@ -1,30 +1,21 @@
-use anyhow::Result;
 use bytes::Bytes;
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+use ironrdp_pdu::pointer::PointerPositionAttribute;
 use ironrdp_server::{
-    gfx::GfxState, BitmapUpdate, DesktopSize, DisplayControlMonitorLayout, DisplayUpdate,
-    GfxDirtyH264Update, GfxFrameUpdate, H264Rect, PixelFormat as RdpPixelFormat,
-    PointerPositionAttribute, RdpServerDisplay, RdpServerDisplayUpdates,
+    BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat as RdpPixelFormat, RdpServerDisplay,
+    RdpServerDisplayUpdates, ServerError, ServerErrorExt as _, ServerResult,
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{
     get_cursor_position, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer,
     FrameData, ScreenCapturer,
 };
-use macrdp_encode::{self, encode_rect_h264, Quality, VideoEncoder};
+use macrdp_encode::{self, Quality};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
-
-/// Maximum total dirty area (in pixels) for the uncompressed GFX path.
-/// Below this threshold, raw pixels are sent instead of H.264 encoding.
-/// 262144 pixels ≈ 512×512 rect ≈ 1 MB of raw BGRA data.
-/// Covers most UI interactions (menus, buttons, tooltips, text cursor blinks).
-const UNCOMPRESSED_MAX_PIXELS: u32 = 262144;
-
-/// Max dirty rects to encode individually before falling back to full-frame H.264.
-const DIRTY_RECT_MAX_COUNT: usize = 16;
 
 /// Dirty area below this fraction of total pixels = "low activity" (0.5%).
 const LOW_ACTIVITY_FRACTION: f64 = 0.005;
@@ -35,6 +26,7 @@ const LOW_ACTIVITY_MIN_FPS: u32 = 5;
 
 /// Progressive rendering: on scene changes (large dirty area), temporarily reduce
 /// encoder bitrate for fast initial delivery, then ramp quality back over several frames.
+#[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX uses this again
 #[derive(Debug)]
 struct ProgressiveRamp {
     trigger_fraction: f64,
@@ -43,6 +35,7 @@ struct ProgressiveRamp {
     remaining: u32,
 }
 
+#[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX uses this again
 impl ProgressiveRamp {
     fn new() -> Self {
         Self {
@@ -99,6 +92,7 @@ impl ProgressiveRamp {
     }
 }
 
+#[allow(dead_code)] // reason: video is bitmap only for now; H.264 on EGFX uses this again
 #[derive(Debug, PartialEq)]
 enum ProgressiveAction {
     None,
@@ -121,20 +115,22 @@ pub struct MacDisplay {
     fixed_resolution: bool,
     frame_rate: u32,
     quality: Quality,
+    /// H.264 settings: unused while video is bitmap only; H.264 on EGFX uses them again.
+    #[allow(dead_code)]
     encoder_pref: macrdp_encode::EncoderPreference,
     /// Whether AVC444 mode is requested by config
+    #[allow(dead_code)]
     mode_444: bool,
     show_cursor: bool,
+    #[allow(dead_code)]
     base_bitrate: u32,
-    gfx_state: Arc<Mutex<GfxState>>,
+    /// New desktop size from a Display Control layout, sent as a Resize update
+    pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
     /// Shared audio sender slot — updated per connection by AudioFactory
     shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
+    #[allow(dead_code)]
     perf_stats: Option<SharedPerfStats>,
-    /// Shared encoder slot — returned here when a connection ends, reused on reconnect
-    encoder_cache: Arc<std::sync::Mutex<Option<Box<dyn macrdp_encode::VideoEncoder>>>>,
-    /// Resolution the cached encoder was created for
-    cached_encoder_dims: (u16, u16),
 }
 
 impl MacDisplay {
@@ -149,7 +145,6 @@ impl MacDisplay {
         mode_444: bool,
         show_cursor: bool,
         bitrate_override: Option<u32>,
-        gfx_state: Arc<Mutex<GfxState>>,
         coord_mapper: MouseCoordMapper,
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
@@ -184,44 +179,22 @@ impl MacDisplay {
             mode_444,
             show_cursor,
             base_bitrate,
-            gfx_state,
+            pending_resize: Arc::new(Mutex::new(None)),
             shared_audio_tx,
             perf_stats,
-            encoder_cache: Arc::new(std::sync::Mutex::new(None)),
-            cached_encoder_dims: (0, 0),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl RdpServerDisplay for MacDisplay {
-    async fn size(&mut self) -> DesktopSize {
+    /// The largest desktop a client may ask for.
+    pub fn max_size(&self) -> DesktopSize {
         DesktopSize {
-            width: self.width,
-            height: self.height,
+            width: self.max_width,
+            height: self.max_height,
         }
     }
 
-    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
-        if self.fixed_resolution {
-            tracing::debug!("Ignoring DisplayControl layout — resolution is fixed by config");
-            return;
-        }
-        let primary = layout.monitors().iter().find(|m| m.is_primary());
-        let Some(monitor) = primary else {
-            tracing::warn!("DisplayControl layout has no primary monitor");
-            return;
-        };
-        let (w, h) = monitor.dimensions();
-        let (w, h) = (w as u16, h as u16);
-        if w == self.width && h == self.height {
-            return;
-        }
-        self.request_resize(w, h);
-        self.gfx_state.lock().unwrap().pending_resize = Some((self.width, self.height));
-    }
-
-    fn request_resize(&mut self, width: u16, height: u16) {
+    /// Adopt a client-requested desktop size, clamped to the maximum.
+    fn resize_to(&mut self, width: u16, height: u16) {
         if self.fixed_resolution {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
@@ -247,19 +220,48 @@ impl RdpServerDisplay for MacDisplay {
             self.coord_mapper.update_rdp_size(w, h);
         }
     }
+}
 
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+#[async_trait::async_trait]
+impl RdpServerDisplay for MacDisplay {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        self.resize_to(client_size.width, client_size.height);
+        self.size().await
+    }
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        if self.fixed_resolution {
+            tracing::debug!("Ignoring DisplayControl layout — resolution is fixed by config");
+            return;
+        }
+        let primary = layout.monitors().iter().find(|m| m.is_primary());
+        let Some(monitor) = primary else {
+            tracing::warn!("DisplayControl layout has no primary monitor");
+            return;
+        };
+        let (w, h) = monitor.dimensions();
+        let (w, h) = (w as u16, h as u16);
+        if w == self.width && h == self.height {
+            return;
+        }
+        self.resize_to(w, h);
+        *self.pending_resize.lock().unwrap() = Some((self.width, self.height));
+    }
+
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
-            pixel_format: if self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
-                && !self.mode_444
-            {
-                CapturePixelFormat::Nv12
-            } else {
-                CapturePixelFormat::Bgra
-            },
+            // Bitmap updates need BGRA pixels.
+            pixel_format: CapturePixelFormat::Bgra,
             show_cursor: self.show_cursor,
         };
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
@@ -267,44 +269,9 @@ impl RdpServerDisplay for MacDisplay {
             .shared_audio_tx
             .as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
-        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
-
-        // Reuse cached encoder if resolution hasn't changed, otherwise create new one
-        let encoder = if self.cached_encoder_dims == (self.width, self.height) {
-            let cached = self.encoder_cache.lock().unwrap().take();
-            if let Some(mut enc) = cached {
-                tracing::info!("Reusing cached H.264 encoder from previous connection");
-                enc.force_keyframe();
-                Some(enc)
-            } else {
-                macrdp_encode::create_encoder(
-                    self.width as u32,
-                    self.height as u32,
-                    self.frame_rate as f32,
-                    self.quality,
-                    self.encoder_pref,
-                    self.mode_444,
-                    self.base_bitrate,
-                )
-                .ok()
-            }
-        } else {
-            macrdp_encode::create_encoder(
-                self.width as u32,
-                self.height as u32,
-                self.frame_rate as f32,
-                self.quality,
-                self.encoder_pref,
-                self.mode_444,
-                self.base_bitrate,
-            )
-            .ok()
-        };
-        self.cached_encoder_dims = (self.width, self.height);
-
-        if encoder.is_some() {
-            tracing::info!("H.264 encoder available — will use GFX path when client supports it");
-        }
+        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx)
+            .await
+            .map_err(|e| ServerError::reason("screen capture", format!("{e:#}")))?;
 
         let cursor_interval = if !self.show_cursor {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
@@ -317,23 +284,12 @@ impl RdpServerDisplay for MacDisplay {
         Ok(Box::new(MacDisplayUpdates {
             capturer,
             capture_config,
-            encoder,
-            encoder_cache: Arc::clone(&self.encoder_cache),
-            gfx_state: Arc::clone(&self.gfx_state),
-            base_bitrate: self.base_bitrate,
-            mode_444: self.mode_444,
-            display_frame_count: 0,
-            skip_next_frame: false,
-            overload_count: 0,
-            perf_stats: self.perf_stats.clone(),
+            pending_resize: Arc::clone(&self.pending_resize),
             low_activity_frames: 0,
             current_fps: self.frame_rate,
             cursor_interval,
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
-            keyframe_replayed: self.gfx_state.lock().unwrap().last_keyframe.is_none(),
-            last_applied_bitrate: self.base_bitrate,
-            progressive: ProgressiveRamp::new(),
         }))
     }
 }
@@ -341,18 +297,8 @@ impl RdpServerDisplay for MacDisplay {
 struct MacDisplayUpdates {
     capturer: ScreenCapturer,
     capture_config: CaptureConfig,
-    encoder: Option<Box<dyn VideoEncoder>>,
-    /// Shared slot to return encoder on drop for reuse across connections
-    encoder_cache: Arc<std::sync::Mutex<Option<Box<dyn VideoEncoder>>>>,
-    gfx_state: Arc<Mutex<GfxState>>,
-    base_bitrate: u32,
-    mode_444: bool,
-    display_frame_count: u64,
-    skip_next_frame: bool,
-    /// Counter for rate-limiting encode overload warnings
-    overload_count: u64,
-    /// Shared performance statistics collector (None = disabled)
-    perf_stats: Option<SharedPerfStats>,
+    /// New desktop size from a Display Control layout, sent as a Resize update
+    pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
     /// Consecutive frames with tiny dirty area (activity-based FPS reduction).
     low_activity_frames: u32,
     /// Current capture FPS (to avoid redundant set_frame_rate calls).
@@ -363,42 +309,16 @@ struct MacDisplayUpdates {
     last_cursor_pos: (u16, u16),
     /// Whether the initial DefaultPointer has been sent
     cursor_initialized: bool,
-    /// Whether the cached keyframe has been replayed on reconnect
-    keyframe_replayed: bool,
-    /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
-    last_applied_bitrate: u32,
-    progressive: ProgressiveRamp,
-}
-
-impl Drop for MacDisplayUpdates {
-    fn drop(&mut self) {
-        if let Some(enc) = self.encoder.take() {
-            *self.encoder_cache.lock().unwrap() = Some(enc);
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        if let Some((w, h)) = self.gfx_state.lock().unwrap().pending_resize.take() {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
+        if let Some((w, h)) = self.pending_resize.lock().unwrap().take() {
             return Ok(Some(DisplayUpdate::Resize(DesktopSize {
                 width: w,
                 height: h,
             })));
-        }
-
-        // Replay cached keyframe on reconnect for instant image
-        if !self.keyframe_replayed {
-            let gs = self.gfx_state.lock().unwrap();
-            if gs.is_ready() {
-                self.keyframe_replayed = true;
-                if let Some(frame) = gs.last_keyframe.clone() {
-                    drop(gs);
-                    tracing::info!("Replaying cached keyframe for instant reconnect image");
-                    return Ok(Some(DisplayUpdate::GfxFrame(frame)));
-                }
-            }
         }
 
         // Send initial DefaultPointer when cursor channel is active
@@ -533,378 +453,11 @@ impl MacDisplayUpdates {
         }
     }
 
-    fn apply_progressive_bitrate(&mut self, frame: &CapturedFrame) {
-        let encoder = match &mut self.encoder {
-            Some(e) => e,
-            None => return,
-        };
-
-        let total_pixels = frame.width as u64 * frame.height as u64;
-        let dirty_pixels: u64 = frame
-            .dirty_rects
-            .iter()
-            .map(|r| r.width as u64 * r.height as u64)
-            .sum();
-
-        match self
-            .progressive
-            .evaluate(dirty_pixels, total_pixels, self.last_applied_bitrate)
-        {
-            ProgressiveAction::SceneChange { bitrate, dirty_pct } => {
-                encoder.set_bitrate(bitrate);
-                encoder.force_keyframe();
-                tracing::info!(
-                    dirty_pct = format!("{:.0}", dirty_pct),
-                    reduced_mbps = bitrate as f64 / 1_000_000.0,
-                    "Progressive: scene change detected, starting quality ramp"
-                );
-            }
-            ProgressiveAction::Ramp { bitrate } => {
-                encoder.set_bitrate(bitrate);
-            }
-            ProgressiveAction::RampComplete { bitrate } => {
-                encoder.set_bitrate(bitrate);
-                tracing::debug!("Progressive: ramp complete, restored full bitrate");
-            }
-            ProgressiveAction::None => {}
-        }
-    }
-
-    fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
-        // Encode overload protection: skip this frame if previous encode took too long
-        if self.skip_next_frame {
-            self.skip_next_frame = false;
-            return Ok(Some(DisplayUpdate::DefaultPointer));
-        }
-
+    fn encode_and_send(&mut self, frame: CapturedFrame) -> ServerResult<Option<DisplayUpdate>> {
         // Activity-based FPS reduction
         self.adjust_fps_for_activity(&frame);
 
-        // Check GFX state and AVC444 negotiation
-        let (gfx_ready, use_444) = {
-            let state = self.gfx_state.lock().unwrap();
-            let ready = state.is_ready() && self.encoder.is_some();
-            let use_444 = self.mode_444 && state.avc444_supported && state.avc444_enabled;
-            (ready, use_444)
-        };
-
-        if gfx_ready {
-            // Adaptive bitrate: adjust encoder bitrate based on network conditions
-            if let Some(encoder) = &mut self.encoder {
-                let adaptive = {
-                    let state = self.gfx_state.lock().unwrap();
-                    state.adaptive_bitrate(self.base_bitrate)
-                };
-                if adaptive != self.last_applied_bitrate
-                    && (adaptive as f64 - self.last_applied_bitrate as f64).abs()
-                        > self.base_bitrate as f64 * 0.1
-                {
-                    tracing::info!(
-                        from_mbps = self.last_applied_bitrate as f64 / 1_000_000.0,
-                        to_mbps = adaptive as f64 / 1_000_000.0,
-                        "Adaptive bitrate adjustment"
-                    );
-                    encoder.set_bitrate(adaptive);
-                    self.last_applied_bitrate = adaptive;
-                }
-            }
-
-            // Progressive rendering: detect scene change and apply quality ramp
-            self.apply_progressive_bitrate(&frame);
-
-            // GFX dirty-rect path — for small dirty regions, encode each rect
-            // independently with OpenH264 instead of full-frame H.264
-            if !frame.dirty_rects.is_empty() {
-                let total_area: u32 = frame.dirty_rects.iter().map(|r| r.width * r.height).sum();
-
-                if total_area > 0
-                    && total_area <= UNCOMPRESSED_MAX_PIXELS
-                    && frame.dirty_rects.len() <= DIRTY_RECT_MAX_COUNT
-                {
-                    if let Some(bgra) = frame.data.as_bgra_bytes() {
-                        let t0 = std::time::Instant::now();
-                        let mut h264_rects: Vec<H264Rect> = Vec::new();
-                        let mut encode_failed = false;
-
-                        for r in frame
-                            .dirty_rects
-                            .iter()
-                            .filter(|r| r.width > 0 && r.height > 0)
-                        {
-                            let x = r.x.min(frame.width.saturating_sub(1));
-                            let y = r.y.min(frame.height.saturating_sub(1));
-                            let w = r.width.min(frame.width - x);
-                            let h = r.height.min(frame.height - y);
-                            if w == 0 || h == 0 {
-                                continue;
-                            }
-
-                            match encode_rect_h264(bgra, frame.stride, x, y, w, h) {
-                                Ok(encoded) => {
-                                    h264_rects.push(H264Rect {
-                                        x: x as u16,
-                                        y: y as u16,
-                                        width: w as u16,
-                                        height: h as u16,
-                                        enc_width: encoded.width as u16,
-                                        enc_height: encoded.height as u16,
-                                        h264_data: encoded.data,
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        rect_x = r.x, rect_y = r.y,
-                                        rect_w = w, rect_h = h,
-                                        "Dirty-rect H.264 encode failed: {e:#}, falling back to full frame"
-                                    );
-                                    encode_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !encode_failed && !h264_rects.is_empty() {
-                            self.display_frame_count += 1;
-                            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            let total_h264: usize =
-                                h264_rects.iter().map(|r| r.h264_data.len()).sum();
-                            {
-                                let mut st = self.gfx_state.lock().unwrap();
-                                st.last_encode_ms = encode_ms;
-                                st.last_frame_bytes = total_h264 as u32;
-                            }
-                            tracing::debug!(
-                                display_frame = self.display_frame_count,
-                                rects = h264_rects.len(),
-                                total_pixels = total_area,
-                                h264_bytes = total_h264,
-                                encode_ms = format!("{:.1}", encode_ms),
-                                "Display: sending GFX dirty-rect H.264"
-                            );
-                            return Ok(Some(DisplayUpdate::GfxDirtyH264(GfxDirtyH264Update {
-                                rects: h264_rects,
-                                width: frame.width as u16,
-                                height: frame.height as u16,
-                            })));
-                        }
-                    }
-                    // PixelBuffer frames or encode failure — fall through to full-frame H.264
-                }
-            }
-
-            // GFX H.264 path — always send at capture rate, never block on acks
-            if let Some(encoder) = &mut self.encoder {
-                self.display_frame_count += 1;
-                let t0 = std::time::Instant::now();
-
-                // Route based on frame data type
-                match &frame.data {
-                    FrameData::PixelBuffer(buf) => {
-                        // Zero-copy VT path — encode CVPixelBuffer directly
-                        match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
-                            Ok(encoded) if !encoded.data.is_empty() => {
-                                let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                let is_keyframe = encoded.is_keyframe;
-                                tracing::debug!(
-                                    display_frame = self.display_frame_count,
-                                    h264_bytes = encoded.data.len(),
-                                    is_keyframe,
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    "Display: sending zero-copy GFX frame"
-                                );
-                                {
-                                    let mut st = self.gfx_state.lock().unwrap();
-                                    st.last_encode_ms = encode_ms;
-                                    st.last_frame_bytes = encoded.data.len() as u32;
-                                }
-                                if let Some(ps) = &self.perf_stats {
-                                    ps.lock().unwrap().record_frame(
-                                        encode_ms,
-                                        encoded.data.len() as u32,
-                                        is_keyframe,
-                                    );
-                                }
-                                let frame_interval_ms =
-                                    1000.0 / self.capture_config.frame_rate as f64;
-                                if encode_ms > frame_interval_ms * 0.95 {
-                                    self.skip_next_frame = true;
-                                    self.overload_count += 1;
-                                    // Rate-limit log: warn once per ~60 overloads, debug otherwise
-                                    if self.overload_count % 60 == 1 {
-                                        tracing::warn!(
-                                            encode_ms = format!("{:.1}", encode_ms),
-                                            frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                            overload_total = self.overload_count,
-                                            "encode overload — skipping frames"
-                                        );
-                                    }
-                                }
-                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                    h264_data: encoded.data,
-                                    width: frame.width as u16,
-                                    height: frame.height as u16,
-                                    enc_width: encoded.width as u16,
-                                    enc_height: encoded.height as u16,
-                                    is_keyframe,
-                                    h264_aux: None,
-                                })));
-                            }
-                            Ok(_) => {
-                                tracing::warn!("Zero-copy encode returned empty data");
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Zero-copy encode failed: {e}, falling back to DefaultPointer"
-                                );
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
-                            }
-                        }
-                    }
-                    FrameData::Raw(_) => {
-                        // Existing BGRA encode path — continues below
-                    }
-                }
-                let bgra = frame.data.as_bgra_bytes().unwrap();
-
-                // AVC444 dual-stream path
-                if use_444 && encoder.supports_444() {
-                    match encoder.encode_bgra_444(bgra, frame.width, frame.height, frame.stride) {
-                        Ok(encoded) if !encoded.main_view.data.is_empty() => {
-                            let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            let total_bytes =
-                                encoded.main_view.data.len() + encoded.aux_view.data.len();
-                            let is_keyframe = encoded.main_view.is_keyframe;
-                            tracing::debug!(
-                                display_frame = self.display_frame_count,
-                                main_bytes = encoded.main_view.data.len(),
-                                aux_bytes = encoded.aux_view.data.len(),
-                                is_keyframe,
-                                encode_ms = format!("{:.1}", encode_ms),
-                                "Display: sending AVC444 GFX frame"
-                            );
-                            {
-                                let mut st = self.gfx_state.lock().unwrap();
-                                st.last_encode_ms = encode_ms;
-                                st.last_frame_bytes = total_bytes as u32;
-                            }
-                            if let Some(ps) = &self.perf_stats {
-                                ps.lock().unwrap().record_frame(
-                                    encode_ms,
-                                    total_bytes as u32,
-                                    is_keyframe,
-                                );
-                            }
-                            let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                            if encode_ms > frame_interval_ms * 0.95 {
-                                self.skip_next_frame = true;
-                                self.overload_count += 1;
-                                if self.overload_count % 60 == 1 {
-                                    tracing::warn!(
-                                        encode_ms = format!("{:.1}", encode_ms),
-                                        frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                        overload_total = self.overload_count,
-                                        "encode overload — skipping frames"
-                                    );
-                                }
-                            }
-                            return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                                h264_data: encoded.main_view.data,
-                                width: frame.width as u16,
-                                height: frame.height as u16,
-                                enc_width: encoded.main_view.width as u16,
-                                enc_height: encoded.main_view.height as u16,
-                                is_keyframe,
-                                h264_aux: Some(encoded.aux_view.data),
-                            })));
-                        }
-                        Ok(_) => {
-                            tracing::warn!(
-                                display_frame = self.display_frame_count,
-                                "AVC444 encode returned EMPTY data — frame dropped!"
-                            );
-                            return Ok(Some(DisplayUpdate::DefaultPointer));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                display_frame = self.display_frame_count,
-                                "AVC444 encode failed: {e}, falling back to AVC420"
-                            );
-                            // Fall through to AVC420 path below
-                        }
-                    }
-                }
-
-                // AVC420 path (default or fallback from AVC444 failure)
-                match encoder.encode_bgra(bgra, frame.width, frame.height, frame.stride) {
-                    Ok(encoded) if !encoded.data.is_empty() => {
-                        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        let is_keyframe = encoded.is_keyframe;
-                        tracing::debug!(
-                            display_frame = self.display_frame_count,
-                            h264_bytes = encoded.data.len(),
-                            is_keyframe,
-                            encode_ms = format!("{:.1}", encode_ms),
-                            "Display: sending GFX frame"
-                        );
-                        {
-                            let mut st = self.gfx_state.lock().unwrap();
-                            st.last_encode_ms = encode_ms;
-                            st.last_frame_bytes = encoded.data.len() as u32;
-                        }
-                        if let Some(ps) = &self.perf_stats {
-                            ps.lock().unwrap().record_frame(
-                                encode_ms,
-                                encoded.data.len() as u32,
-                                is_keyframe,
-                            );
-                        }
-                        let frame_interval_ms = 1000.0 / self.capture_config.frame_rate as f64;
-                        if encode_ms > frame_interval_ms * 0.95 {
-                            self.skip_next_frame = true;
-                            self.overload_count += 1;
-                            if self.overload_count % 60 == 1 {
-                                tracing::warn!(
-                                    encode_ms = format!("{:.1}", encode_ms),
-                                    frame_interval_ms = format!("{:.1}", frame_interval_ms),
-                                    overload_total = self.overload_count,
-                                    "encode overload — skipping frames"
-                                );
-                            }
-                        }
-                        return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
-                            h264_data: encoded.data,
-                            width: frame.width as u16,
-                            height: frame.height as u16,
-                            enc_width: encoded.width as u16,
-                            enc_height: encoded.height as u16,
-                            is_keyframe,
-                            h264_aux: None,
-                        })));
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            display_frame = self.display_frame_count,
-                            "H.264 encode returned EMPTY data — frame dropped!"
-                        );
-                        return Ok(Some(DisplayUpdate::DefaultPointer));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            display_frame = self.display_frame_count,
-                            "H.264 encode failed: {e}"
-                        );
-                    }
-                }
-            }
-        } else if self.encoder.is_some() {
-            // H.264 encoder exists — never send bitmaps, wait for GFX to become ready.
-            // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
-            return Ok(Some(DisplayUpdate::DefaultPointer));
-        }
-
-        // Bitmap path (only when GFX is not available at all)
-        // Requires BGRA raw bytes — PixelBuffer frames should not reach here
+        // Bitmap path: requires BGRA raw bytes — PixelBuffer frames should not reach here
         let bgra_bitmap = match &frame.data {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {

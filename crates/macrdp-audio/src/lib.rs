@@ -4,8 +4,13 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
-use ironrdp_rdpsnd::server::{RdpsndServerHandler, RdpsndServerMessage};
-use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
+use ironrdp_rdpsnd::server::{
+    NegotiatedFormat, RdpsndError, RdpsndServerHandler, RdpsndServerMessage,
+};
+use ironrdp_server::{
+    audio_playback_wanted, ConnectionHandler, ConnectionInfo, ServerEvent, ServerEventSender,
+    SoundServerFactory,
+};
 use macrdp_capture::AudioFrame;
 use tokio::sync::mpsc;
 
@@ -64,41 +69,23 @@ fn is_silent(wave_data: &[u8]) -> bool {
     wave_data.iter().all(|&b| b == 0)
 }
 
-/// Find best matching server format index given client's supported formats.
-pub fn find_matching_format(
-    server_formats: &[AudioFormat],
-    client_formats: &[AudioFormat],
-) -> Option<usize> {
-    for (idx, server_fmt) in server_formats.iter().enumerate().rev() {
-        for client_fmt in client_formats {
-            if server_fmt.format == client_fmt.format
-                && server_fmt.n_samples_per_sec == client_fmt.n_samples_per_sec
-                && server_fmt.n_channels == client_fmt.n_channels
-                && server_fmt.bits_per_sample == client_fmt.bits_per_sample
-            {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
 pub struct MacAudioHandler {
-    formats: Vec<AudioFormat>,
-    selected_format: Option<usize>,
+    /// The one format we offer: PCM S16LE at the configured rate and channel count.
+    format: AudioFormat,
+    started: bool,
 }
 
 impl fmt::Debug for MacAudioHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MacAudioHandler")
-            .field("selected_format", &self.selected_format)
+            .field("started", &self.started)
             .finish_non_exhaustive()
     }
 }
 
 impl MacAudioHandler {
     pub fn new(sample_rate: u32, channels: u16) -> Self {
-        let formats = vec![AudioFormat {
+        let format = AudioFormat {
             format: WaveFormat::PCM,
             n_channels: channels,
             n_samples_per_sec: sample_rate,
@@ -106,30 +93,41 @@ impl MacAudioHandler {
             n_block_align: channels * 2,
             bits_per_sample: 16,
             data: None,
-        }];
+        };
 
         Self {
-            formats,
-            selected_format: None,
+            format,
+            started: false,
         }
     }
 }
 
 impl RdpsndServerHandler for MacAudioHandler {
     fn get_formats(&self) -> &[AudioFormat] {
-        &self.formats
+        std::slice::from_ref(&self.format)
     }
 
-    fn start(&mut self, client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu) -> Option<u16> {
-        let idx = find_matching_format(&self.formats, &client_format.formats)?;
-        self.selected_format = Some(idx);
-        tracing::info!(format_idx = idx, "Audio started");
-        Some(idx as u16)
+    fn choose_format<'a>(
+        &mut self,
+        common: &'a [NegotiatedFormat],
+    ) -> Option<&'a NegotiatedFormat> {
+        // We offer one format; take it if the client has it.
+        common.iter().find(|f| *f.format() == self.format)
+    }
+
+    fn start(&mut self, _format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        self.started = true;
+        tracing::info!(
+            sample_rate = self.format.n_samples_per_sec,
+            channels = self.format.n_channels,
+            "Audio started"
+        );
+        Ok(())
     }
 
     fn stop(&mut self) {
         tracing::info!("Audio stopped");
-        self.selected_format = None;
+        self.started = false;
     }
 }
 
@@ -186,11 +184,31 @@ impl SoundServerFactory for MacAudioFactory {
 
         Box::new(MacAudioHandler::new(sample_rate, channels))
     }
+}
 
-    fn playback_disabled(&self) {
-        // Drop the sender: the display then starts capture without audio,
-        // and audio_loop ends when its receiver closes.
-        *self.shared_tx.lock().unwrap() = None;
+/// Stops audio capture for a client that does not want audio played on its side.
+///
+/// The server builds the rdpsnd backend (and so a fresh audio sender) for every
+/// connection, but does not start rdpsnd when the client set INFO_NOAUDIOPLAYBACK or
+/// INFO_REMOTECONSOLEAUDIO. The server calls `on_connection_info` before the display
+/// starts capture, so dropping the sender here makes the display capture without audio,
+/// and `audio_loop` ends when its receiver closes.
+pub struct AudioPlaybackGate {
+    shared_tx: SharedAudioTx,
+}
+
+impl AudioPlaybackGate {
+    pub fn new(shared_tx: SharedAudioTx) -> Self {
+        Self { shared_tx }
+    }
+}
+
+impl ConnectionHandler for AudioPlaybackGate {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        if !audio_playback_wanted(info.client_info_flags) {
+            tracing::info!("Client asked for no audio playback, audio capture off");
+            *self.shared_tx.lock().unwrap() = None;
+        }
     }
 }
 
@@ -203,17 +221,48 @@ impl ServerEventSender for MacAudioFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_core::encode_vec;
+    use ironrdp_pdu::gcc::KeyboardType;
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+    use ironrdp_rdpsnd::pdu::{
+        AudioFormatFlags, ClientAudioFormatPdu, ClientAudioOutputPdu, TrainingConfirmPdu, Version,
+    };
+    use ironrdp_rdpsnd::server::RdpsndServer;
+    use ironrdp_svc::SvcProcessor;
 
-    fn pcm_48k_stereo() -> AudioFormat {
+    fn pcm(n_channels: u16, n_samples_per_sec: u32) -> AudioFormat {
         AudioFormat {
             format: WaveFormat::PCM,
-            n_channels: 2,
-            n_samples_per_sec: 48000,
-            n_avg_bytes_per_sec: 192000,
-            n_block_align: 4,
+            n_channels,
+            n_samples_per_sec,
+            n_avg_bytes_per_sec: n_samples_per_sec * u32::from(n_channels) * 2,
+            n_block_align: n_channels * 2,
             bits_per_sample: 16,
             data: None,
         }
+    }
+
+    /// Run the rdpsnd negotiation against our handler with the given client formats,
+    /// and return the server (a wave can be sent only if a format was chosen).
+    fn negotiate(client_formats: Vec<AudioFormat>) -> RdpsndServer {
+        let mut server = RdpsndServer::new(Box::new(MacAudioHandler::new(48000, 2)));
+        server.start().unwrap();
+        let formats = ClientAudioOutputPdu::AudioFormat(ClientAudioFormatPdu {
+            version: Version::V5,
+            flags: AudioFormatFlags::ALIVE,
+            formats: client_formats,
+            volume_left: 0xFFFF,
+            volume_right: 0xFFFF,
+            pitch: 0,
+            dgram_port: 0,
+        });
+        server.process(&encode_vec(&formats).unwrap()).unwrap();
+        let confirm = ClientAudioOutputPdu::TrainingConfirm(TrainingConfirmPdu {
+            timestamp: 0,
+            pack_size: 0,
+        });
+        server.process(&encode_vec(&confirm).unwrap()).unwrap();
+        server
     }
 
     #[test]
@@ -223,26 +272,51 @@ mod tests {
     }
 
     #[test]
-    fn match_format_pcm_found() {
-        let server_formats = vec![pcm_48k_stereo()];
-        let client_formats = vec![pcm_48k_stereo()];
-        let result = find_matching_format(&server_formats, &client_formats);
-        assert_eq!(result, Some(0));
+    fn handler_offers_pcm_s16() {
+        let handler = MacAudioHandler::new(48000, 2);
+        assert_eq!(handler.get_formats(), &[pcm(2, 48000)]);
     }
 
     #[test]
-    fn match_format_no_match() {
-        let server_formats = vec![pcm_48k_stereo()];
-        let client_formats = vec![AudioFormat {
-            format: WaveFormat::PCM,
-            n_channels: 1,
-            n_samples_per_sec: 44100,
-            n_avg_bytes_per_sec: 88200,
-            n_block_align: 2,
-            bits_per_sample: 16,
-            data: None,
-        }];
-        let result = find_matching_format(&server_formats, &client_formats);
-        assert_eq!(result, None);
+    fn format_chosen_when_client_has_it() {
+        let mut server = negotiate(vec![pcm(1, 44100), pcm(2, 48000)]);
+        assert!(server.wave(vec![0; 16], 0).is_ok());
+    }
+
+    #[test]
+    fn no_format_when_client_lacks_it() {
+        let mut server = negotiate(vec![pcm(1, 44100)]);
+        assert!(server.wave(vec![0; 16], 0).is_err());
+    }
+
+    fn info_with(flags: ClientInfoFlags) -> ConnectionInfo {
+        let mut info = ConnectionInfo::new(0x409, KeyboardType::IBM_ENHANCED, String::new());
+        info.client_info_flags = flags;
+        info
+    }
+
+    #[test]
+    fn gate_drops_audio_sender_when_client_wants_no_playback() {
+        for flags in [
+            ClientInfoFlags::NO_AUDIO_PLAYBACK,
+            ClientInfoFlags::REMOTE_CONSOLE_AUDIO,
+        ] {
+            let shared = new_shared_audio_tx();
+            let (tx, _rx) = mpsc::channel(1);
+            *shared.lock().unwrap() = Some(tx);
+            AudioPlaybackGate::new(shared.clone()).on_connection_info(&info_with(flags));
+            assert!(shared.lock().unwrap().is_none(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn gate_keeps_audio_sender_when_client_wants_playback() {
+        let shared = new_shared_audio_tx();
+        let (tx, _rx) = mpsc::channel(1);
+        *shared.lock().unwrap() = Some(tx);
+        AudioPlaybackGate::new(shared.clone()).on_connection_info(&info_with(
+            ClientInfoFlags::MOUSE | ClientInfoFlags::UNICODE,
+        ));
+        assert!(shared.lock().unwrap().is_some());
     }
 }

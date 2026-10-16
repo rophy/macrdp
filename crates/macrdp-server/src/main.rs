@@ -10,9 +10,8 @@ use clap::Parser;
 use config::{Cli, ServerConfig};
 use display::MacDisplay;
 use handler::MacInputHandler;
-use ironrdp_server::{gfx::GfxState, Credentials, RdpServer, TlsIdentityCtx};
+use ironrdp_server::{ConnectionPolicy, Credentials, RdpServer, TlsIdentityCtx};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -174,9 +173,6 @@ async fn main() -> Result<()> {
         "Display resolution configured"
     );
 
-    // Create shared GFX state
-    let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
-
     // Create input handler with coordinate mapper
     let input_handler = MacInputHandler::new(coord_mapper.clone());
 
@@ -228,7 +224,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Create display with shared GFX state
+    // Create display
     let cursor_channel = config.cursor_channel.unwrap_or(true);
     let show_cursor = if cursor_channel {
         false // cursor removed from video frames when cursor channel is active
@@ -248,13 +244,23 @@ async fn main() -> Result<()> {
         mode_444,
         show_cursor,
         bitrate_override,
-        Arc::clone(&gfx_state),
         coord_mapper,
-        shared_audio_tx,
+        shared_audio_tx.clone(),
         perf_stats.clone(),
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
+
+    // When resolution follows the client, start each session at the size the
+    // client asks for (up to the physical display size).
+    let honor_client_size = (!fixed_resolution).then(|| display.max_size());
+
+    // Stop audio capture for clients that do not want audio played on their side.
+    let connection_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> = shared_audio_tx
+        .map(|tx| {
+            Box::new(macrdp_audio::AudioPlaybackGate::new(tx))
+                as Box<dyn ironrdp_server::ConnectionHandler>
+        });
 
     // Build RDP server with Hybrid security (NLA/CredSSP)
     // This enables Windows mstsc to prompt for credentials before connecting
@@ -265,16 +271,11 @@ async fn main() -> Result<()> {
         .with_display_handler(display)
         .with_sound_factory(sound_factory)
         .with_cliprdr_factory(cliprdr_factory)
+        .with_connection_handler(connection_handler)
+        // A new client that passes NLA takes over the running session.
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .with_honor_client_desktop_size(honor_client_size)
         .build();
-
-    // Share GFX state with the server
-    server.set_gfx_state(gfx_state);
-
-    // Multi-monitor support
-    if let Some(max) = config.max_monitors {
-        server.set_max_monitors(max);
-        tracing::info!(max_monitors = max, "Multi-monitor support configured");
-    }
 
     // Set credentials — required for RDP authentication
     let (username, password) = match (&config.username, &config.password) {

@@ -15,6 +15,6 @@ image = { version = "0.25", default-features = false, features = ["png", "tiff"]
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
-ironrdp-server = "0.10"
-ironrdp-cliprdr = "0.5"
-ironrdp-core = "0.1"
+ironrdp-server = "0.13"
+ironrdp-cliprdr = "0.7"
+ironrdp-core = "0.2"

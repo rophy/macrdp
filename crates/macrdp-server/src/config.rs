@@ -134,8 +134,6 @@ pub struct ServerConfig {
     /// Clipboard synchronization configuration
     #[serde(default)]
     pub clipboard: ClipboardConfig,
-    /// Maximum number of monitors to advertise (default: auto-detect)
-    pub max_monitors: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -162,7 +160,6 @@ impl Default for ServerConfig {
             idle_keyframe_sec: None,
             audio: AudioConfig::default(),
             clipboard: ClipboardConfig::default(),
-            max_monitors: None,
         }
     }
 }
@@ -293,6 +290,13 @@ mod tests {
         assert_eq!(config.frame_rate, 120);
         assert_eq!(config.username.as_deref(), Some("admin"));
         assert_eq!(config.password.as_ref().map(Secret::expose), Some("secret"));
+    }
+
+    #[test]
+    fn test_removed_max_monitors_key_still_parses() {
+        // max_monitors was removed; old config files that still set it must load.
+        let config: ServerConfig = toml::from_str("port = 13389\nmax_monitors = 2\n").unwrap();
+        assert_eq!(config.port, 13389);
     }
 
     #[test]

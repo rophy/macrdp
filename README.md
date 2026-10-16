@@ -1,7 +1,7 @@
 # macrdp
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.94%2B-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
 
 An RDP server for macOS. Connect to a Mac from Windows (mstsc), Linux (FreeRDP) or any
@@ -67,7 +67,7 @@ Clients without H.264 GFX support (bitmap-only clients) are not supported.
 ## Requirements
 
 - macOS 14 (Sonoma) or later. Apple Silicon is tested.
-- To build from source: Rust 1.89 or later, and Xcode or the Command Line Tools.
+- To build from source: Rust 1.94 or later, and Xcode or the Command Line Tools.
 - Permissions for the `macrdp-server` binary (System Settings → Privacy & Security):
   - **Screen Recording** — capture
   - **Accessibility** — keyboard and mouse injection
@@ -148,7 +148,6 @@ macrdp uses the first `config.toml` it finds in:
 | `bitrate_mbps` | auto | Bitrate ceiling |
 | `cursor_channel` | `true` | Send the cursor as pointer updates instead of in the video |
 | `show_cursor` | auto | Draw the cursor in the video (default: only when `cursor_channel` is off) |
-| `max_monitors` | auto | Number of monitors to advertise |
 | `cert_path`, `key_path` | auto | TLS certificate and key (PEM); generated if not set |
 | `idle_timeout_secs` | `1800` | Disconnect after this many seconds without input |
 | `log_level` | `info` | Log level |
