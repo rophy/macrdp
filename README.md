@@ -201,9 +201,11 @@ cargo test --workspace
 
 `MACRDP_USER=… MACRDP_PASS=… tests/e2e_test.sh <host> [port]` runs a smoke test with
 FreeRDP 3 (with H.264) from a Linux machine: login, session takeover, bitmap, AVC420,
-AVC444, no-audio and dynamic-resolution sessions. `XFREERDP` selects the client binary;
-set `MACRDP_AVC444=1` when the server runs with `chroma_mode = "avc444"`, and `MACRDP_LOG`
-to the server log if the script can read it.
+no-audio and dynamic-resolution sessions. `XFREERDP` selects the client binary. Optional:
+`MACRDP_AVC444=1` (server runs with `chroma_mode = "avc444"`) adds an AVC444 test,
+`MACRDP_LOG` (server log readable by the script) checks the no-audio log line, and
+`MACRDP_MAC_SHELL` (a command that runs a script on the Mac, e.g. `ssh user@mac sh`) adds a
+clipboard file copy test. The script header has the details.
 `tests/bench` has the benchmark (see its README).
 
 ---
