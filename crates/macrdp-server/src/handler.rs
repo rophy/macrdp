@@ -191,7 +191,7 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        let Some(kb) = &self.keyboard else { return };
+        let Some(kb) = &mut self.keyboard else { return };
 
         let result = match event {
             KeyboardEvent::Pressed { code, extended } => kb.inject_key(code, extended, true),
@@ -211,6 +211,8 @@ impl RdpServerInputHandler for MacInputHandler {
 
     fn mouse(&mut self, event: MouseEvent) {
         let Some(m) = &self.mouse else { return };
+        // Mouse events carry the client's modifiers (Shift+click, Cmd+click), not the HID state.
+        let flags = self.keyboard.as_ref().map_or(0, |k| k.modifier_flags());
 
         let result = match event {
             MouseEvent::Move { x, y } => {
@@ -218,7 +220,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
                 self.coord_mapper.note_client_move((mx, my));
-                m.move_to(mx, my)
+                m.move_to(mx, my, flags)
             }
             MouseEvent::Button {
                 x,
@@ -240,9 +242,9 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
                 self.coord_mapper.note_client_move((mx, my));
-                m.button_event(button, pressed, mx, my)
+                m.button_event(button, pressed, mx, my, flags)
             }
-            MouseEvent::VerticalScroll { value } => m.scroll(value),
+            MouseEvent::VerticalScroll { value } => m.scroll(value, flags),
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");
                 Ok(())

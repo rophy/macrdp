@@ -4,6 +4,8 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
 
+use crate::keyboard::set_event_flags;
+
 extern "C" {
     fn CGEventCreateScrollWheelEvent2(
         source: *mut core_graphics::sys::CGEventSource,
@@ -33,19 +35,28 @@ impl MouseInjector {
             .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
     }
 
-    pub fn move_to(&self, x: u16, y: u16) -> Result<()> {
+    /// `flags`: the client's held modifiers (`KeyboardInjector::modifier_flags`).
+    pub fn move_to(&self, x: u16, y: u16, flags: u64) -> Result<()> {
         let point = CGPoint::new(x as f64, y as f64);
         let source = Self::source()?;
         let event =
             CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
                 .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
+        set_event_flags(&event, flags);
 
         event.post(CGEventTapLocation::HID);
         tracing::trace!(x, y, "Mouse moved");
         Ok(())
     }
 
-    pub fn button_event(&self, button: MouseButton, pressed: bool, x: u16, y: u16) -> Result<()> {
+    pub fn button_event(
+        &self,
+        button: MouseButton,
+        pressed: bool,
+        x: u16,
+        y: u16,
+        flags: u64,
+    ) -> Result<()> {
         let point = CGPoint::new(x as f64, y as f64);
         let (event_type, cg_button) = match (button, pressed) {
             (MouseButton::Left, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
@@ -59,13 +70,14 @@ impl MouseInjector {
         let source = Self::source()?;
         let event = CGEvent::new_mouse_event(source, event_type, point, cg_button)
             .map_err(|_| anyhow::anyhow!("Failed to create mouse button event"))?;
+        set_event_flags(&event, flags);
 
         event.post(CGEventTapLocation::HID);
         tracing::trace!(?button, pressed, x, y, "Mouse button event");
         Ok(())
     }
 
-    pub fn scroll(&self, vertical: i16) -> Result<()> {
+    pub fn scroll(&self, vertical: i16, flags: u64) -> Result<()> {
         unsafe {
             let event_ref = CGEventCreateScrollWheelEvent2(
                 std::ptr::null_mut(),
@@ -79,6 +91,7 @@ impl MouseInjector {
                 return Err(anyhow::anyhow!("Failed to create scroll event"));
             }
             let event = CGEvent::from_ptr(event_ref);
+            set_event_flags(&event, flags);
             event.post(CGEventTapLocation::HID);
         }
         tracing::trace!(vertical, "Mouse scroll");

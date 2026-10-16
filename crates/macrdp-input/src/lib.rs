@@ -1,5 +1,6 @@
 //! Keyboard and mouse input injection via CGEvent
 
+pub mod flags;
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
