@@ -2,7 +2,18 @@ use ironrdp_server::{
     KeyboardEvent, MouseButton as RdpMouseButton, MouseEvent, RdpServerInputHandler,
 };
 use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How many recent client-caused cursor positions are kept to recognise an echo.
+/// The cursor tick (16 ms) reads the position after some of the client's moves
+/// were posted, so it can see any of the last few, not only the newest one.
+const RECENT_CLIENT_MOVES: usize = 32;
+
+/// An older client move counts as the cause of the cursor position only this
+/// long. Later, the same position comes from a local move and must be sent.
+const CLIENT_MOVE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Maps RDP desktop coordinates to macOS logical coordinates.
 ///
@@ -20,6 +31,8 @@ struct CoordState {
     logical_h: f64,
     rdp_w: f64,
     rdp_h: f64,
+    /// Mac positions the client's own input moved the cursor to (newest last)
+    recent_client_moves: VecDeque<((u16, u16), Instant)>,
 }
 
 impl MouseCoordMapper {
@@ -36,6 +49,7 @@ impl MouseCoordMapper {
             logical_h: logical_h as f64,
             rdp_w: rdp_w.max(1) as f64,
             rdp_h: rdp_h.max(1) as f64,
+            recent_client_moves: VecDeque::with_capacity(RECENT_CLIENT_MOVES),
         })))
     }
 
@@ -44,6 +58,49 @@ impl MouseCoordMapper {
         let mac_x = (rdp_x as f64 * s.logical_w / s.rdp_w) as u16;
         let mac_y = (rdp_y as f64 * s.logical_h / s.rdp_h) as u16;
         (mac_x, mac_y)
+    }
+
+    /// Remember that client input moved the Mac cursor to `mac`.
+    pub fn note_client_move(&self, mac: (u16, u16)) {
+        self.note_client_move_at(mac, Instant::now());
+    }
+
+    fn note_client_move_at(&self, mac: (u16, u16), now: Instant) {
+        let mut s = self.0.lock().unwrap();
+        if let Some(last) = s.recent_client_moves.back_mut() {
+            if last.0 == mac {
+                last.1 = now;
+                return;
+            }
+        }
+        if s.recent_client_moves.len() == RECENT_CLIENT_MOVES {
+            s.recent_client_moves.pop_front();
+        }
+        s.recent_client_moves.push_back((mac, now));
+    }
+
+    /// Whether the Mac cursor at `mac` was put there by recent client input.
+    ///
+    /// The server must not send such a position back as a PointerPosition:
+    /// the client already shows its cursor there, and when the client scales
+    /// the picture (mstsc smart sizing) it moves its cursor to the rounded
+    /// position and sends that as a new move. The cursor then creeps until the
+    /// round trip is exact (up to ~47 px seen with mstsc).
+    ///
+    /// The newest client position always counts (the client shows its cursor
+    /// there). An older one counts only within [`CLIENT_MOVE_WINDOW`], so a local
+    /// move to a place the client visited before is still sent.
+    pub fn is_client_move(&self, mac: (u16, u16)) -> bool {
+        self.is_client_move_at(mac, Instant::now())
+    }
+
+    fn is_client_move_at(&self, mac: (u16, u16), now: Instant) -> bool {
+        let s = self.0.lock().unwrap();
+        let mut moves = s.recent_client_moves.iter().rev();
+        if moves.next().is_some_and(|(pos, _)| *pos == mac) {
+            return true;
+        }
+        moves.any(|(pos, at)| *pos == mac && now.duration_since(*at) <= CLIENT_MOVE_WINDOW)
     }
 
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
@@ -124,6 +181,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
+                self.coord_mapper.note_client_move((mx, my));
                 m.move_to(mx, my)
             }
             MouseEvent::Button {
@@ -145,6 +203,7 @@ impl RdpServerInputHandler for MacInputHandler {
                 let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
+                self.coord_mapper.note_client_move((mx, my));
                 m.button_event(button, pressed, mx, my)
             }
             MouseEvent::VerticalScroll { value } => m.scroll(value),
@@ -157,5 +216,46 @@ impl RdpServerInputHandler for MacInputHandler {
         if let Err(e) = result {
             tracing::warn!("Mouse injection failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_moves_are_recognised_as_echo() {
+        let m = MouseCoordMapper::new(1280, 720, 1280, 720);
+        m.note_client_move((625, 190));
+        m.note_client_move((626, 191));
+        assert!(m.is_client_move((625, 190)));
+        assert!(m.is_client_move((626, 191)));
+        // A position the client never caused (local user, app warp) is not an echo.
+        assert!(!m.is_client_move((625, 188)));
+    }
+
+    #[test]
+    fn an_old_client_position_is_not_an_echo() {
+        let m = MouseCoordMapper::new(1280, 720, 1280, 720);
+        let t0 = Instant::now();
+        m.note_client_move_at((640, 360), t0);
+        m.note_client_move_at((102, 458), t0 + Duration::from_millis(10));
+        // The tick may still see the older position shortly after.
+        assert!(m.is_client_move_at((640, 360), t0 + Duration::from_millis(100)));
+        // Seconds later a local move back to (640, 360) must reach the client.
+        assert!(!m.is_client_move_at((640, 360), t0 + Duration::from_secs(5)));
+        // The newest client position never expires.
+        assert!(m.is_client_move_at((102, 458), t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn only_recent_client_moves_are_kept() {
+        let m = MouseCoordMapper::new(1280, 720, 1280, 720);
+        for i in 0..=RECENT_CLIENT_MOVES as u16 {
+            m.note_client_move((i, 0));
+        }
+        assert!(!m.is_client_move((0, 0)));
+        assert!(m.is_client_move((1, 0)));
+        assert!(m.is_client_move((RECENT_CLIENT_MOVES as u16, 0)));
     }
 }

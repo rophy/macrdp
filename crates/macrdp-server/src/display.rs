@@ -541,6 +541,7 @@ impl RdpServerDisplay for MacDisplay {
             cursor_interval,
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
+            coord_mapper: self.coord_mapper.clone(),
             encoder,
             encoder_cache: Arc::clone(&self.encoder_cache),
             gfx: Arc::clone(&self.gfx),
@@ -588,6 +589,8 @@ struct MacDisplayUpdates {
     last_cursor_pos: (u16, u16),
     /// Whether the initial DefaultPointer has been sent
     cursor_initialized: bool,
+    /// Mouse mapping and the client's recent cursor moves
+    coord_mapper: MouseCoordMapper,
     encoder: Option<Box<dyn VideoEncoder>>,
     /// Shared slot to return the encoder on drop for reuse across connections
     encoder_cache: EncoderSlot,
@@ -701,6 +704,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     let (x, y) = get_cursor_position();
                     if (x, y) != self.last_cursor_pos {
                         self.last_cursor_pos = (x, y);
+                        // Only moves the client did not cause: an echo makes a
+                        // scaling client move its cursor again (see is_client_move).
+                        if self.coord_mapper.is_client_move((x, y)) {
+                            continue;
+                        }
                         return Ok(Some(DisplayUpdate::PointerPosition(
                             PointerPositionAttribute { x, y },
                         )));
