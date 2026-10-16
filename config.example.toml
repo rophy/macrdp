@@ -78,6 +78,11 @@ encoder = "hardware"
 # Default: true (AVC420 only)
 # lossless_text = true
 
+# Keyboard for Windows users: the client's Ctrl is Command, Alt is Option and
+# Win is Control, so Ctrl+C / Ctrl+V copy and paste. Default (false): Ctrl is
+# Control, Alt is Command, Win is Option (by key position).
+# ctrl_as_cmd = false
+
 # ─── TLS ───────────────────────────────────────────────────────────────────────
 
 # Path to TLS certificate file (PEM format)

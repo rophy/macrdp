@@ -173,8 +173,9 @@ pub struct MacInputHandler {
 }
 
 impl MacInputHandler {
-    pub fn new(coord_mapper: MouseCoordMapper) -> Self {
-        let keyboard = KeyboardInjector::new()
+    /// `ctrl_as_cmd`: post the client's Ctrl as Command (config `ctrl_as_cmd`).
+    pub fn new(coord_mapper: MouseCoordMapper, ctrl_as_cmd: bool) -> Self {
+        let keyboard = KeyboardInjector::new(ctrl_as_cmd)
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
         let mouse = MouseInjector::new()

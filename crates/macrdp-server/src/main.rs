@@ -178,7 +178,8 @@ async fn main() -> Result<()> {
     );
 
     // Create input handler with coordinate mapper
-    let input_handler = MacInputHandler::new(coord_mapper.clone());
+    let input_handler =
+        MacInputHandler::new(coord_mapper.clone(), config.ctrl_as_cmd.unwrap_or(false));
 
     // Audio setup — shared sender slot, recreated per connection by AudioFactory
     let shared_audio_tx = if config.audio.enabled {

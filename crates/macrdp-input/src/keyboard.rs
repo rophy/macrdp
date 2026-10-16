@@ -3,11 +3,15 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode}
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 use crate::flags::{merge, ModifierState};
-use crate::keymap::{keypad_navigation_keycode, scancode_to_keycode, SCANCODE_NUM_LOCK};
+use crate::keymap::{
+    ctrl_as_cmd_keycode, keypad_navigation_keycode, scancode_to_keycode, SCANCODE_NUM_LOCK,
+};
 
 pub struct KeyboardInjector {
     state: ModifierState,
     unicode: UnicodeJoiner,
+    /// Ctrl -> Command, Alt -> Option, Win -> Control (see `ctrl_as_cmd_keycode`)
+    ctrl_as_cmd: bool,
 }
 
 /// What to post for an RDP Unicode keyboard event.
@@ -73,14 +77,21 @@ pub(crate) fn set_event_flags(event: &CGEvent, ours: u64) {
 }
 
 impl KeyboardInjector {
-    pub fn new() -> Result<Self> {
+    /// `ctrl_as_cmd`: post the client's Ctrl as Command (Windows shortcuts).
+    pub fn new(ctrl_as_cmd: bool) -> Result<Self> {
         // Verify we can create an event source (permission check)
         let _ = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
             anyhow::anyhow!("Failed to create CGEventSource — check Accessibility permission")
         })?;
+        let state = if ctrl_as_cmd {
+            ModifierState::new().ctrl_as_cmd()
+        } else {
+            ModifierState::new()
+        };
         Ok(Self {
-            state: ModifierState::new(),
+            state,
             unicode: UnicodeJoiner::default(),
+            ctrl_as_cmd,
         })
     }
 
@@ -121,6 +132,7 @@ impl KeyboardInjector {
             None
         };
         let keycode = match keypad_nav.or_else(|| scancode_to_keycode(scancode, extended)) {
+            Some(kc) if self.ctrl_as_cmd => ctrl_as_cmd_keycode(kc),
             Some(kc) => kc,
             None => {
                 tracing::warn!(scancode, extended, "Unknown scancode, ignoring");

@@ -115,6 +115,10 @@ pub struct ServerConfig {
     /// Costs some CPU (BGRA capture) and a burst of data after each change.
     /// AVC420 only.
     pub lossless_text: Option<bool>,
+    /// Keyboard for Windows users (default: false): Ctrl -> Command,
+    /// Alt -> Option, Win -> Control, so Ctrl+C / Ctrl+V copy and paste.
+    /// Default mapping: Ctrl -> Control, Alt -> Command, Win -> Option.
+    pub ctrl_as_cmd: Option<bool>,
     /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")
     #[serde(alias = "hidpi_scale")]
     pub resolution: Option<String>,
@@ -156,6 +160,7 @@ impl Default for ServerConfig {
             encoder: None,
             chroma_mode: None,
             lossless_text: None,
+            ctrl_as_cmd: None,
             resolution: None,
             show_cursor: None,
             cursor_channel: None,

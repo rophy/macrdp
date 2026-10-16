@@ -29,6 +29,22 @@ pub fn keypad_navigation_keycode(scancode: u8) -> Option<u16> {
     })
 }
 
+/// Modifier layout for a Windows user (config `ctrl_as_cmd`): Ctrl -> Command,
+/// Alt -> Option, Win -> Control, so that Ctrl+C / Ctrl+V copy and paste.
+/// Takes the keycode of the default mapping (Ctrl -> Control, Alt -> Command,
+/// Win -> Option) and returns the keycode to post.
+pub fn ctrl_as_cmd_keycode(keycode: u16) -> u16 {
+    match keycode {
+        0x3B => 0x37, // Left Ctrl: Control -> Command
+        0x3E => 0x36, // Right Ctrl: Right Control -> Right Command
+        0x37 => 0x3A, // Left Alt: Command -> Option
+        0x36 => 0x3D, // Right Alt: Right Command -> Right Option
+        0x3A => 0x3B, // Left Win: Option -> Control
+        0x3D => 0x3E, // Right Win: Right Option -> Right Control
+        other => other,
+    }
+}
+
 /// RDP scancode of Num Lock (non-extended)
 pub const SCANCODE_NUM_LOCK: u8 = 0x45;
 
@@ -210,6 +226,18 @@ mod tests {
     #[test]
     fn test_menu_key() {
         assert_eq!(scancode_to_keycode(0x5D, true), Some(0x6E));
+    }
+
+    #[test]
+    fn ctrl_as_cmd_swaps_the_modifiers() {
+        let map = |sc, ext| ctrl_as_cmd_keycode(scancode_to_keycode(sc, ext).unwrap());
+        assert_eq!(map(0x1D, false), 0x37); // Left Ctrl -> Left Command
+        assert_eq!(map(0x1D, true), 0x36); // Right Ctrl -> Right Command
+        assert_eq!(map(0x38, false), 0x3A); // Left Alt -> Left Option
+        assert_eq!(map(0x38, true), 0x3D); // Right Alt -> Right Option
+        assert_eq!(map(0x5B, true), 0x3B); // Left Win -> Left Control
+        assert_eq!(map(0x5C, true), 0x3E); // Right Win -> Right Control
+        assert_eq!(map(0x2E, false), 0x08); // C stays C
     }
 
     #[test]

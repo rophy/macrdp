@@ -72,6 +72,8 @@ const MODIFIER_KEYS: [(u16, u64, u64); 8] = [
 
 /// Index of Left Control in `MODIFIER_KEYS`.
 const LEFT_CONTROL: usize = 2;
+/// Index of Left Command in `MODIFIER_KEYS`.
+const LEFT_COMMAND: usize = 6;
 
 /// Flags that a key gets by itself (no modifier held). The table is what
 /// `CGEventCreateKeyboardEvent` sets for keycodes 0-127 from a clean state
@@ -112,6 +114,8 @@ pub struct ModifierState {
     num_lock: bool,
     /// The scancode 0x45 that is down is the Pause key
     pause_down: bool,
+    /// Index in `MODIFIER_KEYS` of the key the client's Left Ctrl is posted as
+    left_ctrl: usize,
 }
 
 impl Default for ModifierState {
@@ -122,6 +126,7 @@ impl Default for ModifierState {
             caps_lock: false,
             num_lock: true,
             pause_down: false,
+            left_ctrl: LEFT_CONTROL,
         }
     }
 }
@@ -129,6 +134,12 @@ impl Default for ModifierState {
 impl ModifierState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The client's Left Ctrl is posted as Left Command (`ctrl_as_cmd`).
+    pub fn ctrl_as_cmd(mut self) -> Self {
+        self.left_ctrl = LEFT_COMMAND;
+        self
     }
 
     /// Record a key press or release (macOS keycode). Caps Lock toggles on press.
@@ -178,7 +189,7 @@ impl ModifierState {
         if !pressed {
             return !std::mem::take(&mut self.pause_down);
         }
-        if self.down & (1 << LEFT_CONTROL) != 0 {
+        if self.down & (1 << self.left_ctrl) != 0 {
             self.pause_down = true;
             return false;
         }
@@ -326,6 +337,17 @@ mod tests {
         // The next Num Lock press is Num Lock again.
         assert!(s.num_lock_scancode(true));
         assert!(!s.num_lock());
+    }
+
+    #[test]
+    fn pause_with_ctrl_as_cmd() {
+        // Left Ctrl is posted as Left Command: Pause is still seen.
+        let mut s = ModifierState::new().ctrl_as_cmd();
+        s.key(0x37, true);
+        assert!(!s.num_lock_scancode(true));
+        s.key(0x37, false);
+        assert!(!s.num_lock_scancode(false));
+        assert!(s.num_lock());
     }
 
     #[test]
