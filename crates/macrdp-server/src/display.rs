@@ -607,6 +607,10 @@ impl PendingResize {
         self.0.lock().unwrap().take()
     }
 
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+
     /// Drop a resize left over from an earlier connection: a new connection starts
     /// at the current size. Call once per connection, before its display starts.
     pub fn clear(&self) {
@@ -864,6 +868,7 @@ impl RdpServerDisplay for MacDisplay {
             gfx: Arc::clone(&self.gfx),
             surface_frames: 0,
             held_frame: None,
+            resize_wait: None,
             retry_at: tokio::time::Instant::now(),
             last_send_failed: false,
             // A new or reused encoder starts with a keyframe.
@@ -926,6 +931,8 @@ struct MacDisplayUpdates {
     gfx: SharedGfx,
     /// Newest frame not sent yet; tried again after one frame interval
     held_frame: Option<CapturedFrame>,
+    /// A resize waits for the EGFX frames in flight since this time
+    resize_wait: Option<tokio::time::Instant>,
     /// When to try the held frame again
     retry_at: tokio::time::Instant,
     /// H.264 frames sent on the current surface
@@ -992,6 +999,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     /// does not end the call (returning `Ok(None)` disconnects the client).
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         loop {
+            if self.pending_resize.is_set() && self.wait_for_frames_before_resize() {
+                tokio::time::sleep(RESIZE_DRAIN_POLL).await;
+                continue;
+            }
             if let Some((w, h)) = self.pending_resize.take() {
                 // The client gets a new pointer cache with the new size: send the shape again.
                 self.pointer_cache.clear();
@@ -1120,7 +1131,35 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     }
 }
 
+/// A resize waits at most this long for the EGFX frames in flight ...
+const RESIZE_DRAIN_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+/// ... and checks this often.
+const RESIZE_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(4);
+
 impl MacDisplayUpdates {
+    /// Before a resize, no EGFX frame may be in flight: the resize changes the
+    /// client's desktop size at once, and FreeRDP cannot draw a frame of the
+    /// old, larger surface into the smaller desktop (without cairo it fails
+    /// the EndFrame and closes the graphics channel; the picture stops). So
+    /// send no more frames and wait until the client acknowledged all of them
+    /// (at most `RESIZE_DRAIN_MAX`). Returns true while it must wait.
+    fn wait_for_frames_before_resize(&mut self) -> bool {
+        self.flush_refine_job();
+        let now = tokio::time::Instant::now();
+        let since = *self.resize_wait.get_or_insert(now);
+        let in_flight = gfx::frames_in_flight(&self.gfx);
+        if in_flight > 0 && now.duration_since(since) < RESIZE_DRAIN_MAX {
+            return true;
+        }
+        tracing::debug!(
+            in_flight,
+            waited_ms = now.duration_since(since).as_millis(),
+            "Resize after the frames in flight"
+        );
+        self.resize_wait = None;
+        false
+    }
+
     /// Ask the encoder for a keyframe (see `keyframe_due`).
     fn request_keyframe(&mut self) {
         if let Some(encoder) = &mut self.encoder {
