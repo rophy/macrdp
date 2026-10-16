@@ -73,10 +73,15 @@ const MODIFIER_KEYS: [(u16, u64, u64); 8] = [
 /// Index of Left Control in `MODIFIER_KEYS`.
 const LEFT_CONTROL: usize = 2;
 
-/// Flags that macOS gives a key by itself (no modifier held). The table is
-/// what `CGEventCreateKeyboardEvent` sets for keycodes 0-127 from a clean
-/// state (macOS 15): arrows get numpad+fn, the navigation and function keys
-/// and keypad Clear get fn, Help gets help+fn, other keypad keys get numpad.
+/// Flags that a key gets by itself (no modifier held). The table is what
+/// `CGEventCreateKeyboardEvent` sets for keycodes 0-127 from a clean state
+/// (macOS 15): arrows get numpad+fn, the navigation keys and keypad Clear get
+/// fn, Help gets help+fn, other keypad keys get numpad.
+///
+/// Exception: F1-F20 get no fn flag, although macOS gives them one. The
+/// system shortcuts on F-keys are defined with fn (Show Desktop is fn+F11),
+/// so an F-key with fn goes to the system and not to the app. A remote user
+/// expects the F-key in the app, as on Windows.
 pub fn intrinsic_flags(keycode: u16) -> u64 {
     match keycode {
         // arrows
@@ -85,9 +90,6 @@ pub fn intrinsic_flags(keycode: u16) -> u64 {
         0x72 => HELP | SECONDARY_FN,
         // Home, PgUp, Fwd Delete, End, PgDn
         0x73 | 0x74 | 0x75 | 0x77 | 0x79 => SECONDARY_FN,
-        // F1-F20
-        0x7A | 0x78 | 0x63 | 0x76 | 0x60 | 0x61 | 0x62 | 0x64 | 0x65 | 0x6D | 0x67 | 0x6F
-        | 0x69 | 0x6B | 0x71 | 0x6A | 0x40 | 0x4F | 0x50 | 0x5A => SECONDARY_FN,
         // fn, keypad Clear
         0x3F | 0x47 => SECONDARY_FN,
         // keypad . * + / Enter - = 0-9
@@ -223,11 +225,20 @@ mod tests {
         let s = ModifierState::new();
         assert_eq!(s.key_flags(0x73), SECONDARY_FN); // Home
         assert_eq!(s.key_flags(0x75), SECONDARY_FN); // Fwd Delete
-        assert_eq!(s.key_flags(0x7A), SECONDARY_FN); // F1
-        assert_eq!(s.key_flags(0x6F), SECONDARY_FN); // F12
         assert_eq!(s.key_flags(0x72), HELP | SECONDARY_FN); // Help
         assert_eq!(s.key_flags(0x53), NUMERIC_PAD); // keypad 1
         assert_eq!(s.key_flags(0x4C), NUMERIC_PAD); // keypad Enter
+    }
+
+    #[test]
+    fn function_keys_have_no_fn_flag() {
+        // fn+F11 is Show Desktop; the app must get F1-F20 as plain keys.
+        let mut s = ModifierState::new();
+        for kc in [0x7A, 0x60, 0x67, 0x6F, 0x69, 0x5A] {
+            assert_eq!(s.key_flags(kc), 0, "keycode {kc:#x}");
+        }
+        s.key(0x3B, true); // Control
+        assert_eq!(s.key_flags(0x78), CONTROL | DEV_LCTL); // Ctrl+F2
     }
 
     #[test]
