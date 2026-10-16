@@ -1,7 +1,7 @@
 use ironrdp_server::{
     KeyboardEvent, MouseButton as RdpMouseButton, MouseEvent, RdpServerInputHandler,
 };
-use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector};
+use macrdp_input::{KeyboardInjector, MouseButton, MouseInjector, ScrollAxis};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -210,7 +210,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        let Some(m) = &self.mouse else { return };
+        let Some(m) = &mut self.mouse else { return };
         // Mouse events carry the client's modifiers (Shift+click, Cmd+click), not the HID state.
         let flags = self.keyboard.as_ref().map_or(0, |k| k.modifier_flags());
 
@@ -244,7 +244,10 @@ impl RdpServerInputHandler for MacInputHandler {
                 self.coord_mapper.note_client_move((mx, my));
                 m.button_event(button, pressed, mx, my, flags)
             }
-            MouseEvent::VerticalScroll { value } => m.scroll(value, flags),
+            MouseEvent::VerticalScroll { value } => m.scroll(ScrollAxis::Vertical, value, flags),
+            MouseEvent::HorizontalScroll { value } => {
+                m.scroll(ScrollAxis::Horizontal, value, flags)
+            }
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");
                 Ok(())
