@@ -283,7 +283,7 @@ pub struct MacDisplay {
     show_cursor: bool,
     base_bitrate: u32,
     /// New desktop size from a Display Control layout, sent as a Resize update
-    pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
+    pending_resize: PendingResize,
     /// Shared audio sender slot — updated per connection by AudioFactory
     shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
@@ -298,6 +298,30 @@ pub struct MacDisplay {
     last_keyframe: KeyframeSlot,
     /// Set by the server while the client sends SuppressOutput (e.g. minimised)
     display_suppressed: Arc<AtomicBool>,
+}
+
+/// Desktop size from a Display Control layout that the client has not been sent yet
+/// (sent as a Resize update). Shared by the display, its update loop and the
+/// connection handler.
+#[derive(Clone, Default)]
+pub struct PendingResize(Arc<Mutex<Option<(u16, u16)>>>);
+
+impl PendingResize {
+    pub(crate) fn set(&self, width: u16, height: u16) {
+        *self.0.lock().unwrap() = Some((width, height));
+    }
+
+    pub(crate) fn take(&self) -> Option<(u16, u16)> {
+        self.0.lock().unwrap().take()
+    }
+
+    /// Drop a resize left over from an earlier connection: a new connection starts
+    /// at the current size. Call once per connection, before its display starts.
+    pub fn clear(&self) {
+        if let Some((w, h)) = self.take() {
+            tracing::debug!(w, h, "Dropping resize of the previous connection");
+        }
+    }
 }
 
 impl MacDisplay {
@@ -348,7 +372,7 @@ impl MacDisplay {
             mode_444,
             show_cursor,
             base_bitrate,
-            pending_resize: Arc::new(Mutex::new(None)),
+            pending_resize: PendingResize::default(),
             shared_audio_tx,
             perf_stats,
             gfx,
@@ -357,6 +381,11 @@ impl MacDisplay {
             last_keyframe: Arc::new(Mutex::new(None)),
             display_suppressed,
         }
+    }
+
+    /// The resize slot, for clearing it when a new connection starts.
+    pub fn pending_resize(&self) -> PendingResize {
+        self.pending_resize.clone()
     }
 
     /// The largest desktop a client may ask for.
@@ -457,13 +486,14 @@ impl RdpServerDisplay for MacDisplay {
             return;
         }
         self.resize_to(w, h);
-        *self.pending_resize.lock().unwrap() = Some((self.width, self.height));
+        self.pending_resize.set(self.width, self.height);
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        // A resize left over from an earlier connection does not apply to this one:
-        // capture starts at the current size.
-        self.pending_resize.lock().unwrap().take();
+        // Do not clear pending_resize here: within a connection, a layout can arrive
+        // after the previous loop returned Resize and before this call (the server
+        // handles layouts on another thread). It is cleared once per connection
+        // (PendingResize::clear from the connection handler).
         let encoder = self.take_or_create_encoder();
         if encoder.is_some() {
             tracing::info!("H.264 encoder available — will use GFX path when client supports it");
@@ -505,7 +535,7 @@ impl RdpServerDisplay for MacDisplay {
             capturer,
             capture_config,
             shared_audio_tx: self.shared_audio_tx.clone(),
-            pending_resize: Arc::clone(&self.pending_resize),
+            pending_resize: self.pending_resize.clone(),
             low_activity_frames: 0,
             current_fps: self.frame_rate,
             cursor_interval,
@@ -547,7 +577,7 @@ struct MacDisplayUpdates {
     /// Audio sender slot, to restart capture with audio
     shared_audio_tx: Option<SharedAudioTx>,
     /// New desktop size from a Display Control layout, sent as a Resize update
-    pending_resize: Arc<Mutex<Option<(u16, u16)>>>,
+    pending_resize: PendingResize,
     /// Consecutive frames with tiny dirty area (activity-based FPS reduction).
     low_activity_frames: u32,
     /// Current capture FPS (to avoid redundant set_frame_rate calls).
@@ -621,7 +651,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     /// does not end the call (returning `Ok(None)` disconnects the client).
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         loop {
-            if let Some((w, h)) = self.pending_resize.lock().unwrap().take() {
+            if let Some((w, h)) = self.pending_resize.take() {
                 return Ok(Some(DisplayUpdate::Resize(DesktopSize {
                     width: w,
                     height: h,

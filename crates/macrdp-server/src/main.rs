@@ -11,7 +11,7 @@ use clap::Parser;
 use config::{Cli, ServerConfig};
 use display::MacDisplay;
 use handler::MacInputHandler;
-use ironrdp_server::{ConnectionPolicy, Credentials, RdpServer, TlsIdentityCtx};
+use ironrdp_server::{ConnectionHandler, ConnectionPolicy, Credentials, RdpServer, TlsIdentityCtx};
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -262,12 +262,11 @@ async fn main() -> Result<()> {
     // client asks for (up to the physical display size).
     let honor_client_size = (!fixed_resolution).then(|| display.max_size());
 
-    // Stop audio capture for clients that do not want audio played on their side.
-    let connection_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> = shared_audio_tx
-        .map(|tx| {
-            Box::new(macrdp_audio::AudioPlaybackGate::new(tx))
-                as Box<dyn ironrdp_server::ConnectionHandler>
-        });
+    let connection_handler: Option<Box<dyn ironrdp_server::ConnectionHandler>> =
+        Some(Box::new(MacConnectionHandler {
+            pending_resize: display.pending_resize(),
+            audio_gate: shared_audio_tx.map(macrdp_audio::AudioPlaybackGate::new),
+        }));
 
     let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> = Some(Box::new(
         gfx::MacGfxFactory::new(std::sync::Arc::clone(&gfx_shared)),
@@ -396,9 +395,49 @@ fn generate_password() -> Result<String> {
     Ok(pass)
 }
 
+/// Hooks run once per new connection (not on a reactivation after a resize).
+struct MacConnectionHandler {
+    /// A resize of the previous connection does not apply to the new one.
+    pending_resize: display::PendingResize,
+    /// Stops audio capture for clients that do not want audio played on their side.
+    audio_gate: Option<macrdp_audio::AudioPlaybackGate>,
+}
+
+impl ConnectionHandler for MacConnectionHandler {
+    fn on_connection_info(&mut self, info: &ironrdp_server::ConnectionInfo) {
+        self.pending_resize.clear();
+        if let Some(gate) = &mut self.audio_gate {
+            gate.on_connection_info(info);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_connection_drops_old_resize_only() {
+        use ironrdp_pdu::gcc::KeyboardType;
+        use ironrdp_server::ConnectionInfo;
+
+        let pending = display::PendingResize::default();
+        let mut handler = MacConnectionHandler {
+            pending_resize: pending.clone(),
+            audio_gate: None,
+        };
+        let info = ConnectionInfo::new(0x409, KeyboardType::IBM_ENHANCED, String::new());
+
+        // Left over from the previous connection: dropped when a new one starts.
+        pending.set(1280, 720);
+        handler.on_connection_info(&info);
+        assert_eq!(pending.take(), None);
+
+        // Within a connection, a layout that arrives later is kept for the update loop,
+        // also across the next display start (updates() does not clear it).
+        pending.set(1024, 768);
+        assert_eq!(pending.take(), Some((1024, 768)));
+    }
 
     #[test]
     fn test_generate_password() {
