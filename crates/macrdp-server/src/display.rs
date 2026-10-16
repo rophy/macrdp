@@ -471,7 +471,7 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
-        tracing::info!(
+        tracing::debug!(
             monitors = ?layout
                 .monitors()
                 .iter()
