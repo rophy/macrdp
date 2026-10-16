@@ -166,9 +166,16 @@ impl GfxServerFactory for MacGfxFactory {
     }
 
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        // No ZGFX compression. Upstream `compress_and_wrap_egfx` checks only the
+        // compressed size against the 65535-byte single-segment limit, not the
+        // input size: a 64-70 KiB PDU that compresses a little goes out as one
+        // oversized segment and FreeRDP fails with `zgfx_decompress failure`.
+        // H.264 payloads do not compress anyway, and with `Never` the server
+        // never back-references the ZGFX history, so ordering between inline
+        // replies and queued frames cannot desync the client.
         let server = GraphicsPipelineServer::with_compression(
             self.build_gfx_handler(),
-            CompressionMode::Auto,
+            CompressionMode::Never,
         );
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         // A new connection: the previous channel (if any) is gone.
