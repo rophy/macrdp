@@ -3,6 +3,7 @@ mod display;
 mod gfx;
 mod handler;
 mod perf_stats;
+mod pointer;
 mod tls;
 mod version;
 

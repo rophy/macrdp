@@ -89,6 +89,11 @@ impl MouseCoordMapper {
         )
     }
 
+    /// RDP pixels per Mac point (the scale of the display picture in the RDP desktop).
+    pub fn picture_scale(&self) -> f64 {
+        self.0.lock().unwrap().picture().0
+    }
+
     /// Remember that client input moved the Mac cursor to `mac`.
     pub fn note_client_move(&self, mac: (u16, u16)) {
         self.note_client_move_at(mac, Instant::now());

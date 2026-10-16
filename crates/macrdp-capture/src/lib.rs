@@ -1,5 +1,7 @@
 //! macOS screen capture via ScreenCaptureKit
 
+pub mod cursor;
+
 use std::ffi::c_void;
 use std::sync::Arc;
 

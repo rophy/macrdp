@@ -8,8 +8,8 @@ use ironrdp_server::{
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{
-    get_cursor_position, CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer,
-    FrameData, ScreenCapturer,
+    cursor, get_cursor_position, CaptureConfig, CapturePixelFormat, CapturedFrame,
+    CgFallbackCapturer, FrameData, ScreenCapturer,
 };
 use macrdp_encode::{self, Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -20,6 +20,7 @@ use std::time::Instant;
 use crate::gfx::{self, SharedGfx};
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
+use crate::pointer::PointerCache;
 
 /// Dirty area below this fraction of total pixels = "low activity" (0.5%).
 const LOW_ACTIVITY_FRACTION: f64 = 0.005;
@@ -628,6 +629,10 @@ impl RdpServerDisplay for MacDisplay {
             cursor_interval,
             last_cursor_pos: (0, 0),
             cursor_initialized: false,
+            pointer_cache: PointerCache::default(),
+            cursor_seed: None,
+            cursor_scale: 0.0,
+            pending_pointer: None,
             coord_mapper: self.coord_mapper.clone(),
             encoder,
             encoder_cache: Arc::clone(&self.encoder_cache),
@@ -677,6 +682,13 @@ struct MacDisplayUpdates {
     last_cursor_pos: (u16, u16),
     /// Whether the initial DefaultPointer has been sent
     cursor_initialized: bool,
+    /// Pointer shapes the client has in its cache
+    pointer_cache: PointerCache,
+    /// System cursor seed and picture scale of the last shape check
+    cursor_seed: Option<i32>,
+    cursor_scale: f64,
+    /// Pointer update to send before anything else (position after a shape)
+    pending_pointer: Option<DisplayUpdate>,
     /// Mouse mapping and the client's recent cursor moves
     coord_mapper: MouseCoordMapper,
     encoder: Option<Box<dyn VideoEncoder>>,
@@ -744,10 +756,17 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         loop {
             if let Some((w, h)) = self.pending_resize.take() {
+                // The client gets a new pointer cache with the new size: send the shape again.
+                self.pointer_cache.clear();
+                self.cursor_seed = None;
                 return Ok(Some(DisplayUpdate::Resize(DesktopSize {
                     width: w,
                     height: h,
                 })));
+            }
+
+            if let Some(update) = self.pending_pointer.take() {
+                return Ok(Some(update));
             }
 
             // Send initial DefaultPointer when cursor channel is active
@@ -790,24 +809,16 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
             let frame = match event {
                 LoopEvent::CursorTick => {
-                    let (x, y) = get_cursor_position();
-                    if (x, y) != self.last_cursor_pos {
-                        self.last_cursor_pos = (x, y);
-                        // Only moves the client did not cause: an echo makes a
-                        // scaling client move its cursor again (see is_client_move).
-                        if self.coord_mapper.is_client_move((x, y)) {
-                            continue;
+                    let shape = self.poll_cursor_shape();
+                    let position = self.poll_cursor_position();
+                    match (shape, position) {
+                        (Some(shape), position) => {
+                            self.pending_pointer = position;
+                            return Ok(Some(shape));
                         }
-                        // The client places its cursor in RDP desktop coordinates.
-                        let (x, y) = self.coord_mapper.to_rdp(x, y);
-                        // The client cursor moves to this position: older client
-                        // positions no longer describe where the client shows it.
-                        self.coord_mapper.forget_client_moves();
-                        return Ok(Some(DisplayUpdate::PointerPosition(
-                            PointerPositionAttribute { x, y },
-                        )));
+                        (None, Some(position)) => return Ok(Some(position)),
+                        (None, None) => continue,
                     }
-                    continue;
                 }
                 LoopEvent::Retry if suppressed => continue,
                 LoopEvent::Retry => match self.held_frame.take() {
@@ -850,6 +861,50 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// A PointerPosition update when the Mac cursor moved by itself.
+    fn poll_cursor_position(&mut self) -> Option<DisplayUpdate> {
+        let (x, y) = get_cursor_position();
+        if (x, y) == self.last_cursor_pos {
+            return None;
+        }
+        self.last_cursor_pos = (x, y);
+        // Only moves the client did not cause: an echo makes a
+        // scaling client move its cursor again (see is_client_move).
+        if self.coord_mapper.is_client_move((x, y)) {
+            return None;
+        }
+        // The client places its cursor in RDP desktop coordinates.
+        let (x, y) = self.coord_mapper.to_rdp(x, y);
+        // The client cursor moves to this position: older client
+        // positions no longer describe where the client shows it.
+        self.coord_mapper.forget_client_moves();
+        Some(DisplayUpdate::PointerPosition(PointerPositionAttribute {
+            x,
+            y,
+        }))
+    }
+
+    /// A pointer shape update when the Mac cursor image changed (I-beam, hand, hidden, ...).
+    /// The cursor seed changes with each new image, so the image is read only then.
+    fn poll_cursor_shape(&mut self) -> Option<DisplayUpdate> {
+        let seed = cursor::cursor_seed();
+        let scale = self.coord_mapper.picture_scale();
+        if self.cursor_seed == Some(seed) && self.cursor_scale == scale {
+            return None;
+        }
+        self.cursor_seed = Some(seed);
+        self.cursor_scale = scale;
+        let Some(shape) = cursor::current_cursor_shape(scale) else {
+            tracing::debug!(seed, "No system cursor image");
+            return None;
+        };
+        let update = self.pointer_cache.show(shape);
+        if let Some(u) = &update {
+            tracing::debug!(seed, update = ?u, "Cursor shape changed");
+        }
+        update
+    }
+
     /// Whether output is stopped because the client does not show it.
     /// When output starts again, the next frame is a full frame / keyframe.
     fn poll_suppress(&mut self) -> bool {
