@@ -179,59 +179,104 @@ fn keyframe_due(was_due: bool, result: FrameResult) -> bool {
     }
 }
 
-/// Upper RTT bound (ms) of each quality level; the last level has no bound.
-/// Same steps as the old fork's `GfxState` network quality.
-const LEVEL_RTT_LIMIT_MS: [f32; 4] = [15.0, 30.0, 60.0, 100.0];
-/// Encoder bitrate share of each level: full rate below 15 ms, 80 % below 30 ms,
-/// 50 % below 60 ms, 30 % below 100 ms, else 15 %.
+/// Encoder bitrate share of each level: full rate, then 80 %, 50 %, 30 %, 15 %.
 const LEVEL_QUALITY: [f64; 5] = [1.0, 0.8, 0.5, 0.3, 0.15];
-/// Step up only when the RTT stays below the next-better level's limit times this.
-const STEP_UP_MARGIN: f32 = 0.8;
-/// ... for at least this long without a break.
-const STEP_UP_DWELL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Step down when the median queueing delay of the last `DOWN_SPAN` is above
+/// this: the link is full. A client that decodes slower than the capture rate
+/// queues frames too (mstsc in a VM, ~33 fps: 40-50 ms with a 3-frame window),
+/// but a lower bitrate does not help it (measured: same fps at 13 and 44 Mbps).
+const QUEUE_DELAY_HIGH_MS: f32 = 100.0;
+const DOWN_SPAN: std::time::Duration = std::time::Duration::from_millis(300);
+/// Fewest samples for a step down.
+const MIN_DOWN_SAMPLES: usize = 5;
+/// No second step down within this time: the queue needs time to drain.
+const STEP_DOWN_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+/// Step up when the median queueing delay of the last second stayed below
+/// this for the up dwell.
+const QUEUE_DELAY_LOW_MS: f32 = 50.0;
+/// Fewest samples (in one second) for a step up.
+const MIN_UP_SAMPLES: usize = 10;
+/// Up dwell. It doubles (up to the maximum) when a step up is followed by a
+/// step down within `PROBE_FAILED`: the link has no room for the next level.
+const UP_DWELL_MIN: std::time::Duration = std::time::Duration::from_secs(3);
+const UP_DWELL_MAX: std::time::Duration = std::time::Duration::from_secs(48);
+const PROBE_FAILED: std::time::Duration = std::time::Duration::from_secs(10);
+/// The up dwell goes back to the minimum after this long without a step down.
+const DWELL_RESET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Quality level that follows the EGFX frame round-trip time (send to
-/// FrameAcknowledge). On a LAN the RTT swings between samples, so the level is
-/// damped: it steps down at once when the RTT exceeds the current level's limit,
-/// and steps up one level at a time, after the RTT stayed clearly below the
-/// next-better limit for `STEP_UP_DWELL`.
-#[derive(Debug, Default)]
+/// Bitrate level that follows congestion: the queueing delay of stream frames
+/// (send-to-acknowledge time above the smallest one of the channel, see
+/// `FrameWindow::queue_delay`). Path delay alone (a far client) and the Wi-Fi
+/// wake-up delay after a quiet screen do not change it.
+#[derive(Debug)]
 struct BitrateLevel {
     /// Index into `LEVEL_QUALITY`; 0 = best.
     level: usize,
-    /// Since when the RTT is below the step-up limit (continuously).
+    /// Since when the queueing delay is below `QUEUE_DELAY_LOW_MS` (continuously).
     below_since: Option<Instant>,
+    last_down: Option<Instant>,
+    last_up: Option<Instant>,
+    up_dwell: std::time::Duration,
+}
+
+impl Default for BitrateLevel {
+    fn default() -> Self {
+        Self {
+            level: 0,
+            below_since: None,
+            last_down: None,
+            last_up: None,
+            up_dwell: UP_DWELL_MIN,
+        }
+    }
 }
 
 impl BitrateLevel {
-    /// Level that a single RTT sample asks for.
-    fn level_for(rtt_ms: f32) -> usize {
-        LEVEL_RTT_LIMIT_MS
-            .iter()
-            .position(|limit| rtt_ms < *limit)
-            .unwrap_or(LEVEL_RTT_LIMIT_MS.len())
-    }
-
-    /// Feed one RTT sample; returns the bitrate share (0..=1) to use.
-    /// No measurement yet (`None`): full rate.
-    fn update(&mut self, rtt_ms: Option<f32>, now: Instant) -> f64 {
-        let Some(rtt) = rtt_ms else {
-            self.level = 0;
+    /// Feed the median queueing delay (ms) and sample count of the last
+    /// `DOWN_SPAN` (`short`) and of the last second (`long`); returns the
+    /// bitrate share (0..=1) to use. Too few samples (a quiet screen): no change.
+    fn update(
+        &mut self,
+        short: Option<(f32, usize)>,
+        long: Option<(f32, usize)>,
+        now: Instant,
+    ) -> f64 {
+        if self
+            .last_down
+            .is_some_and(|t| now.duration_since(t) >= DWELL_RESET)
+        {
+            self.up_dwell = UP_DWELL_MIN;
+        }
+        let congested =
+            short.is_some_and(|(d, n)| n >= MIN_DOWN_SAMPLES && d > QUEUE_DELAY_HIGH_MS);
+        if congested {
             self.below_since = None;
-            return LEVEL_QUALITY[0];
-        };
-        let wanted = Self::level_for(rtt);
-        if wanted > self.level {
-            self.level = wanted;
-            self.below_since = None;
-        } else if self.level > 0 && rtt < LEVEL_RTT_LIMIT_MS[self.level - 1] * STEP_UP_MARGIN {
-            let since = *self.below_since.get_or_insert(now);
-            if now.duration_since(since) >= STEP_UP_DWELL {
-                self.level -= 1;
-                self.below_since = None;
+            let held = self
+                .last_down
+                .is_some_and(|t| now.duration_since(t) < STEP_DOWN_HOLD);
+            if !held && self.level + 1 < LEVEL_QUALITY.len() {
+                if self
+                    .last_up
+                    .is_some_and(|t| now.duration_since(t) < PROBE_FAILED)
+                {
+                    self.up_dwell = (self.up_dwell * 2).min(UP_DWELL_MAX);
+                    self.last_up = None;
+                }
+                self.level += 1;
+                self.last_down = Some(now);
             }
-        } else {
-            self.below_since = None;
+            return LEVEL_QUALITY[self.level];
+        }
+        match long.filter(|&(_, n)| n >= MIN_UP_SAMPLES) {
+            Some((d, _)) if d < QUEUE_DELAY_LOW_MS && self.level > 0 => {
+                let since = *self.below_since.get_or_insert(now);
+                if now.duration_since(since) >= self.up_dwell {
+                    self.level -= 1;
+                    self.below_since = None;
+                    self.last_up = Some(now);
+                }
+            }
+            _ => self.below_since = None,
         }
         LEVEL_QUALITY[self.level]
     }
@@ -1504,21 +1549,24 @@ impl MacDisplayUpdates {
         }
     }
 
-    /// Follow the damped EGFX frame round-trip time (see `BitrateLevel`).
-    /// The levels are at least 15 % of the base rate apart, so a level change
-    /// always changes the bitrate; no extra bitrate hysteresis is needed.
+    /// Follow congestion (see `BitrateLevel`). The levels are at least 15 % of
+    /// the base rate apart, so a level change always changes the bitrate.
     fn apply_adaptive_bitrate(&mut self) {
         let Some(encoder) = &mut self.encoder else {
             return;
         };
-        let rtt = gfx::rtt_ms(&self.gfx);
-        let quality = self.bitrate_level.update(rtt, Instant::now());
+        let ms = |(d, n): (std::time::Duration, usize)| (d.as_secs_f32() * 1000.0, n);
+        let short = gfx::queue_delay(&self.gfx, DOWN_SPAN).map(ms);
+        let delay = gfx::queue_delay(&self.gfx, crate::frame_window::DELAY_SPAN).map(ms);
+        let quality = self.bitrate_level.update(short, delay, Instant::now());
         let target = (f64::from(self.base_bitrate) * quality).round() as u32;
         if target != self.last_applied_bitrate {
             tracing::info!(
                 from_mbps = self.last_applied_bitrate as f64 / 1_000_000.0,
                 to_mbps = target as f64 / 1_000_000.0,
-                rtt_ms = ?rtt,
+                queue_delay_ms = ?delay.map(|(d, _)| d),
+                samples = ?delay.map(|(_, n)| n),
+                rtt_ms = ?gfx::rtt_ms(&self.gfx),
                 "Adaptive bitrate adjustment"
             );
             encoder.set_bitrate(target);
@@ -1867,69 +1915,83 @@ mod tests {
         assert!(!keyframe_due(false, FrameResult::Sent));
     }
 
-    fn run(level: &mut BitrateLevel, t0: Instant, ms: u64, rtt: Option<f32>) -> f64 {
-        level.update(rtt, t0 + std::time::Duration::from_millis(ms))
+    fn run(level: &mut BitrateLevel, t0: Instant, ms: u64, delay: Option<f32>) -> f64 {
+        let d = delay.map(|d| (d, MIN_UP_SAMPLES));
+        level.update(d, d, t0 + std::time::Duration::from_millis(ms))
     }
 
     #[test]
-    fn bitrate_level_none_is_full_rate() {
+    fn bitrate_level_no_samples_keeps_level() {
         let t0 = Instant::now();
         let mut l = BitrateLevel::default();
         assert_eq!(run(&mut l, t0, 0, None), 1.0);
-        run(&mut l, t0, 10, Some(500.0));
-        assert_eq!(run(&mut l, t0, 20, None), 1.0);
+        assert_eq!(run(&mut l, t0, 10, Some(500.0)), 0.8);
+        // Quiet screen: no samples, no change.
+        assert_eq!(run(&mut l, t0, 5_000, None), 0.8);
+        // Too few samples count as none.
+        let few = Some((500.0, 3));
+        assert_eq!(
+            l.update(few, few, t0 + std::time::Duration::from_secs(9)),
+            0.8
+        );
     }
 
     #[test]
-    fn bitrate_level_steps_down_at_once() {
+    fn bitrate_level_ignores_small_queues() {
         let t0 = Instant::now();
         let mut l = BitrateLevel::default();
-        assert_eq!(run(&mut l, t0, 0, Some(10.0)), 1.0);
-        assert_eq!(run(&mut l, t0, 10, Some(20.0)), 0.8);
-        assert_eq!(run(&mut l, t0, 20, Some(45.0)), 0.5);
-        assert_eq!(run(&mut l, t0, 30, Some(80.0)), 0.3);
-        assert_eq!(run(&mut l, t0, 40, Some(300.0)), 0.15);
-    }
-
-    #[test]
-    fn bitrate_level_steps_up_only_after_dwell() {
-        let t0 = Instant::now();
-        let mut l = BitrateLevel::default();
-        assert_eq!(run(&mut l, t0, 0, Some(80.0)), 0.3);
-        // 40 ms is below 60 * 0.8: the dwell starts here.
-        assert_eq!(run(&mut l, t0, 100, Some(40.0)), 0.3);
-        assert_eq!(run(&mut l, t0, 2_000, Some(40.0)), 0.3);
-        // One level up after 2 s, not two.
-        assert_eq!(run(&mut l, t0, 2_100, Some(40.0)), 0.5);
-        assert_eq!(run(&mut l, t0, 2_200, Some(40.0)), 0.5);
-        // 40 ms is not below 30 * 0.8: no further step.
-        assert_eq!(run(&mut l, t0, 9_000, Some(40.0)), 0.5);
-        // A sample inside the margin band restarts the dwell.
-        let mut l = BitrateLevel::default();
-        run(&mut l, t0, 0, Some(80.0));
-        run(&mut l, t0, 100, Some(40.0));
-        run(&mut l, t0, 1_500, Some(55.0));
-        assert_eq!(run(&mut l, t0, 2_200, Some(40.0)), 0.3);
-        assert_eq!(run(&mut l, t0, 4_200, Some(40.0)), 0.5);
-    }
-
-    #[test]
-    fn bitrate_level_does_not_flap_on_lan_rtt() {
-        let t0 = Instant::now();
-        let mut l = BitrateLevel::default();
-        let mut changes = 0;
-        let mut last = 1.0;
+        // Wi-Fi jitter and a client that decodes slowly stay below the limit.
         for i in 0..600u64 {
-            let rtt = [25.0, 45.0, 70.0][(i % 3) as usize];
-            let q = run(&mut l, t0, i * 16, Some(rtt));
-            if q != last {
-                changes += 1;
-                last = q;
-            }
+            let d = [5.0, 45.0, 90.0][(i % 3) as usize];
+            assert_eq!(run(&mut l, t0, i * 16, Some(d)), 1.0);
         }
-        // One step down to the 70 ms level, then stable (~10 s of samples).
-        assert_eq!(changes, 3, "0.8, 0.5, 0.3 on the way down only");
-        assert_eq!(last, 0.3);
+    }
+
+    #[test]
+    fn bitrate_level_steps_down_once_per_hold() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        assert_eq!(run(&mut l, t0, 0, Some(300.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 400, Some(300.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 500, Some(300.0)), 0.5);
+        assert_eq!(run(&mut l, t0, 1_000, Some(300.0)), 0.3);
+        assert_eq!(run(&mut l, t0, 1_500, Some(300.0)), 0.15);
+        assert_eq!(run(&mut l, t0, 2_000, Some(300.0)), 0.15);
+    }
+
+    #[test]
+    fn bitrate_level_steps_up_after_dwell() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        run(&mut l, t0, 0, Some(300.0));
+        run(&mut l, t0, 500, Some(300.0));
+        assert_eq!(run(&mut l, t0, 1_100, Some(10.0)), 0.5);
+        assert_eq!(run(&mut l, t0, 4_000, Some(10.0)), 0.5);
+        // One level per dwell.
+        assert_eq!(run(&mut l, t0, 4_100, Some(10.0)), 0.8);
+        // A sample in the band between the limits restarts the dwell.
+        assert_eq!(run(&mut l, t0, 5_000, Some(70.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 7_500, Some(10.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 10_400, Some(10.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 10_500, Some(10.0)), 1.0);
+    }
+
+    #[test]
+    fn bitrate_level_failed_probe_doubles_dwell() {
+        let t0 = Instant::now();
+        let mut l = BitrateLevel::default();
+        assert_eq!(run(&mut l, t0, 0, Some(300.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 100, Some(10.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 3_100, Some(10.0)), 1.0);
+        // The step up congests the link again: back down, and wait 6 s next time.
+        assert_eq!(run(&mut l, t0, 4_000, Some(300.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 4_100, Some(10.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 9_000, Some(10.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 10_100, Some(10.0)), 1.0);
+        // 30 s without a step down: the dwell is 3 s again.
+        assert_eq!(run(&mut l, t0, 40_000, Some(300.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 40_100, Some(10.0)), 0.8);
+        assert_eq!(run(&mut l, t0, 43_100, Some(10.0)), 1.0);
     }
 
     #[test]

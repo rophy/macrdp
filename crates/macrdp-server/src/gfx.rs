@@ -24,7 +24,7 @@ use ironrdp_server::{
 use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 
-use crate::frame_window::FrameWindow;
+use crate::frame_window::{FrameKind, FrameWindow};
 use crate::refine::TileRect;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 
@@ -261,7 +261,7 @@ pub fn submit_avc420(
     };
     let frame_id = server.try_send_avc420_frame(surface, data, &regions, ts_ms)?;
     flush(shared, &mut server)?;
-    lock(&shared.window).on_sent(frame_id, Instant::now());
+    lock(&shared.window).on_sent(frame_id, FrameKind::Video, Instant::now());
     Ok(())
 }
 
@@ -292,7 +292,7 @@ pub fn submit_clearcodec(
         .send_mixed_frame(surface, tiles, ts_ms)
         .ok_or(FrameSubmissionError::InvalidFrame)?;
     flush(shared, &mut server)?;
-    lock(&shared.window).on_sent(frame_id, Instant::now());
+    lock(&shared.window).on_sent(frame_id, FrameKind::Other, Instant::now());
     tracing::trace!(frame_id, bytes, "EGFX ClearCodec frame sent");
     Ok(bytes)
 }
@@ -325,7 +325,7 @@ pub fn submit_avc444(
         ts_ms,
     )?;
     flush(shared, &mut server)?;
-    lock(&shared.window).on_sent(frame_id, Instant::now());
+    lock(&shared.window).on_sent(frame_id, FrameKind::Video, Instant::now());
     Ok(())
 }
 
@@ -432,6 +432,12 @@ pub fn current_surface(shared: &GfxShared) -> Option<SurfaceInfo> {
 /// The pipeline no longer has our surface: create a new one with the next frame.
 pub fn forget_surface(shared: &GfxShared) {
     *lock(&shared.surface) = None;
+}
+
+/// Median queueing delay of the stream frames acknowledged in the last `span`
+/// and the number of samples (see `FrameWindow::queue_delay`).
+pub fn queue_delay(shared: &GfxShared, span: Duration) -> Option<(Duration, usize)> {
+    lock(&shared.window).queue_delay(Instant::now(), span)
 }
 
 /// Average frame round-trip time from frame acknowledgements, if measured.
