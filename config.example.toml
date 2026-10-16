@@ -71,6 +71,13 @@ encoder = "hardware"
 #   "avc444" — full YUV 4:4:4 via dual-stream AVC444 (requires V10+ client, best quality)
 # chroma_mode = "avc420"
 
+# Lossless text: H.264 frames update only the changed tiles, and after 200 ms
+# without change the changed tiles with few colors (text, UI) are sent again
+# with ClearCodec, which is lossless. Colored text then looks like the original.
+# Costs some CPU (BGRA capture) and a burst of data after each change.
+# Default: true (AVC420 only)
+# lossless_text = true
+
 # ─── TLS ───────────────────────────────────────────────────────────────────────
 
 # Path to TLS certificate file (PEM format)

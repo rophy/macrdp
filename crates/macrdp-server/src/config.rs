@@ -109,6 +109,12 @@ pub struct ServerConfig {
     /// - avc420: standard 4:2:0 chroma (compatible with all RDP clients)
     /// - avc444: full 4:4:4 chroma via dual-stream AVC444 (requires V10+ client, best quality)
     pub chroma_mode: Option<String>,
+    /// Send text and UI losslessly when the screen is quiet (default: true).
+    /// H.264 frames then update only the changed tiles; after 200 ms without
+    /// change, changed tiles with few colors are sent again with ClearCodec.
+    /// Costs some CPU (BGRA capture) and a burst of data after each change.
+    /// AVC420 only.
+    pub lossless_text: Option<bool>,
     /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")
     #[serde(alias = "hidpi_scale")]
     pub resolution: Option<String>,
@@ -149,6 +155,7 @@ impl Default for ServerConfig {
             quality: None,
             encoder: None,
             chroma_mode: None,
+            lossless_text: None,
             resolution: None,
             show_cursor: None,
             cursor_channel: None,

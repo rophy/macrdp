@@ -21,6 +21,7 @@ use crate::gfx::{self, SharedGfx};
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
 use crate::pointer::PointerCache;
+use crate::refine::{self, TileGrid, TileRect};
 
 /// Dirty area below this fraction of total pixels = "low activity" (0.5%).
 const LOW_ACTIVITY_FRACTION: f64 = 0.005;
@@ -31,6 +32,13 @@ const LOW_ACTIVITY_MIN_FPS: u32 = 5;
 /// First wait before a failed BGRA capture restart is tried again; doubles up to the maximum.
 const BGRA_RESTART_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 const BGRA_RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Lossless refinement starts when no H.264 frame was sent for this long.
+const REFINE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+/// Lossless refinement is sent in frames of about this size.
+const REFINE_CHUNK_BYTES: usize = 64 * 1024;
+/// How often to check if the client acknowledged the last refinement frame.
+const REFINE_POLL: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// A scene change needs a quiet screen before it: no frame for this long.
 const PROGRESSIVE_REARM_GAP: std::time::Duration = std::time::Duration::from_millis(250);
@@ -303,6 +311,8 @@ type KeyframeSlot = Arc<Mutex<Option<CachedKeyframe>>>;
 /// What woke up the update loop.
 enum LoopEvent {
     CursorTick,
+    /// The screen is quiet: send the changed text tiles losslessly.
+    Refine,
     /// Time to try the held frame again.
     Retry,
     Frame(Option<CapturedFrame>),
@@ -343,6 +353,78 @@ impl Encoded {
 
 type EncoderSlot = Arc<Mutex<Option<Box<dyn VideoEncoder>>>>;
 
+/// A BGRA frame that the client got as H.264.
+struct BgraFrame {
+    data: Bytes,
+    width: u32,
+    height: u32,
+    stride: usize,
+}
+
+/// H.264 regions and lossless refinement (see `refine`).
+#[derive(Default)]
+struct RefineState {
+    /// Tiles that changed since the last H.264 frame that reached the client
+    h264_dirty: Option<TileGrid>,
+    /// Tiles the client shows from H.264 since the last refinement
+    pending: Option<TileGrid>,
+    /// Last frame sent as H.264
+    last_frame: Option<BgraFrame>,
+    /// When to refine
+    due: Option<tokio::time::Instant>,
+    /// ClearCodec encoder of the current surface (its sequence numbers), by
+    /// (EGFX generation, surface id)
+    clear: Option<((u64, u16), ironrdp_graphics::clearcodec::ClearCodecEncoder)>,
+}
+
+impl RefineState {
+    /// Grid of the frame size; a new size starts with all tiles set.
+    fn grid(slot: &mut Option<TileGrid>, width: u32, height: u32) -> &mut TileGrid {
+        if slot.as_ref().is_none_or(|g| g.size() != (width, height)) {
+            let mut g = TileGrid::new(width, height);
+            g.mark_all();
+            *slot = Some(g);
+        }
+        slot.as_mut().expect("set above")
+    }
+
+    /// A frame was captured: its dirty tiles go into the next H.264 frame.
+    fn on_captured(&mut self, frame: &CapturedFrame) {
+        Self::grid(&mut self.h264_dirty, frame.width, frame.height).mark_dirty(&frame.dirty_rects);
+    }
+
+    /// Regions for the next H.264 frame (empty = the whole frame).
+    fn regions(&mut self, width: u32, height: u32, new_surface: bool) -> Vec<TileRect> {
+        let grid = Self::grid(&mut self.h264_dirty, width, height);
+        if new_surface {
+            grid.mark_all();
+        }
+        let (cols, rows) = grid.cols_rows();
+        if grid.tiles().count() == (cols * rows) as usize {
+            return Vec::new();
+        }
+        grid.rects()
+    }
+
+    /// The H.264 frame reached the client: its tiles now need refinement.
+    fn on_sent(&mut self, frame: &CapturedFrame) {
+        let (w, h) = (frame.width, frame.height);
+        let dirty = Self::grid(&mut self.h264_dirty, w, h).clone();
+        self.h264_dirty.as_mut().expect("set").clear();
+        let pending = Self::grid(&mut self.pending, w, h);
+        pending.union(&dirty);
+        if let FrameData::Raw(data) = &frame.data {
+            self.last_frame = Some(BgraFrame {
+                data: data.clone(),
+                width: w,
+                height: h,
+                stride: frame.stride,
+            });
+        }
+        self.due = Some(tokio::time::Instant::now() + REFINE_DELAY);
+    }
+}
+
 /// Display adapter that bridges ScreenCapturer to ironrdp-server
 pub struct MacDisplay {
     width: u16,
@@ -360,6 +442,8 @@ pub struct MacDisplay {
     encoder_pref: macrdp_encode::EncoderPreference,
     /// Whether AVC444 mode is requested by config
     mode_444: bool,
+    /// Lossless refinement of a quiet screen (AVC420 only)
+    refine: bool,
     show_cursor: bool,
     base_bitrate: u32,
     /// New desktop size from a Display Control layout, sent as a Resize update
@@ -414,6 +498,7 @@ impl MacDisplay {
         quality: Quality,
         encoder_pref: macrdp_encode::EncoderPreference,
         mode_444: bool,
+        lossless_text: bool,
         show_cursor: bool,
         bitrate_override: Option<u32>,
         coord_mapper: MouseCoordMapper,
@@ -450,6 +535,7 @@ impl MacDisplay {
             quality,
             encoder_pref,
             mode_444,
+            refine: lossless_text,
             show_cursor,
             base_bitrate,
             pending_resize: PendingResize::default(),
@@ -592,9 +678,11 @@ impl RdpServerDisplay for MacDisplay {
             frame_rate: self.frame_rate,
             // The hardware AVC420 encoder takes NV12 pixel buffers without a copy.
             // Everything else (software encoder, AVC444, bitmap updates) needs BGRA.
+            // Lossless refinement needs the exact pixels: BGRA.
             pixel_format: if encoder.is_some()
                 && self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
                 && !self.mode_444
+                && !self.refine
             {
                 CapturePixelFormat::Nv12
             } else {
@@ -645,6 +733,7 @@ impl RdpServerDisplay for MacDisplay {
             need_bgra_capture: false,
             full_bitmap_next: true,
             mode_444: self.mode_444,
+            refine: (self.refine && !self.mode_444).then(RefineState::default),
             base_bitrate: self.base_bitrate,
             last_applied_bitrate: self.base_bitrate,
             bitrate_level: BitrateLevel::default(),
@@ -710,6 +799,8 @@ struct MacDisplayUpdates {
     /// Send the whole frame as the next bitmap (screen was not painted by bitmaps before).
     full_bitmap_next: bool,
     mode_444: bool,
+    /// Lossless refinement state; None when it is off
+    refine: Option<RefineState>,
     /// Encoder bitrate at full network quality
     base_bitrate: u32,
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
@@ -797,6 +888,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             } else {
                 self.retry_at
             };
+            let refine_at = self.refine.as_ref().and_then(|r| r.due);
             let event = tokio::select! {
                 biased;
                 _ = async { cursor_iv.as_mut().expect("checked").tick().await }, if has_cursor => {
@@ -804,6 +896,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 _ = tokio::time::sleep_until(wake_at), if has_timer => LoopEvent::Retry,
                 frame = self.next_frame() => LoopEvent::Frame(frame),
+                _ = async { tokio::time::sleep_until(refine_at.expect("checked")).await },
+                    if refine_at.is_some() && !suppressed => LoopEvent::Refine,
             };
             self.cursor_interval = cursor_iv;
 
@@ -820,6 +914,10 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         (None, None) => continue,
                     }
                 }
+                LoopEvent::Refine => {
+                    self.refine_quiet_screen();
+                    continue;
+                }
                 LoopEvent::Retry if suppressed => continue,
                 LoopEvent::Retry => match self.held_frame.take() {
                     Some(frame) => frame,
@@ -828,7 +926,11 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 LoopEvent::Frame(None) => return Ok(None),
                 LoopEvent::Frame(Some(frame)) => {
                     // A newer frame replaces a held one: H.264 frames are full frames.
+                    // Its dirty tiles stay marked for the next H.264 frame.
                     self.held_frame = None;
+                    if let Some(r) = &mut self.refine {
+                        r.on_captured(&frame);
+                    }
                     self.adjust_fps_for_activity(&frame);
                     // Check again: the flag may have changed while we waited.
                     if self.poll_suppress() {
@@ -1214,8 +1316,14 @@ impl MacDisplayUpdates {
         let is_keyframe = encoded.is_keyframe();
 
         let ts_ms = self.start.elapsed().as_millis() as u32;
+        let regions = match &mut self.refine {
+            Some(r) => r.regions(frame.width, frame.height, created),
+            None => Vec::new(),
+        };
         let result = match &encoded {
-            Encoded::Avc420(f) => gfx::submit_avc420(&self.gfx, surface_id, &f.data, w, h, ts_ms),
+            Encoded::Avc420(f) => {
+                gfx::submit_avc420(&self.gfx, surface_id, &f.data, &regions, w, h, ts_ms)
+            }
             Encoded::Avc444(f) => gfx::submit_avc444(
                 &self.gfx,
                 surface_id,
@@ -1245,12 +1353,16 @@ impl MacDisplayUpdates {
                 }
                 self.last_send_failed = keyframe_due(self.last_send_failed, FrameResult::Sent);
                 self.delivered = true;
+                if let Some(r) = &mut self.refine {
+                    r.on_sent(frame);
+                }
                 self.cache_keyframe(&encoded, w, h, generation);
                 tracing::debug!(
                     display_frame = self.display_frame_count,
                     h264_bytes = frame_bytes,
                     is_keyframe,
                     encode_ms = format!("{:.1}", encode_ms),
+                    regions = regions.len(),
                     "Display: sent GFX frame"
                 );
             }
@@ -1286,6 +1398,110 @@ impl MacDisplayUpdates {
         }
         // Keep a frame that did not reach the client: it is sent again as a keyframe.
         sent
+    }
+
+    /// The screen is quiet: send the tiles that the client shows from H.264 and
+    /// that have few colors (text, UI) again with ClearCodec (lossless).
+    ///
+    /// The tiles go in chunks of about `REFINE_CHUNK_BYTES`, one at a time
+    /// (the next after the client acknowledged the last frame), so that a new
+    /// H.264 frame waits behind one chunk at most.
+    fn refine_quiet_screen(&mut self) {
+        let Some(state) = &mut self.refine else {
+            return;
+        };
+        state.due = None;
+        if self.held_frame.is_some() {
+            // A frame still waits: it comes first, then a new quiet period.
+            return;
+        }
+        let Some(frame) = &state.last_frame else {
+            return;
+        };
+        let Some(pending) = state.pending.as_mut().filter(|p| !p.is_empty()) else {
+            return;
+        };
+        if pending.size() != (frame.width, frame.height) {
+            return;
+        }
+        let Some(surface) = gfx::current_surface(&self.gfx) else {
+            return;
+        };
+        if (u32::from(surface.width), u32::from(surface.height)) != (frame.width, frame.height) {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(1) / self.capture_config.frame_rate.max(1);
+        if gfx::frames_in_flight(&self.gfx) > 0
+            || gfx::can_submit(&self.gfx, surface.id, false, interval).is_err()
+        {
+            // Wait for the client to catch up.
+            state.due = Some(tokio::time::Instant::now() + REFINE_POLL);
+            return;
+        }
+        let t0 = Instant::now();
+        let encoder = match &mut state.clear {
+            Some((key, enc)) if *key == (surface.generation, surface.id) => enc,
+            slot => {
+                &mut slot
+                    .insert((
+                        (surface.generation, surface.id),
+                        ironrdp_graphics::clearcodec::ClearCodecEncoder::new(),
+                    ))
+                    .1
+            }
+        };
+        let (cols, rows) = pending.cols_rows();
+        let (mut total, mut picked, mut bytes) = (0, 0, 0);
+        let mut tiles: Vec<(TileRect, Vec<u8>)> = Vec::new();
+        for row in 0..rows {
+            let lossless: Vec<bool> = (0..cols)
+                .map(|c| {
+                    pending.is_set(c, row)
+                        && refine::is_text_like(
+                            &frame.data,
+                            frame.stride,
+                            pending.tile_rect(c, row),
+                        )
+                })
+                .collect();
+            for c in 0..cols {
+                if pending.is_set(c, row) {
+                    pending.unset(c, row);
+                    total += 1;
+                    picked += usize::from(lossless[c as usize]);
+                }
+            }
+            let runs = pending.runs_larger_than(refine::GLYPH_MAX_PIXELS, |c, r| {
+                r == row && lossless[c as usize]
+            });
+            for rect in runs {
+                let px = refine::copy_rect(&frame.data, frame.stride, rect);
+                let data = encoder.encode(&px, rect.w, rect.h);
+                bytes += data.len();
+                tiles.push((rect, data));
+            }
+            if bytes >= REFINE_CHUNK_BYTES {
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            state.due = Some(tokio::time::Instant::now());
+        }
+        if tiles.is_empty() {
+            return;
+        }
+        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let ts_ms = self.start.elapsed().as_millis() as u32;
+        match gfx::submit_clearcodec(&self.gfx, surface.id, tiles, ts_ms) {
+            Ok(bytes) => tracing::debug!(
+                tiles = total,
+                lossless = picked,
+                bytes,
+                encode_ms = format!("{encode_ms:.1}"),
+                "Refine: sent lossless tiles"
+            ),
+            Err(e) => tracing::warn!(error = %e, "Refine: frame not sent"),
+        }
     }
 
     /// Follow the damped EGFX frame round-trip time (see `BitrateLevel`).
@@ -1368,7 +1584,7 @@ impl MacDisplayUpdates {
         }
         let ts_ms = self.start.elapsed().as_millis() as u32;
         let result = match &cached.chroma {
-            None => gfx::submit_avc420(&self.gfx, surface_id, &cached.main, w, h, ts_ms),
+            None => gfx::submit_avc420(&self.gfx, surface_id, &cached.main, &[], w, h, ts_ms),
             Some(chroma) => {
                 gfx::submit_avc444(&self.gfx, surface_id, &cached.main, chroma, w, h, ts_ms)
             }

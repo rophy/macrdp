@@ -5,6 +5,7 @@ mod gfx;
 mod handler;
 mod perf_stats;
 mod pointer;
+mod refine;
 mod tls;
 mod version;
 
@@ -249,6 +250,7 @@ async fn main() -> Result<()> {
         quality,
         encoder_pref,
         mode_444,
+        config.lossless_text.unwrap_or(true),
         show_cursor,
         bitrate_override,
         coord_mapper.clone(),

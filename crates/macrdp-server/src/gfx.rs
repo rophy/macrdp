@@ -13,7 +13,9 @@ use ironrdp_egfx::pdu::{
     Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV103Flags, CapabilitiesV104Flags,
     CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitySet,
 };
-use ironrdp_egfx::server::{FrameSubmissionError, GraphicsPipelineHandler, GraphicsPipelineServer};
+use ironrdp_egfx::server::{
+    FrameSubmissionError, GraphicsPipelineHandler, GraphicsPipelineServer, MixedTilePayload,
+};
 use ironrdp_graphics::zgfx::CompressionMode;
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
@@ -23,6 +25,8 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 
 use crate::frame_window::FrameWindow;
+use crate::refine::TileRect;
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 
 /// H.264 quantization parameter and quality written into each AVC420 region.
 const REGION_QP: u8 = 22;
@@ -234,20 +238,63 @@ fn full_region(w: u16, h: u16) -> [Avc420Region; 1] {
 }
 
 /// Queue one AVC420 frame and send it to the wire. Returns Err if the frame was not accepted.
+/// `regions` are the parts of the decoded frame that the client copies to the
+/// surface (MS-RDPEGFX 2.2.4.4.1); empty means the whole frame.
 pub fn submit_avc420(
     shared: &GfxShared,
     surface: u16,
     data: &[u8],
+    regions: &[TileRect],
     w: u16,
     h: u16,
     ts_ms: u32,
 ) -> Result<(), FrameSubmissionError> {
     let handle = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
     let mut server = lock(&handle);
-    let frame_id = server.try_send_avc420_frame(surface, data, &full_region(w, h), ts_ms)?;
+    let regions: Vec<Avc420Region> = if regions.is_empty() {
+        full_region(w, h).to_vec()
+    } else {
+        regions
+            .iter()
+            .map(|r| Avc420Region::new(r.x, r.y, r.x + r.w, r.y + r.h, REGION_QP, REGION_QUALITY))
+            .collect()
+    };
+    let frame_id = server.try_send_avc420_frame(surface, data, &regions, ts_ms)?;
     flush(shared, &mut server)?;
     lock(&shared.window).on_sent(frame_id, Instant::now());
     Ok(())
+}
+
+/// Queue one frame of ClearCodec (lossless) tiles and send it to the wire.
+/// Returns the number of bytes queued.
+pub fn submit_clearcodec(
+    shared: &GfxShared,
+    surface: u16,
+    tiles: Vec<(TileRect, Vec<u8>)>,
+    ts_ms: u32,
+) -> Result<usize, FrameSubmissionError> {
+    let handle = current_handle(shared).ok_or(FrameSubmissionError::NotReady)?;
+    let mut server = lock(&handle);
+    let bytes = tiles.iter().map(|(_, d)| d.len()).sum();
+    let tiles = tiles
+        .into_iter()
+        .map(|(r, bitmap_data)| MixedTilePayload::ClearCodec {
+            destination: ExclusiveRectangle {
+                left: r.x,
+                top: r.y,
+                right: r.x + r.w,
+                bottom: r.y + r.h,
+            },
+            bitmap_data,
+        })
+        .collect();
+    let frame_id = server
+        .send_mixed_frame(surface, tiles, ts_ms)
+        .ok_or(FrameSubmissionError::InvalidFrame)?;
+    flush(shared, &mut server)?;
+    lock(&shared.window).on_sent(frame_id, Instant::now());
+    tracing::trace!(frame_id, bytes, "EGFX ClearCodec frame sent");
+    Ok(bytes)
 }
 
 /// Queue one AVC444 frame (luma + chroma streams) and send it to the wire.
@@ -368,6 +415,18 @@ pub fn ensure_surface(shared: &GfxShared, generation: u64, w: u16, h: u16) -> Op
         height: h,
     });
     Some((id, true))
+}
+
+/// EGFX frames sent and not acknowledged yet.
+pub fn frames_in_flight(shared: &GfxShared) -> u32 {
+    current_handle(shared)
+        .map(|h| lock(&h).frames_in_flight())
+        .unwrap_or(0)
+}
+
+/// The surface that frames are drawn on now, if any.
+pub fn current_surface(shared: &GfxShared) -> Option<SurfaceInfo> {
+    *lock(&shared.surface)
 }
 
 /// The pipeline no longer has our surface: create a new one with the next frame.

@@ -148,6 +148,7 @@ macrdp uses the first `config.toml` it finds in:
 | `quality` | `high_quality` | `low_latency`, `balanced` or `high_quality` |
 | `encoder` | software | `hardware` (VideoToolbox) or `software` (OpenH264) |
 | `chroma_mode` | `avc420` | `avc420`, or `avc444` for full chroma |
+| `lossless_text` | `true` | After 200 ms without change, send text and UI tiles again losslessly (ClearCodec); H.264 then updates only changed tiles. AVC420 only. |
 | `bitrate_mbps` | auto | Bitrate ceiling |
 | `cursor_channel` | `true` | Send the cursor as pointer updates instead of in the video |
 | `show_cursor` | auto | Draw the cursor in the video (default: only when `cursor_channel` is off) |
