@@ -38,7 +38,35 @@ pub struct MacClipboardBackend {
     poll_handle: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
     locked: bool,
-    pending_paste_format: Option<u32>,
+    pending_paste_format: Option<PasteKind>,
+}
+
+/// Kind of remote clipboard data we asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteKind {
+    FileList,
+    Html,
+    Dib,
+    Text,
+}
+
+/// Pick the remote format to paste, best fidelity first, and keep the ID the remote
+/// announced. Registered formats (file list, HTML) are matched by name: their IDs are
+/// chosen by the remote at run time ([MS-RDPECLIP] 1.3.1.2), e.g. FreeRDP uses 0xC00A
+/// for FileGroupDescriptorW.
+fn choose_paste_format(formats: &[ClipboardFormat]) -> Option<(PasteKind, ClipboardFormatId)> {
+    let by_name = |name: &ClipboardFormatName| {
+        formats
+            .iter()
+            .find(|f| f.name().is_some_and(|n| n.value() == name.value()))
+            .map(|f| f.id())
+    };
+    let by_id = |id: ClipboardFormatId| formats.iter().find(|f| f.id() == id).map(|f| f.id());
+    by_name(&ClipboardFormatName::FILE_LIST)
+        .map(|id| (PasteKind::FileList, id))
+        .or_else(|| by_name(&ClipboardFormatName::HTML).map(|id| (PasteKind::Html, id)))
+        .or_else(|| by_id(ClipboardFormatId::CF_DIB).map(|id| (PasteKind::Dib, id)))
+        .or_else(|| by_id(ClipboardFormatId::CF_UNICODETEXT).map(|id| (PasteKind::Text, id)))
 }
 
 impl fmt::Debug for MacClipboardBackend {
@@ -186,16 +214,17 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         self.remote_formats = available_formats.to_vec();
 
-        // Request the highest-fidelity format available, in order of preference
-        let preferred = [FORMAT_ID_FILE_LIST, FORMAT_ID_HTML, 8, 13];
-        for &fmt_id in &preferred {
-            if available_formats.iter().any(|f| f.id().value() == fmt_id) {
-                self.pending_paste_format = Some(fmt_id);
-                let _ = self.event_sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiatePaste(ClipboardFormatId::new(fmt_id)),
-                ));
-                return;
-            }
+        // Request the highest-fidelity format available, with the ID the remote announced.
+        if let Some((kind, id)) = choose_paste_format(available_formats) {
+            tracing::debug!(
+                ?kind,
+                format_id = id.value(),
+                "Requesting remote clipboard data"
+            );
+            self.pending_paste_format = Some(kind);
+            let _ = self.event_sender.send(ServerEvent::Clipboard(
+                ClipboardMessage::SendInitiatePaste(id),
+            ));
         }
     }
 
@@ -254,14 +283,14 @@ impl CliprdrBackend for MacClipboardBackend {
 
         let format = self.pending_paste_format.take();
         match format {
-            Some(13) => {
+            Some(PasteKind::Text) => {
                 if let Ok(text) = response.to_unicode_string() {
                     let pb = PasteboardBridge::new();
                     let new_count = pb.write_string(&text);
                     self.last_change_count.store(new_count, Ordering::SeqCst);
                 }
             }
-            Some(8) => {
+            Some(PasteKind::Dib) => {
                 let data = response.data();
                 if data.len() >= formats::BITMAPINFOHEADER_SIZE {
                     if let Ok(png_data) = dib_to_png(data) {
@@ -271,7 +300,7 @@ impl CliprdrBackend for MacClipboardBackend {
                     }
                 }
             }
-            Some(id) if id == FORMAT_ID_HTML => {
+            Some(PasteKind::Html) => {
                 if let Some(html_content) = crate::html::unwrap_html_format(response.data()) {
                     let pb = PasteboardBridge::new();
                     let new_count = pb.write_html(&html_content);
@@ -304,6 +333,7 @@ impl CliprdrBackend for MacClipboardBackend {
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], _clip_data_id: Option<u32>) {
         // The cliprdr crate takes the file list response, checks the names, and gives the
         // list here instead of to on_format_data_response.
+        self.pending_paste_format = None;
         let requests = {
             let mut transfer = self.transfer_manager.lock().unwrap();
             transfer.set_incoming_descriptors(files.to_vec());
@@ -441,6 +471,49 @@ mod tests {
         assert_eq!(response.data_as_size().unwrap(), 11);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paste_matches_registered_formats_by_name() {
+        // FreeRDP announces FileGroupDescriptorW at 0xC00A (chosen at run time).
+        let remote = [
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            ClipboardFormat::new(ClipboardFormatId::new(0xC00A))
+                .with_name(ClipboardFormatName::FILE_LIST),
+            ClipboardFormat::new(ClipboardFormatId::new(0xC00B))
+                .with_name(ClipboardFormatName::PREFERRED_DROP_EFFECT),
+        ];
+        assert_eq!(
+            choose_paste_format(&remote),
+            Some((PasteKind::FileList, ClipboardFormatId::new(0xC00A)))
+        );
+
+        // A different format at our local file list ID is not a file list.
+        let remote = [
+            ClipboardFormat::new(ClipboardFormatId::new(FORMAT_ID_FILE_LIST))
+                .with_name(ClipboardFormatName::new_static("Other")),
+            ClipboardFormat::new(ClipboardFormatId::new(0xC0F0))
+                .with_name(ClipboardFormatName::HTML),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ];
+        assert_eq!(
+            choose_paste_format(&remote),
+            Some((PasteKind::Html, ClipboardFormatId::new(0xC0F0)))
+        );
+
+        let remote = [
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ];
+        assert_eq!(
+            choose_paste_format(&remote),
+            Some((PasteKind::Dib, ClipboardFormatId::CF_DIB))
+        );
+        assert_eq!(
+            choose_paste_format(&remote[..1]),
+            Some((PasteKind::Text, ClipboardFormatId::CF_UNICODETEXT))
+        );
+        assert_eq!(choose_paste_format(&[]), None);
     }
 
     #[test]

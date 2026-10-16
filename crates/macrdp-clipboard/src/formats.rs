@@ -5,10 +5,14 @@ use std::io::Cursor;
 
 pub const BITMAPINFOHEADER_SIZE: usize = 40;
 
-/// Registered format ID for Windows "HTML Format"
+/// Format ID we announce for our own "HTML Format".
+/// Registered format IDs are chosen by each side at run time, so this ID is only valid
+/// for our own format list; a remote "HTML Format" is matched by name.
 pub const FORMAT_ID_HTML: u32 = 0xD010;
 
-/// Registered format ID for FileGroupDescriptorW
+/// Local marker for a file list (FileGroupDescriptorW) on the pasteboard.
+/// Not sent on the wire: the cliprdr crate announces local files with its own ID, and a
+/// remote FileGroupDescriptorW is matched by name (its ID is chosen by the client at run time).
 pub const FORMAT_ID_FILE_LIST: u32 = 0xD011;
 
 /// Convert PNG/TIFF image bytes to Windows CF_DIB format.
