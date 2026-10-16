@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use ironrdp_dvc::{DvcEncode, DvcMessage};
 use ironrdp_egfx::pdu::{
     Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV103Flags, CapabilitiesV104Flags,
     CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitySet,
@@ -16,7 +17,8 @@ use ironrdp_egfx::pdu::{
 use ironrdp_egfx::server::{
     FrameSubmissionError, GraphicsPipelineHandler, GraphicsPipelineServer, MixedTilePayload,
 };
-use ironrdp_graphics::zgfx::CompressionMode;
+use ironrdp_graphics::zgfx::{self, CompressionMode};
+use ironrdp_pdu::{Encode, EncodeResult, WriteCursor};
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
     ServerEventSender,
@@ -188,7 +190,8 @@ impl GfxServerFactory for MacGfxFactory {
         // oversized segment and FreeRDP fails with `zgfx_decompress failure`.
         // H.264 payloads do not compress anyway, and with `Never` the server
         // never back-references the ZGFX history, so ordering between inline
-        // replies and queued frames cannot desync the client.
+        // replies and queued frames cannot desync the client. Lossless
+        // refinement frames are compressed on their own (`flush_compressed`).
         let server = GraphicsPipelineServer::with_compression(
             self.build_gfx_handler(),
             CompressionMode::Never,
@@ -210,6 +213,82 @@ fn flush(
     server: &mut GraphicsPipelineServer,
 ) -> Result<(), FrameSubmissionError> {
     let msgs = server.drain_output();
+    send_messages(shared, server, msgs)
+}
+
+/// Like `flush`, but each PDU is ZGFX-compressed on its own.
+///
+/// The pipeline sends PDUs uncompressed (see `build_server_with_handle`). A
+/// PDU compressed with a new compressor refers only to its own bytes, so the
+/// client decodes it correctly whatever else it put into its ZGFX history
+/// before, and in whatever order the other messages reach it.
+/// Returns the size of the compressed messages.
+fn flush_compressed(
+    shared: &GfxShared,
+    server: &mut GraphicsPipelineServer,
+) -> Result<usize, FrameSubmissionError> {
+    let msgs = server
+        .drain_output()
+        .into_iter()
+        .map(compress_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    let size = msgs.iter().map(|m| m.size()).sum();
+    send_messages(shared, server, msgs)?;
+    Ok(size)
+}
+
+/// Compress one ZGFX-wrapped (uncompressed) EGFX message on its own.
+fn compress_message(msg: DvcMessage) -> Result<DvcMessage, FrameSubmissionError> {
+    let fail = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::warn!(error = %e, "EGFX {what} failed");
+        FrameSubmissionError::InvalidFrame
+    };
+    let mut wrapped = vec![0u8; msg.size()];
+    msg.encode(&mut WriteCursor::new(&mut wrapped))
+        .map_err(|e| fail("PDU encode", &e))?;
+    // The wrapped PDU has raw segments only: a new decompressor unwraps it.
+    let mut pdu = Vec::with_capacity(wrapped.len());
+    zgfx::Decompressor::new()
+        .decompress(&wrapped, &mut pdu)
+        .map_err(|e| fail("ZGFX unwrap", &e))?;
+    let bytes =
+        zgfx::compress_and_wrap_egfx(&pdu, &mut zgfx::Compressor::new(), CompressionMode::Auto)
+            .map_err(|e| fail("ZGFX compress", &e))?;
+    Ok(Box::new(ZgfxMessage {
+        bytes,
+        name: msg.name(),
+    }))
+}
+
+/// A ZGFX-wrapped EGFX PDU.
+struct ZgfxMessage {
+    bytes: Vec<u8>,
+    name: &'static str,
+}
+
+impl Encode for ZgfxMessage {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_slice(&self.bytes);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl DvcEncode for ZgfxMessage {}
+
+/// Hand drained EGFX messages to the server event loop.
+fn send_messages(
+    shared: &GfxShared,
+    server: &GraphicsPipelineServer,
+    msgs: Vec<DvcMessage>,
+) -> Result<(), FrameSubmissionError> {
     if msgs.is_empty() {
         return Ok(());
     }
@@ -291,9 +370,17 @@ pub fn submit_clearcodec(
     let frame_id = server
         .send_mixed_frame(surface, tiles, ts_ms)
         .ok_or(FrameSubmissionError::InvalidFrame)?;
-    flush(shared, &mut server)?;
+    // ClearCodec residual data compresses well; H.264 does not.
+    let t0 = Instant::now();
+    let wire = flush_compressed(shared, &mut server)?;
     lock(&shared.window).on_sent(frame_id, FrameKind::Other, Instant::now());
-    tracing::trace!(frame_id, bytes, "EGFX ClearCodec frame sent");
+    tracing::debug!(
+        frame_id,
+        bytes,
+        wire,
+        zgfx_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1000.0),
+        "EGFX ClearCodec frame sent"
+    );
     Ok(bytes)
 }
 
@@ -454,6 +541,34 @@ pub fn rtt_ms(shared: &GfxShared) -> Option<f32> {
 mod tests {
     use super::*;
     use ironrdp_egfx::pdu::{CapabilitiesV81Flags, CapabilitiesV8Flags};
+
+    fn wire_bytes(msg: &DvcMessage) -> Vec<u8> {
+        let mut out = vec![0u8; msg.size()];
+        msg.encode(&mut WriteCursor::new(&mut out)).unwrap();
+        out
+    }
+
+    #[test]
+    fn compressed_message_decodes_after_any_history() {
+        // One segment and a multipart message (more than 65535 bytes).
+        for len in [20_000usize, 150_000] {
+            let pdu: Vec<u8> = (0..len).map(|i| ((i / 7) % 13) as u8).collect();
+            let msg: DvcMessage = Box::new(ZgfxMessage {
+                bytes: zgfx::wrap_uncompressed(&pdu),
+                name: "test",
+            });
+            let compressed = wire_bytes(&compress_message(msg).unwrap());
+            assert!(compressed.len() < pdu.len() / 4, "{}", compressed.len());
+            // A client that already has other data in its history.
+            let mut client = zgfx::Decompressor::new();
+            let mut out = Vec::new();
+            let other = zgfx::wrap_uncompressed(&[0x55; 3000]);
+            client.decompress(&other, &mut out).unwrap();
+            out.clear();
+            client.decompress(&compressed, &mut out).unwrap();
+            assert_eq!(out, pdu);
+        }
+    }
 
     #[test]
     fn cannot_submit_before_ready() {
