@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ironrdp_cliprdr::pdu::*;
 
@@ -16,6 +16,8 @@ type StreamMapping = (u32, RequestKind);
 
 pub struct FileTransferManager {
     local_files: Vec<PathBuf>,
+    /// Files announced while the remote holds a lock; they replace `local_files` on unlock.
+    pending_local_files: Option<Vec<PathBuf>>,
     incoming_descriptors: Vec<FileDescriptor>,
     incoming_data: HashMap<u32, Vec<u8>>,
     incoming_complete: HashSet<u32>,
@@ -31,6 +33,7 @@ impl FileTransferManager {
         fs::create_dir_all(&temp_dir).ok();
         Self {
             local_files: Vec::new(),
+            pending_local_files: None,
             incoming_descriptors: Vec::new(),
             incoming_data: HashMap::new(),
             incoming_complete: HashSet::new(),
@@ -42,21 +45,26 @@ impl FileTransferManager {
         }
     }
 
-    pub fn set_local_files(&mut self, paths: Vec<PathBuf>) {
-        self.local_files = paths;
-    }
-
-    pub fn build_file_list(&self) -> PackedFileList {
-        let files = self
-            .local_files
-            .iter()
+    /// Offer local files and return their descriptors.
+    ///
+    /// Only the paths that give a descriptor are kept, in the same order, so the
+    /// descriptor index the remote uses in file contents requests selects the right file.
+    /// While the remote holds a lock, the files being transferred stay in use and the new
+    /// list takes effect on unlock.
+    pub fn set_local_files(&mut self, paths: Vec<PathBuf>) -> Vec<FileDescriptor> {
+        let (paths, files): (Vec<PathBuf>, Vec<FileDescriptor>) = paths
+            .into_iter()
             .filter_map(|path| {
-                let meta = fs::metadata(path).ok()?;
-                let name = path.file_name()?.to_string_lossy().to_string();
-                Some(FileDescriptor::new(name).with_file_size(meta.len()))
+                let desc = file_descriptor(&path)?;
+                Some((path, desc))
             })
-            .collect();
-        PackedFileList { files }
+            .unzip();
+        if self.locked {
+            self.pending_local_files = Some(paths);
+        } else {
+            self.local_files = paths;
+        }
+        files
     }
 
     pub fn handle_contents_request(
@@ -232,6 +240,9 @@ impl FileTransferManager {
 
     pub fn unlock(&mut self) {
         self.locked = false;
+        if let Some(paths) = self.pending_local_files.take() {
+            self.local_files = paths;
+        }
         self.incoming_data.clear();
         self.incoming_complete.clear();
         self.stream_to_index.clear();
@@ -239,11 +250,28 @@ impl FileTransferManager {
 
     pub fn clear(&mut self) {
         self.local_files.clear();
+        self.pending_local_files = None;
         self.incoming_descriptors.clear();
         self.incoming_data.clear();
         self.incoming_complete.clear();
         self.stream_to_index.clear();
     }
+}
+
+/// Longest file name a CLIPRDR file descriptor carries (MS-RDPECLIP 2.2.5.2.3.1: 260
+/// UTF-16 characters including the terminator). The cliprdr crate drops longer names.
+/// (A macOS file name has at most 255 bytes, so this is only a guard.)
+const MAX_FILE_NAME_LEN: usize = 259;
+
+/// Descriptor for a local file, or `None` if the file cannot be offered.
+fn file_descriptor(path: &Path) -> Option<FileDescriptor> {
+    let meta = fs::metadata(path).ok()?;
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if name.is_empty() || name.encode_utf16().count() > MAX_FILE_NAME_LEN {
+        tracing::warn!(path = %path.display(), "File name cannot be sent, file skipped");
+        return None;
+    }
+    Some(FileDescriptor::new(name).with_file_size(meta.len()))
 }
 
 impl Drop for FileTransferManager {
@@ -268,6 +296,62 @@ mod tests {
         ));
         fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    fn size_request(index: i32) -> FileContentsRequest {
+        FileContentsRequest {
+            stream_id: 9,
+            index,
+            flags: FileContentsFlags::SIZE,
+            position: 0,
+            requested_size: 8,
+            data_id: None,
+        }
+    }
+
+    #[test]
+    fn local_files_keep_descriptor_order() {
+        let dir = temp_dir("order");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, b"1").unwrap();
+        fs::write(&b, b"333").unwrap();
+
+        let mut mgr = FileTransferManager::new(dir.join("tmp"), 1024);
+        let files = mgr.set_local_files(vec![a, dir.join("missing.bin"), b]);
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
+        // Index 1 is b.txt, not the skipped file.
+        let response = mgr.handle_contents_request(&size_request(1));
+        assert_eq!(response.data_as_size().unwrap(), 3);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_files_wait_for_unlock() {
+        let dir = temp_dir("locked");
+        let old = dir.join("old.txt");
+        let new = dir.join("new.txt");
+        fs::write(&old, b"old").unwrap();
+        fs::write(&new, b"newer").unwrap();
+
+        let mut mgr = FileTransferManager::new(dir.join("tmp"), 1024);
+        mgr.set_local_files(vec![old]);
+        mgr.lock();
+        let files = mgr.set_local_files(vec![new]);
+        assert_eq!(files[0].name, "new.txt");
+
+        // The transfer under the lock still gets the old file.
+        let response = mgr.handle_contents_request(&size_request(0));
+        assert_eq!(response.data_as_size().unwrap(), 3);
+
+        mgr.unlock();
+        let response = mgr.handle_contents_request(&size_request(0));
+        assert_eq!(response.data_as_size().unwrap(), 5);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

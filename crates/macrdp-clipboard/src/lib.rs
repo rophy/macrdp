@@ -103,9 +103,7 @@ fn file_copy_message(
     transfer: &Mutex<FileTransferManager>,
     paths: Vec<PathBuf>,
 ) -> Option<ClipboardMessage> {
-    let mut transfer = transfer.lock().unwrap();
-    transfer.set_local_files(paths);
-    let files = transfer.build_file_list().files;
+    let files = transfer.lock().unwrap().set_local_files(paths);
     if files.is_empty() {
         return None;
     }
