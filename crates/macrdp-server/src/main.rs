@@ -237,6 +237,8 @@ async fn main() -> Result<()> {
     }
     // EGFX graphics pipeline; one per connection, shared with the display loop.
     let gfx_shared: gfx::SharedGfx = Default::default();
+    // Set by the server while the client sends SuppressOutput (e.g. window minimised).
+    let display_suppressed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let display = MacDisplay::new(
         width,
         height,
@@ -251,6 +253,7 @@ async fn main() -> Result<()> {
         shared_audio_tx.clone(),
         perf_stats.clone(),
         std::sync::Arc::clone(&gfx_shared),
+        std::sync::Arc::clone(&display_suppressed),
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
@@ -284,6 +287,7 @@ async fn main() -> Result<()> {
         // A new client that passes NLA takes over the running session.
         .with_connection_policy(ConnectionPolicy::Preempt)
         .with_honor_client_desktop_size(honor_client_size)
+        .with_display_suppressed_handle(display_suppressed)
         .build();
 
     // Set credentials — required for RDP authentication

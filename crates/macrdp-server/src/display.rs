@@ -13,7 +13,7 @@ use macrdp_capture::{
 };
 use macrdp_encode::{self, Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -27,6 +27,9 @@ const LOW_ACTIVITY_FRACTION: f64 = 0.005;
 const LOW_ACTIVITY_RAMP_FRAMES: u32 = 60;
 /// Minimum FPS during sustained low activity.
 const LOW_ACTIVITY_MIN_FPS: u32 = 5;
+/// First wait before a failed BGRA capture restart is tried again; doubles up to the maximum.
+const BGRA_RESTART_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const BGRA_RESTART_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Progressive rendering: on scene changes (large dirty area), temporarily reduce
 /// encoder bitrate for fast initial delivery, then ramp quality back over several frames.
@@ -123,6 +126,100 @@ fn plan_frame(can_submit: Result<(), FrameSubmissionError>, last_send_failed: bo
     }
 }
 
+/// Encoder bitrate for a measured EGFX frame round-trip time (send to FrameAcknowledge).
+///
+/// Same steps as the old fork's `GfxState` network quality: full rate below 15 ms,
+/// 80 % below 30 ms, 50 % below 60 ms, 30 % below 100 ms, else 15 %.
+/// No measurement yet: full rate.
+fn adaptive_bitrate(base: u32, rtt_ms: Option<f32>) -> u32 {
+    let Some(rtt) = rtt_ms else {
+        return base;
+    };
+    let quality = if rtt < 15.0 {
+        1.0
+    } else if rtt < 30.0 {
+        0.8
+    } else if rtt < 60.0 {
+        0.5
+    } else if rtt < 100.0 {
+        0.3
+    } else {
+        0.15
+    };
+    (f64::from(base) * quality).round() as u32
+}
+
+/// The client must keep asking for no output this long before output stops.
+/// Some clients pulse SuppressOutput under load (see ironrdp-server
+/// `display_suppressed_handle`).
+const SUPPRESS_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often the loop checks the suppress flag while output is stopped.
+const SUPPRESS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Debug, PartialEq)]
+enum SuppressState {
+    /// Send output.
+    Off,
+    /// The client does not show output: do not encode or send frames.
+    On,
+    /// Output starts again after a stop: the next frame must be a keyframe.
+    Resumed,
+}
+
+/// Debounced view of the client's SuppressOutput flag.
+///
+/// It engages only after a frame reached the client on this connection (mstsc
+/// sends SuppressOutput during its connect handshake) and after the flag stays
+/// set for `SUPPRESS_DEBOUNCE`. It clears at once.
+#[derive(Debug, Default)]
+struct SuppressGate {
+    /// When the flag was first seen set (after the first delivered frame)
+    since: Option<Instant>,
+    active: bool,
+}
+
+impl SuppressGate {
+    fn poll(&mut self, flag: bool, delivered: bool, now: Instant) -> SuppressState {
+        if !flag {
+            self.since = None;
+            if self.active {
+                self.active = false;
+                return SuppressState::Resumed;
+            }
+            return SuppressState::Off;
+        }
+        if self.active {
+            return SuppressState::On;
+        }
+        if !delivered {
+            return SuppressState::Off;
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since) >= SUPPRESS_DEBOUNCE {
+            self.active = true;
+            SuppressState::On
+        } else {
+            SuppressState::Off
+        }
+    }
+}
+
+/// The last H.264 keyframe that reached a client. Sent first on the next
+/// connection, so the client shows the screen before the encoder makes a new one.
+#[derive(Clone)]
+struct CachedKeyframe {
+    /// AVC420 stream, or the AVC444 luma (main view) stream
+    main: Bytes,
+    /// AVC444 chroma (aux view) stream; None for AVC420
+    chroma: Option<Bytes>,
+    width: u16,
+    height: u16,
+    /// EGFX generation (channel) the keyframe was sent on
+    generation: u64,
+}
+
+type KeyframeSlot = Arc<Mutex<Option<CachedKeyframe>>>;
+
 /// What woke up the update loop.
 enum LoopEvent {
     CursorTick,
@@ -197,6 +294,10 @@ pub struct MacDisplay {
     encoder_cache: EncoderSlot,
     /// Resolution the cached encoder was created for
     cached_encoder_dims: (u16, u16),
+    /// Last keyframe that reached a client, replayed on the next connection
+    last_keyframe: KeyframeSlot,
+    /// Set by the server while the client sends SuppressOutput (e.g. minimised)
+    display_suppressed: Arc<AtomicBool>,
 }
 
 impl MacDisplay {
@@ -215,6 +316,7 @@ impl MacDisplay {
         shared_audio_tx: Option<SharedAudioTx>,
         perf_stats: Option<SharedPerfStats>,
         gfx: SharedGfx,
+        display_suppressed: Arc<AtomicBool>,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -252,6 +354,8 @@ impl MacDisplay {
             gfx,
             encoder_cache: Arc::new(Mutex::new(None)),
             cached_encoder_dims: (0, 0),
+            last_keyframe: Arc::new(Mutex::new(None)),
+            display_suppressed,
         }
     }
 
@@ -297,6 +401,8 @@ impl MacDisplay {
             if let Some(mut enc) = self.encoder_cache.lock().unwrap().take() {
                 tracing::info!("Reusing cached H.264 encoder from previous connection");
                 enc.force_keyframe();
+                // The adaptive bitrate of the previous connection does not apply.
+                enc.set_bitrate(self.base_bitrate);
                 return Some(enc);
             }
         }
@@ -417,7 +523,15 @@ impl RdpServerDisplay for MacDisplay {
             need_bgra_capture: false,
             full_bitmap_next: true,
             mode_444: self.mode_444,
+            base_bitrate: self.base_bitrate,
             last_applied_bitrate: self.base_bitrate,
+            last_keyframe: Arc::clone(&self.last_keyframe),
+            replay_pending: true,
+            display_suppressed: Arc::clone(&self.display_suppressed),
+            suppress: SuppressGate::default(),
+            delivered: false,
+            bgra_restart_after: None,
+            bgra_restart_backoff: BGRA_RESTART_BACKOFF_MIN,
             progressive: ProgressiveRamp::new(),
             display_frame_count: 0,
             skip_next_frame: false,
@@ -466,8 +580,23 @@ struct MacDisplayUpdates {
     /// Send the whole frame as the next bitmap (screen was not painted by bitmaps before).
     full_bitmap_next: bool,
     mode_444: bool,
+    /// Encoder bitrate at full network quality
+    base_bitrate: u32,
     /// Last bitrate applied to the encoder (to avoid redundant set_bitrate calls)
     last_applied_bitrate: u32,
+    /// Last keyframe that reached a client (shared across connections)
+    last_keyframe: KeyframeSlot,
+    /// Send the cached keyframe on the first surface of this connection
+    replay_pending: bool,
+    /// Client SuppressOutput flag, set by the server
+    display_suppressed: Arc<AtomicBool>,
+    suppress: SuppressGate,
+    /// A frame (H.264 or bitmap) reached the client on this connection
+    delivered: bool,
+    /// A BGRA capture restart failed: do not try again before this time
+    bgra_restart_after: Option<tokio::time::Instant>,
+    /// Wait after the next failed BGRA capture restart
+    bgra_restart_backoff: std::time::Duration,
     progressive: ProgressiveRamp,
     display_frame_count: u64,
     /// Encode overload protection: drop the next frame
@@ -511,20 +640,31 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 return Ok(Some(DisplayUpdate::DefaultPointer));
             }
 
-            if self.need_bgra_capture {
+            if self.need_bgra_capture
+                && self
+                    .bgra_restart_after
+                    .is_none_or(|t| tokio::time::Instant::now() >= t)
+            {
                 self.restart_capture_bgra().await;
             }
 
+            let suppressed = self.poll_suppress();
+
             let mut cursor_iv = self.cursor_interval.take();
             let has_cursor = cursor_iv.is_some();
-            let has_held = self.held_frame.is_some();
-            let retry_at = self.retry_at;
+            // While output is stopped, wake up now and then to see if it can start again.
+            let has_timer = self.held_frame.is_some() || suppressed;
+            let wake_at = if suppressed {
+                tokio::time::Instant::now() + SUPPRESS_POLL
+            } else {
+                self.retry_at
+            };
             let event = tokio::select! {
                 biased;
                 _ = async { cursor_iv.as_mut().expect("checked").tick().await }, if has_cursor => {
                     LoopEvent::CursorTick
                 }
-                _ = tokio::time::sleep_until(retry_at), if has_held => LoopEvent::Retry,
+                _ = tokio::time::sleep_until(wake_at), if has_timer => LoopEvent::Retry,
                 frame = self.next_frame() => LoopEvent::Frame(frame),
             };
             self.cursor_interval = cursor_iv;
@@ -540,6 +680,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     }
                     continue;
                 }
+                LoopEvent::Retry if suppressed => continue,
                 LoopEvent::Retry => match self.held_frame.take() {
                     Some(frame) => frame,
                     None => continue,
@@ -549,12 +690,23 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     // A newer frame replaces a held one: H.264 frames are full frames.
                     self.held_frame = None;
                     self.adjust_fps_for_activity(&frame);
+                    // Check again: the flag may have changed while we waited.
+                    if self.poll_suppress() {
+                        // Keep only the newest frame; it is sent when output starts again.
+                        self.held_frame = Some(frame);
+                        continue;
+                    }
                     frame
                 }
             };
 
             match self.handle_frame(frame) {
-                FrameOutcome::Update(update) => return Ok(Some(update)),
+                FrameOutcome::Update(update) => {
+                    if matches!(update, DisplayUpdate::Bitmap(_)) {
+                        self.delivered = true;
+                    }
+                    return Ok(Some(update));
+                }
                 FrameOutcome::Done => {}
                 FrameOutcome::Hold(frame) => {
                     // A fixed deadline: the cursor tick must not keep pushing it back.
@@ -569,6 +721,34 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 }
 
 impl MacDisplayUpdates {
+    /// Whether output is stopped because the client does not show it.
+    /// When output starts again, the next frame is a full frame / keyframe.
+    fn poll_suppress(&mut self) -> bool {
+        let flag = self.display_suppressed.load(Ordering::Relaxed);
+        let was_active = self.suppress.active;
+        match self.suppress.poll(flag, self.delivered, Instant::now()) {
+            SuppressState::Off => false,
+            SuppressState::On => {
+                if !was_active {
+                    tracing::info!(
+                        "Client does not show output (SuppressOutput) — encoding stopped"
+                    );
+                }
+                true
+            }
+            SuppressState::Resumed => {
+                tracing::info!("Client shows output again — sending a keyframe");
+                if let Some(encoder) = &mut self.encoder {
+                    encoder.force_keyframe();
+                }
+                self.full_bitmap_next = true;
+                // Send the newest frame now.
+                self.retry_at = tokio::time::Instant::now();
+                false
+            }
+        }
+    }
+
     /// Wait for the next video frame, handling SCK recovery and frame draining.
     async fn next_frame(&mut self) -> Option<CapturedFrame> {
         loop {
@@ -623,8 +803,18 @@ impl MacDisplayUpdates {
             Ok(capturer) => {
                 tracing::info!("Capture restarted with BGRA pixels for bitmap updates");
                 self.capturer = capturer;
+                self.bgra_restart_after = None;
+                self.bgra_restart_backoff = BGRA_RESTART_BACKOFF_MIN;
             }
-            Err(e) => tracing::warn!("Capture restart with BGRA pixels failed: {e:#}"),
+            Err(e) => {
+                let wait = self.bgra_restart_backoff;
+                tracing::warn!(
+                    retry_in_s = wait.as_secs(),
+                    "Capture restart with BGRA pixels failed: {e:#}"
+                );
+                self.bgra_restart_after = Some(tokio::time::Instant::now() + wait);
+                self.bgra_restart_backoff = (wait * 2).min(BGRA_RESTART_BACKOFF_MAX);
+            }
         }
     }
 
@@ -798,6 +988,9 @@ impl MacDisplayUpdates {
                     if let Some(encoder) = &mut self.encoder {
                         encoder.force_keyframe();
                     }
+                    if std::mem::take(&mut self.replay_pending) {
+                        self.replay_keyframe(id, w, h, generation);
+                    }
                 }
                 None => {
                     self.surface = None;
@@ -829,13 +1022,17 @@ impl MacDisplayUpdates {
             }
         }
 
+        self.apply_adaptive_bitrate();
         // Progressive rendering: detect scene change and apply quality ramp
         self.apply_progressive_bitrate(frame);
 
         self.display_frame_count += 1;
         let t0 = Instant::now();
         let Some(encoded) = self.encode(frame, use_444) else {
-            return true;
+            // The encoder may have moved on without output: keep the frame and
+            // send it again as a keyframe.
+            self.last_send_failed = true;
+            return false;
         };
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let frame_bytes = encoded.len();
@@ -868,6 +1065,8 @@ impl MacDisplayUpdates {
                     );
                 }
                 self.last_send_failed = false;
+                self.delivered = true;
+                self.cache_keyframe(&encoded, w, h, generation);
                 tracing::debug!(
                     display_frame = self.display_frame_count,
                     h264_bytes = frame_bytes,
@@ -908,6 +1107,99 @@ impl MacDisplayUpdates {
         }
         // Keep a frame that did not reach the client: it is sent again as a keyframe.
         sent
+    }
+
+    /// Follow the EGFX frame round-trip time, with 10 % hysteresis.
+    fn apply_adaptive_bitrate(&mut self) {
+        let Some(encoder) = &mut self.encoder else {
+            return;
+        };
+        let target = adaptive_bitrate(self.base_bitrate, gfx::rtt_ms(&self.gfx));
+        let change = (f64::from(target) - f64::from(self.last_applied_bitrate)).abs();
+        if target != self.last_applied_bitrate && change > f64::from(self.base_bitrate) * 0.1 {
+            tracing::info!(
+                from_mbps = self.last_applied_bitrate as f64 / 1_000_000.0,
+                to_mbps = target as f64 / 1_000_000.0,
+                rtt_ms = ?gfx::rtt_ms(&self.gfx),
+                "Adaptive bitrate adjustment"
+            );
+            encoder.set_bitrate(target);
+            self.last_applied_bitrate = target;
+        }
+    }
+
+    /// Keep a keyframe that reached the client, for the next connection.
+    fn cache_keyframe(&self, encoded: &Encoded, width: u16, height: u16, generation: u64) {
+        let cached = match encoded {
+            Encoded::Avc420(f) if f.is_keyframe => CachedKeyframe {
+                main: f.data.clone(),
+                chroma: None,
+                width,
+                height,
+                generation,
+            },
+            // Both streams must be IDR, else the chroma stream needs older frames.
+            Encoded::Avc444(f) if f.main_view.is_keyframe && f.aux_view.is_keyframe => {
+                CachedKeyframe {
+                    main: f.main_view.data.clone(),
+                    chroma: Some(f.aux_view.data.clone()),
+                    width,
+                    height,
+                    generation,
+                }
+            }
+            _ => return,
+        };
+        *self.last_keyframe.lock().unwrap() = Some(cached);
+    }
+
+    /// Send the keyframe of the previous connection on a new surface of the same size.
+    /// The client then shows the screen at once; the encoder's next frame is a keyframe too.
+    fn replay_keyframe(&mut self, surface_id: u16, w: u16, h: u16, generation: u64) {
+        let Some(cached) = self.last_keyframe.lock().unwrap().clone() else {
+            return;
+        };
+        if cached.generation == generation {
+            // Same channel (e.g. a resize in this session): the client has newer content.
+            return;
+        }
+        if (cached.width, cached.height) != (w, h) {
+            tracing::debug!(
+                cached_w = cached.width,
+                cached_h = cached.height,
+                w,
+                h,
+                "Cached keyframe has another size — not replayed"
+            );
+            return;
+        }
+        let avc444 = cached.chroma.is_some();
+        if avc444 && !self.gfx.avc444.load(Ordering::SeqCst) {
+            tracing::debug!(
+                "Cached keyframe is AVC444 but the client has no AVC444 — not replayed"
+            );
+            return;
+        }
+        if let Err(e) = gfx::can_submit(&self.gfx, surface_id, avc444) {
+            tracing::debug!(error = %e, "Cached keyframe not replayed");
+            return;
+        }
+        let ts_ms = self.start.elapsed().as_millis() as u32;
+        let result = match &cached.chroma {
+            None => gfx::submit_avc420(&self.gfx, surface_id, &cached.main, w, h, ts_ms),
+            Some(chroma) => {
+                gfx::submit_avc444(&self.gfx, surface_id, &cached.main, chroma, w, h, ts_ms)
+            }
+        };
+        match result {
+            Ok(()) => tracing::info!(
+                width = w,
+                height = h,
+                avc444,
+                "Replaying cached keyframe for instant reconnect image"
+            ),
+            Err(e) => tracing::warn!(error = %e, "Cached keyframe replay failed"),
+        }
     }
 
     /// Encode a full frame: NV12 pixel buffer (zero copy), BGRA AVC444, or BGRA AVC420.
@@ -1084,6 +1376,63 @@ mod tests {
                 force_keyframe: true
             }
         );
+    }
+
+    #[test]
+    fn adaptive_bitrate_policy() {
+        // Thresholds of the old fork's GfxState::adaptive_bitrate.
+        assert_eq!(adaptive_bitrate(10_000_000, None), 10_000_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(10.0)), 10_000_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(15.0)), 8_000_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(20.0)), 8_000_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(45.0)), 5_000_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(80.0)), 3_000_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(300.0)), 1_500_000);
+        assert_eq!(adaptive_bitrate(10_000_000, Some(1000.0)), 1_500_000);
+    }
+
+    #[test]
+    fn suppress_waits_for_first_delivered_frame() {
+        let mut gate = SuppressGate::default();
+        let t0 = Instant::now();
+        assert_eq!(gate.poll(true, false, t0), SuppressState::Off);
+        assert_eq!(
+            gate.poll(true, false, t0 + 5 * SUPPRESS_DEBOUNCE),
+            SuppressState::Off
+        );
+        // The debounce starts when a frame was delivered.
+        let t1 = t0 + 6 * SUPPRESS_DEBOUNCE;
+        assert_eq!(gate.poll(true, true, t1), SuppressState::Off);
+        assert_eq!(
+            gate.poll(true, true, t1 + SUPPRESS_DEBOUNCE),
+            SuppressState::On
+        );
+    }
+
+    #[test]
+    fn suppress_debounce_and_resume() {
+        let mut gate = SuppressGate::default();
+        let t0 = Instant::now();
+        let half = SUPPRESS_DEBOUNCE / 2;
+        assert_eq!(gate.poll(true, true, t0), SuppressState::Off);
+        assert_eq!(gate.poll(true, true, t0 + half), SuppressState::Off);
+        // A short pulse does not stop output and is not a resume.
+        assert_eq!(gate.poll(false, true, t0 + half), SuppressState::Off);
+        let t1 = t0 + SUPPRESS_DEBOUNCE;
+        assert_eq!(gate.poll(true, true, t1), SuppressState::Off);
+        assert_eq!(gate.poll(true, true, t1 + half), SuppressState::Off);
+        assert_eq!(
+            gate.poll(true, true, t1 + SUPPRESS_DEBOUNCE),
+            SuppressState::On
+        );
+        assert_eq!(
+            gate.poll(true, true, t1 + 10 * SUPPRESS_DEBOUNCE),
+            SuppressState::On
+        );
+        // Clears at once, and reports the resume once.
+        let t2 = t1 + 11 * SUPPRESS_DEBOUNCE;
+        assert_eq!(gate.poll(false, true, t2), SuppressState::Resumed);
+        assert_eq!(gate.poll(false, true, t2), SuppressState::Off);
     }
 
     #[test]
