@@ -1,5 +1,6 @@
 mod config;
 mod display;
+mod gfx;
 mod handler;
 mod perf_stats;
 mod tls;
@@ -262,6 +263,12 @@ async fn main() -> Result<()> {
                 as Box<dyn ironrdp_server::ConnectionHandler>
         });
 
+    // EGFX graphics pipeline; one per connection, shared with the display loop.
+    let gfx_shared: gfx::SharedGfx = Default::default();
+    let gfx_factory: Option<Box<dyn ironrdp_server::GfxServerFactory>> = Some(Box::new(
+        gfx::MacGfxFactory::new(std::sync::Arc::clone(&gfx_shared)),
+    ));
+
     // Build RDP server with Hybrid security (NLA/CredSSP)
     // This enables Windows mstsc to prompt for credentials before connecting
     let mut server = RdpServer::builder()
@@ -271,6 +278,7 @@ async fn main() -> Result<()> {
         .with_display_handler(display)
         .with_sound_factory(sound_factory)
         .with_cliprdr_factory(cliprdr_factory)
+        .with_gfx_factory(gfx_factory)
         .with_connection_handler(connection_handler)
         // A new client that passes NLA takes over the running session.
         .with_connection_policy(ConnectionPolicy::Preempt)
