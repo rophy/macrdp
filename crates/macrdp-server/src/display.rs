@@ -810,11 +810,9 @@ impl MacDisplayUpdates {
                 macrdp_capture::CaptureEvent::Frame(f) => f,
                 macrdp_capture::CaptureEvent::Idle => continue,
             };
-            match self.capturer.try_next_frame() {
-                Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue,
-                Some(macrdp_capture::CaptureEvent::Idle) => return Some(frame),
-                None => return Some(frame),
-            }
+            // Frames that wait already are newer: send only the newest one.
+            let capturer = &mut self.capturer;
+            return Some(newest_frame(frame, || capturer.try_next_frame()));
         }
     }
 
@@ -1354,9 +1352,85 @@ impl MacDisplayUpdates {
     }
 }
 
+/// Coalesce a frame with the frames that already wait behind it: the newest frame wins,
+/// with the dirty rects of all of them (bitmap updates send only the dirty area).
+/// `Idle` events in between are skipped.
+fn newest_frame(
+    mut frame: CapturedFrame,
+    mut next: impl FnMut() -> Option<macrdp_capture::CaptureEvent>,
+) -> CapturedFrame {
+    while let Some(event) = next() {
+        if let macrdp_capture::CaptureEvent::Frame(mut newer) = event {
+            // Empty dirty rects mean "whole frame changed"; keep that if either says so.
+            if frame.dirty_rects.is_empty() {
+                newer.dirty_rects.clear();
+            } else if !newer.dirty_rects.is_empty() {
+                newer.dirty_rects.append(&mut frame.dirty_rects);
+            }
+            frame = newer;
+        }
+    }
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_frame(timestamp_us: u64, rects: &[(u32, u32)]) -> CapturedFrame {
+        CapturedFrame {
+            width: 64,
+            height: 64,
+            data: FrameData::Raw(Bytes::new()),
+            stride: 256,
+            timestamp_us,
+            dirty_rects: rects
+                .iter()
+                .map(|&(x, y)| macrdp_capture::Rect {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1,
+                })
+                .collect(),
+        }
+    }
+
+    fn drain(first: CapturedFrame, waiting: Vec<macrdp_capture::CaptureEvent>) -> CapturedFrame {
+        let mut waiting = waiting.into_iter();
+        newest_frame(first, || waiting.next())
+    }
+
+    #[test]
+    fn newest_frame_keeps_last_change() {
+        use macrdp_capture::CaptureEvent::{Frame, Idle};
+
+        // Nothing waits: the frame itself.
+        assert_eq!(drain(test_frame(1, &[(0, 0)]), vec![]).timestamp_us, 1);
+
+        // Newer frames wait (with Idle in between): the newest is sent, never none.
+        let got = drain(
+            test_frame(1, &[(1, 1)]),
+            vec![
+                Frame(test_frame(2, &[(2, 2)])),
+                Idle,
+                Frame(test_frame(3, &[(3, 3)])),
+            ],
+        );
+        assert_eq!(got.timestamp_us, 3);
+        let mut xs: Vec<u32> = got.dirty_rects.iter().map(|r| r.x).collect();
+        xs.sort_unstable();
+        assert_eq!(xs, [1, 2, 3], "dirty areas of skipped frames are kept");
+
+        // A frame with no dirty rects (whole frame) makes the result whole too.
+        let got = drain(test_frame(1, &[]), vec![Frame(test_frame(2, &[(2, 2)]))]);
+        assert!(got.dirty_rects.is_empty());
+        let got = drain(test_frame(1, &[(1, 1)]), vec![Frame(test_frame(2, &[]))]);
+        assert!(got.dirty_rects.is_empty());
+
+        // Only Idle waits: the frame itself.
+        assert_eq!(drain(test_frame(4, &[]), vec![Idle]).timestamp_us, 4);
+    }
 
     #[test]
     fn frame_gate() {
