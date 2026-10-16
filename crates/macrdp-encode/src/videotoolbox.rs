@@ -22,6 +22,8 @@ type CFTypeRef = *const c_void;
 type CFAllocatorRef = *const c_void;
 type OSStatus = i32;
 type VTEncodeInfoFlags = u32;
+/// `kVTEncodeInfo_FrameDropped`: the encoder dropped the frame (no output).
+const K_VT_ENCODE_INFO_FRAME_DROPPED: VTEncodeInfoFlags = 1 << 1;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -270,24 +272,35 @@ struct CallbackCtx {
     output: std::sync::Mutex<Option<(Vec<u8>, bool)>>, // (nal_data, is_keyframe)
     ready: std::sync::Condvar,
     has_data: std::sync::atomic::AtomicBool,
+    /// The encoder dropped the last frame on purpose (`kVTEncodeInfo_FrameDropped`):
+    /// no output, and the frame is not a reference for later frames.
+    dropped: std::sync::atomic::AtomicBool,
 }
 
 extern "C" fn encode_callback(
     ref_con: *mut c_void,
     _source: *mut c_void,
     status: OSStatus,
-    _info_flags: VTEncodeInfoFlags,
+    info_flags: VTEncodeInfoFlags,
     sample_buffer: CMSampleBufferRef,
 ) {
     let ctx = unsafe { &*(ref_con as *const CallbackCtx) };
 
     if status != 0 || sample_buffer.is_null() {
         // Signal has_data so encoder doesn't timeout waiting — it will get empty data
-        tracing::warn!(
-            status,
-            null_buf = sample_buffer.is_null(),
-            "VT encode callback error"
-        );
+        let dropped = status == 0 && info_flags & K_VT_ENCODE_INFO_FRAME_DROPPED != 0;
+        if dropped {
+            tracing::debug!("VT dropped the frame (rate control)");
+        } else {
+            tracing::warn!(
+                status,
+                null_buf = sample_buffer.is_null(),
+                info_flags,
+                "VT encode callback error"
+            );
+        }
+        ctx.dropped
+            .store(dropped, std::sync::atomic::Ordering::Release);
         ctx.has_data
             .store(true, std::sync::atomic::Ordering::Release);
         ctx.ready.notify_one();
@@ -488,6 +501,7 @@ impl VtEncoder {
             output: std::sync::Mutex::new(None),
             ready: std::sync::Condvar::new(),
             has_data: std::sync::atomic::AtomicBool::new(false),
+            dropped: std::sync::atomic::AtomicBool::new(false),
         });
 
         // NV12 full-range input for both AVC420 and AVC444.
@@ -1148,6 +1162,8 @@ impl VtEncoder {
             *guard = None;
             ctx.has_data
                 .store(false, std::sync::atomic::Ordering::Release);
+            ctx.dropped
+                .store(false, std::sync::atomic::Ordering::Release);
         }
 
         unsafe {
@@ -1219,6 +1235,8 @@ impl VtEncoder {
             *guard = None;
             ctx.has_data
                 .store(false, std::sync::atomic::Ordering::Release);
+            ctx.dropped
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         unsafe {
             let status = VTCompressionSessionEncodeFrame(
@@ -1289,6 +1307,16 @@ impl VtEncoder {
             tracing::warn!("VT collect: no data after timeout + CompleteFrames");
             Ok(None)
         }
+    }
+
+    /// AVC420 output contract: empty data means that VT dropped the frame on
+    /// purpose, so its reference state did not change. Empty output for any other
+    /// reason (callback error, no callback before the timeout) is an error.
+    fn check_empty_output(ctx: &CallbackCtx, nal_data: &[u8]) -> Result<()> {
+        if nal_data.is_empty() && !ctx.dropped.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("VT gave no output for the frame (encode error or timeout)");
+        }
+        Ok(())
     }
 
     /// Compute PTS and duration for the current frame.
@@ -1448,6 +1476,7 @@ impl VideoEncoder for VtEncoder {
             );
         }
 
+        Self::check_empty_output(&self.callback_ctx, &nal_data)?;
         Ok(EncodedFrame {
             data: Bytes::from(nal_data),
             is_keyframe,
@@ -1507,6 +1536,7 @@ impl VideoEncoder for VtEncoder {
 
         self.frame_count += 1;
 
+        Self::check_empty_output(&self.callback_ctx, &nal_data)?;
         Ok(EncodedFrame {
             data: Bytes::from(nal_data),
             is_keyframe,

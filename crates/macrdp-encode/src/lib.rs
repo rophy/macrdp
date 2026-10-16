@@ -42,7 +42,9 @@ pub enum Quality {
 
 /// Video encoder trait
 pub trait VideoEncoder: Send {
-    /// AVC420 encode (existing)
+    /// AVC420 encode (existing).
+    /// Ok with empty data: the encoder dropped the frame on purpose (rate control);
+    /// the frame is not a reference, so the next frame need not be a keyframe.
     fn encode_bgra(
         &mut self,
         data: &[u8],
@@ -62,6 +64,7 @@ pub trait VideoEncoder: Send {
     ) -> Result<Avc444EncodedFrame>;
 
     /// Zero-copy encode from CVPixelBuffer (NV12). Default returns error (unsupported).
+    /// Empty data has the same meaning as for `encode_bgra`.
     /// Only VtEncoder overrides this.
     fn encode_pixel_buffer(
         &mut self,

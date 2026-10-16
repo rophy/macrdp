@@ -126,6 +126,29 @@ fn plan_frame(can_submit: Result<(), FrameSubmissionError>, last_send_failed: bo
     }
 }
 
+/// What happened to an encoded frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrameResult {
+    /// The client got the frame.
+    Sent,
+    /// The encoder dropped the frame on purpose (rate control). The frame is not
+    /// a reference, so the client's references still match the encoder.
+    Dropped,
+    /// The encoder state moved on but the client did not get the frame
+    /// (encode error, or the frame was not sent).
+    Lost,
+}
+
+/// Whether the next frame must be a keyframe, after `result`.
+/// A drop keeps the earlier state: a keyframe that was due stays due.
+fn keyframe_due(was_due: bool, result: FrameResult) -> bool {
+    match result {
+        FrameResult::Sent => false,
+        FrameResult::Dropped => was_due,
+        FrameResult::Lost => true,
+    }
+}
+
 /// Upper RTT bound (ms) of each quality level; the last level has no bound.
 /// Same steps as the old fork's `GfxState` network quality.
 const LEVEL_RTT_LIMIT_MS: [f32; 4] = [15.0, 30.0, 60.0, 100.0];
@@ -1094,11 +1117,14 @@ impl MacDisplayUpdates {
 
         self.display_frame_count += 1;
         let t0 = Instant::now();
-        let Some(encoded) = self.encode(frame, use_444) else {
-            // The encoder may have moved on without output: keep the frame and
-            // send it again as a keyframe.
-            self.last_send_failed = true;
-            return false;
+        let encoded = match self.encode(frame, use_444) {
+            Ok(encoded) => encoded,
+            Err(result) => {
+                // Keep the frame and try it again; a keyframe only when the
+                // encoder may have moved on without output.
+                self.last_send_failed = keyframe_due(self.last_send_failed, result);
+                return false;
+            }
         };
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let frame_bytes = encoded.len();
@@ -1130,7 +1156,7 @@ impl MacDisplayUpdates {
                         "EGFX H.264 frames sent"
                     );
                 }
-                self.last_send_failed = false;
+                self.last_send_failed = keyframe_due(self.last_send_failed, FrameResult::Sent);
                 self.delivered = true;
                 self.cache_keyframe(&encoded, w, h, generation);
                 tracing::debug!(
@@ -1143,7 +1169,7 @@ impl MacDisplayUpdates {
             }
             Err(e) => {
                 // The encoder moved on but the client did not get this frame.
-                self.last_send_failed = true;
+                self.last_send_failed = keyframe_due(self.last_send_failed, FrameResult::Lost);
                 tracing::warn!(
                     display_frame = self.display_frame_count,
                     error = %e,
@@ -1272,21 +1298,22 @@ impl MacDisplayUpdates {
     }
 
     /// Encode a full frame: NV12 pixel buffer (zero copy), BGRA AVC444, or BGRA AVC420.
-    fn encode(&mut self, frame: &CapturedFrame, use_444: bool) -> Option<Encoded> {
+    /// Without output, says if the encoder dropped the frame or lost it.
+    fn encode(&mut self, frame: &CapturedFrame, use_444: bool) -> Result<Encoded, FrameResult> {
         let display_frame = self.display_frame_count;
-        let encoder = self.encoder.as_mut()?;
+        let encoder = self.encoder.as_mut().ok_or(FrameResult::Lost)?;
         let bgra = match &frame.data {
             FrameData::PixelBuffer(buf) => {
                 // Zero-copy VT path — encode CVPixelBuffer directly
                 return match encoder.encode_pixel_buffer(buf.as_ptr(), false) {
-                    Ok(encoded) if !encoded.data.is_empty() => Some(Encoded::Avc420(encoded)),
+                    Ok(encoded) if !encoded.data.is_empty() => Ok(Encoded::Avc420(encoded)),
                     Ok(_) => {
-                        tracing::warn!(display_frame, "Zero-copy encode returned empty data");
-                        None
+                        tracing::debug!(display_frame, "Encoder dropped the frame");
+                        Err(FrameResult::Dropped)
                     }
                     Err(e) => {
                         tracing::warn!(display_frame, "Zero-copy encode failed: {e}");
-                        None
+                        Err(FrameResult::Lost)
                     }
                 };
             }
@@ -1297,14 +1324,16 @@ impl MacDisplayUpdates {
         if use_444 {
             match encoder.encode_bgra_444(bgra, frame.width, frame.height, frame.stride) {
                 Ok(encoded) if !encoded.main_view.data.is_empty() => {
-                    return Some(Encoded::Avc444(encoded));
+                    return Ok(Encoded::Avc444(encoded));
                 }
                 Ok(_) => {
                     tracing::warn!(
                         display_frame,
                         "AVC444 encode returned EMPTY data — frame dropped!"
                     );
-                    return None;
+                    // The two views may not agree on what was dropped: start again
+                    // from a keyframe.
+                    return Err(FrameResult::Lost);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1318,17 +1347,14 @@ impl MacDisplayUpdates {
 
         // AVC420 path (default or fallback from AVC444 failure)
         match encoder.encode_bgra(bgra, frame.width, frame.height, frame.stride) {
-            Ok(encoded) if !encoded.data.is_empty() => Some(Encoded::Avc420(encoded)),
+            Ok(encoded) if !encoded.data.is_empty() => Ok(Encoded::Avc420(encoded)),
             Ok(_) => {
-                tracing::warn!(
-                    display_frame,
-                    "H.264 encode returned EMPTY data — frame dropped!"
-                );
-                None
+                tracing::debug!(display_frame, "Encoder dropped the frame");
+                Err(FrameResult::Dropped)
             }
             Err(e) => {
                 tracing::warn!(display_frame, "H.264 encode failed: {e}");
-                None
+                Err(FrameResult::Lost)
             }
         }
     }
@@ -1521,6 +1547,21 @@ mod tests {
                 force_keyframe: true
             }
         );
+    }
+
+    #[test]
+    fn keyframe_due_after_frame() {
+        // A frame the encoder dropped is not a reference: no keyframe for it ...
+        assert!(!keyframe_due(false, FrameResult::Dropped));
+        // ... but a keyframe that was due (e.g. the dropped frame was the forced
+        // keyframe) stays due.
+        assert!(keyframe_due(true, FrameResult::Dropped));
+        // The encoder moved on without the client: keyframe.
+        assert!(keyframe_due(false, FrameResult::Lost));
+        assert!(keyframe_due(true, FrameResult::Lost));
+        // The client got the frame.
+        assert!(!keyframe_due(true, FrameResult::Sent));
+        assert!(!keyframe_due(false, FrameResult::Sent));
     }
 
     fn run(level: &mut BitrateLevel, t0: Instant, ms: u64, rtt: Option<f32>) -> f64 {
