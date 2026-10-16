@@ -45,6 +45,11 @@ pub struct GfxShared {
     pub ready: AtomicBool,
     /// The negotiated capabilities allow AVC444.
     pub avc444: AtomicBool,
+    /// The channel of this connection was closed (by the client, or at the
+    /// end of the connection). Cleared for each new connection.
+    pub closed_by_client: AtomicBool,
+    /// Number of the current connection's pipeline (see `MacGfxHandler`).
+    connection: AtomicU64,
     /// Incremented on every `on_ready` (new or re-negotiated channel).
     pub generation: AtomicU64,
     /// Surface the display loop draws on. Kept here and not in the display
@@ -180,6 +185,9 @@ fn caps_allow_avc444(caps: &CapabilitySet) -> bool {
 
 struct MacGfxHandler {
     shared: SharedGfx,
+    /// Pipeline number: the channel of an ended connection can close after
+    /// the next connection started; that close must not touch the new state.
+    connection: u64,
 }
 
 impl GraphicsPipelineHandler for MacGfxHandler {
@@ -203,8 +211,13 @@ impl GraphicsPipelineHandler for MacGfxHandler {
     }
 
     fn on_close(&mut self) {
+        if self.shared.connection.load(Ordering::SeqCst) != self.connection {
+            tracing::debug!("EGFX channel of an earlier connection closed");
+            return;
+        }
         tracing::info!("EGFX channel closed");
         self.shared.ready.store(false, Ordering::SeqCst);
+        self.shared.closed_by_client.store(true, Ordering::SeqCst);
     }
 }
 
@@ -228,6 +241,7 @@ impl GfxServerFactory for MacGfxFactory {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
         Box::new(MacGfxHandler {
             shared: Arc::clone(&self.shared),
+            connection: self.shared.connection.load(Ordering::SeqCst),
         })
     }
 
@@ -240,6 +254,7 @@ impl GfxServerFactory for MacGfxFactory {
         // never back-references the ZGFX history, so ordering between inline
         // replies and queued frames cannot desync the client. Lossless
         // refinement frames are compressed on their own (`flush_compressed`).
+        self.shared.connection.fetch_add(1, Ordering::SeqCst);
         let server = GraphicsPipelineServer::with_compression(
             self.build_gfx_handler(),
             CompressionMode::Never,
@@ -247,6 +262,7 @@ impl GfxServerFactory for MacGfxFactory {
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         // A new connection: the previous channel (if any) is gone.
         self.shared.ready.store(false, Ordering::SeqCst);
+        self.shared.closed_by_client.store(false, Ordering::SeqCst);
         self.shared.avc444.store(false, Ordering::SeqCst);
         *lock(&self.shared.surface) = None;
         lock(&self.shared.window).reset();
@@ -657,6 +673,30 @@ pub fn rtt_ms(shared: &GfxShared) -> Option<f32> {
 mod tests {
     use super::*;
     use ironrdp_egfx::pdu::{CapabilitiesV81Flags, CapabilitiesV8Flags};
+
+    #[test]
+    fn close_of_an_earlier_connection_keeps_the_new_state() {
+        let shared: SharedGfx = Arc::new(GfxShared::default());
+        let factory = MacGfxFactory::new(Arc::clone(&shared));
+        let _first = factory.build_server_with_handle();
+        let mut old = MacGfxHandler {
+            shared: Arc::clone(&shared),
+            connection: shared.connection.load(Ordering::SeqCst),
+        };
+        let _second = factory.build_server_with_handle();
+        shared.ready.store(true, Ordering::SeqCst);
+        old.on_close();
+        assert!(shared.ready.load(Ordering::SeqCst));
+        assert!(!shared.closed_by_client.load(Ordering::SeqCst));
+        // The current connection's channel closing is seen.
+        let mut current = MacGfxHandler {
+            shared: Arc::clone(&shared),
+            connection: shared.connection.load(Ordering::SeqCst),
+        };
+        current.on_close();
+        assert!(!shared.ready.load(Ordering::SeqCst));
+        assert!(shared.closed_by_client.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn compressed_message_decodes_after_any_history() {

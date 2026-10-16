@@ -869,6 +869,7 @@ impl RdpServerDisplay for MacDisplay {
             surface_frames: 0,
             held_frame: None,
             resize_wait: None,
+            bitmap_fallback: false,
             retry_at: tokio::time::Instant::now(),
             last_send_failed: false,
             // A new or reused encoder starts with a keyframe.
@@ -933,6 +934,8 @@ struct MacDisplayUpdates {
     held_frame: Option<CapturedFrame>,
     /// A resize waits for the EGFX frames in flight since this time
     resize_wait: Option<tokio::time::Instant>,
+    /// EGFX was closed by the client: frames go as bitmap updates
+    bitmap_fallback: bool,
     /// When to try the held frame again
     retry_at: tokio::time::Instant,
     /// H.264 frames sent on the current surface
@@ -1406,6 +1409,19 @@ impl MacDisplayUpdates {
             return self.bitmap_outcome(&frame);
         }
 
+        if !self.gfx.ready.load(Ordering::SeqCst)
+            && self.gfx.closed_by_client.load(Ordering::SeqCst)
+        {
+            // The client closed EGFX in this session (FreeRDP does so when it
+            // cannot draw a frame). No EGFX frame can be sent any more, and the
+            // channel is not opened again: send bitmaps, or the picture stops.
+            if !self.bitmap_fallback {
+                tracing::warn!("EGFX channel closed by the client: using bitmap updates");
+                self.bitmap_fallback = true;
+                self.full_bitmap_next = true;
+            }
+            return self.bitmap_outcome(&frame);
+        }
         if !self.gfx.ready.load(Ordering::SeqCst) {
             // H.264 encoder exists — never send bitmaps, wait for GFX to become ready.
             // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
