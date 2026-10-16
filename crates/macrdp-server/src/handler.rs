@@ -60,6 +60,18 @@ impl MouseCoordMapper {
         (mac_x, mac_y)
     }
 
+    /// Maps a macOS logical position to RDP desktop coordinates (the inverse of
+    /// [`Self::map`]), for PointerPosition updates sent to the client.
+    pub fn to_rdp(&self, mac_x: u16, mac_y: u16) -> (u16, u16) {
+        let s = self.0.lock().unwrap();
+        let x = (mac_x as f64 * s.rdp_w / s.logical_w).round();
+        let y = (mac_y as f64 * s.rdp_h / s.logical_h).round();
+        (
+            x.min(s.rdp_w - 1.0).max(0.0) as u16,
+            y.min(s.rdp_h - 1.0).max(0.0) as u16,
+        )
+    }
+
     /// Remember that client input moved the Mac cursor to `mac`.
     pub fn note_client_move(&self, mac: (u16, u16)) {
         self.note_client_move_at(mac, Instant::now());
@@ -246,6 +258,22 @@ mod tests {
         assert!(!m.is_client_move_at((640, 360), t0 + Duration::from_secs(5)));
         // The newest client position never expires.
         assert!(m.is_client_move_at((102, 458), t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn to_rdp_maps_mac_position_into_the_rdp_desktop() {
+        // 900x560 session on a 1280x720 Mac: a Mac position must not be sent unscaled.
+        let m = MouseCoordMapper::new(1280, 720, 900, 560);
+        assert_eq!(m.to_rdp(0, 0), (0, 0));
+        assert_eq!(m.to_rdp(640, 360), (450, 280));
+        // The far edge stays inside the desktop.
+        assert_eq!(m.to_rdp(1280, 720), (899, 559));
+    }
+
+    #[test]
+    fn to_rdp_is_identity_at_native_size() {
+        let m = MouseCoordMapper::new(1280, 720, 1280, 720);
+        assert_eq!(m.to_rdp(500, 287), (500, 287));
     }
 
     #[test]

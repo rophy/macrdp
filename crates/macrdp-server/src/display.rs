@@ -709,6 +709,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                         if self.coord_mapper.is_client_move((x, y)) {
                             continue;
                         }
+                        // The client places its cursor in RDP desktop coordinates.
+                        let (x, y) = self.coord_mapper.to_rdp(x, y);
                         return Ok(Some(DisplayUpdate::PointerPosition(
                             PointerPositionAttribute { x, y },
                         )));
