@@ -9,7 +9,7 @@ use ironrdp_server::{
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{
     cursor, get_cursor_position, CaptureConfig, CapturePixelFormat, CapturedFrame,
-    CgFallbackCapturer, FrameData, ScreenCapturer,
+    CgFallbackCapturer, FrameData, SafePixelBuffer, ScreenCapturer,
 };
 use macrdp_encode::{self, Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -400,10 +400,26 @@ type EncoderSlot = Arc<Mutex<Option<Box<dyn VideoEncoder>>>>;
 
 /// A BGRA frame that the client got as H.264.
 struct BgraFrame {
-    data: Bytes,
+    data: BgraPixels,
     width: u32,
     height: u32,
     stride: usize,
+}
+
+/// Pixels of a `BgraFrame`: copied bytes, or the capture pixel buffer itself.
+enum BgraPixels {
+    Bytes(Bytes),
+    Buffer(SafePixelBuffer),
+}
+
+impl BgraFrame {
+    /// Call `f` with the BGRA bytes and the bytes per row.
+    fn read<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
+        match &self.data {
+            BgraPixels::Bytes(b) => Some(f(b, self.stride)),
+            BgraPixels::Buffer(buf) => buf.read_bgra(f),
+        }
+    }
 }
 
 /// H.264 regions and lossless refinement (see `refine`).
@@ -458,14 +474,20 @@ impl RefineState {
         self.h264_dirty.as_mut().expect("set").clear();
         let pending = Self::grid(&mut self.pending, w, h);
         pending.union(&dirty);
-        if let FrameData::Raw(data) = &frame.data {
-            self.last_frame = Some(BgraFrame {
-                data: data.clone(),
-                width: w,
-                height: h,
-                stride: frame.stride,
-            });
-        }
+        let data = match &frame.data {
+            FrameData::Raw(data) => BgraPixels::Bytes(data.clone()),
+            FrameData::PixelBuffer(buf) if buf.is_bgra() => BgraPixels::Buffer(buf.clone_ref()),
+            FrameData::PixelBuffer(_) => {
+                self.last_frame = None;
+                return;
+            }
+        };
+        self.last_frame = Some(BgraFrame {
+            data,
+            width: w,
+            height: h,
+            stride: frame.stride,
+        });
         self.due = Some(tokio::time::Instant::now() + REFINE_DELAY);
     }
 }
@@ -721,15 +743,18 @@ impl RdpServerDisplay for MacDisplay {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
-            // The hardware AVC420 encoder takes NV12 pixel buffers without a copy.
-            // Everything else (software encoder, AVC444, bitmap updates) needs BGRA.
-            // Lossless refinement needs the exact pixels: BGRA.
+            // The hardware AVC420 encoder takes capture pixel buffers without a copy:
+            // NV12, or BGRA when lossless refinement needs the exact pixels.
+            // Everything else (software encoder, AVC444, bitmap updates) needs BGRA bytes.
             pixel_format: if encoder.is_some()
                 && self.encoder_pref == macrdp_encode::EncoderPreference::Hardware
                 && !self.mode_444
-                && !self.refine
             {
-                CapturePixelFormat::Nv12
+                if self.refine {
+                    CapturePixelFormat::BgraBuffer
+                } else {
+                    CapturePixelFormat::Nv12
+                }
             } else {
                 CapturePixelFormat::Bgra
             },
@@ -1498,36 +1523,39 @@ impl MacDisplayUpdates {
         let (cols, rows) = pending.cols_rows();
         let (mut total, mut picked, mut bytes) = (0, 0, 0);
         let mut tiles: Vec<(TileRect, Vec<u8>)> = Vec::new();
-        for row in 0..rows {
-            let lossless: Vec<bool> = (0..cols)
-                .map(|c| {
-                    pending.is_set(c, row)
-                        && refine::is_text_like(
-                            &frame.data,
-                            frame.stride,
-                            pending.tile_rect(c, row),
-                        )
-                })
-                .collect();
-            for c in 0..cols {
-                if pending.is_set(c, row) {
-                    pending.unset(c, row);
-                    total += 1;
-                    picked += usize::from(lossless[c as usize]);
+        let read = frame.read(|data, stride| {
+            for row in 0..rows {
+                let lossless: Vec<bool> = (0..cols)
+                    .map(|c| {
+                        pending.is_set(c, row)
+                            && refine::is_text_like(data, stride, pending.tile_rect(c, row))
+                    })
+                    .collect();
+                for c in 0..cols {
+                    if pending.is_set(c, row) {
+                        pending.unset(c, row);
+                        total += 1;
+                        picked += usize::from(lossless[c as usize]);
+                    }
+                }
+                let runs = pending.runs_larger_than(refine::GLYPH_MAX_PIXELS, |c, r| {
+                    r == row && lossless[c as usize]
+                });
+                for rect in runs {
+                    let px = refine::copy_rect(data, stride, rect);
+                    let encoded = encoder.encode(&px, rect.w, rect.h);
+                    bytes += encoded.len();
+                    tiles.push((rect, encoded));
+                }
+                if bytes >= REFINE_CHUNK_BYTES {
+                    break;
                 }
             }
-            let runs = pending.runs_larger_than(refine::GLYPH_MAX_PIXELS, |c, r| {
-                r == row && lossless[c as usize]
-            });
-            for rect in runs {
-                let px = refine::copy_rect(&frame.data, frame.stride, rect);
-                let data = encoder.encode(&px, rect.w, rect.h);
-                bytes += data.len();
-                tiles.push((rect, data));
-            }
-            if bytes >= REFINE_CHUNK_BYTES {
-                break;
-            }
+        });
+        if read.is_none() {
+            // The pixels cannot be read: give up on these tiles.
+            pending.clear();
+            return;
         }
         if !pending.is_empty() {
             state.due = Some(tokio::time::Instant::now());

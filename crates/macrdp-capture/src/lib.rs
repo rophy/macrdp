@@ -48,6 +48,9 @@ pub enum CapturePixelFormat {
     Bgra,
     /// NV12 (420f full-range) — zero-copy to VideoToolbox, no color conversion needed
     Nv12,
+    /// BGRA kept in the capture pixel buffer (no copy). VideoToolbox takes the
+    /// buffer as it is; the exact pixels can be read with `SafePixelBuffer::read_bgra`.
+    BgraBuffer,
 }
 
 /// Frame pixel data — either raw BGRA bytes or a zero-copy CVPixelBuffer reference
@@ -137,7 +140,9 @@ impl SCStreamOutputTrait for VideoOutputHandler {
         }
 
         let event = match self.pixel_format {
-            CapturePixelFormat::Nv12 => extract_frame_nv12(&sample),
+            CapturePixelFormat::Nv12 | CapturePixelFormat::BgraBuffer => {
+                extract_frame_buffer(&sample)
+            }
             CapturePixelFormat::Bgra => extract_frame(&sample),
         };
         let Some(event) = event else { return };
@@ -291,9 +296,9 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     }))
 }
 
-/// Extract a frame in NV12 mode — zero-copy CVPixelBuffer wrapped as SafePixelBuffer.
+/// Extract a frame without a copy: the CVPixelBuffer (NV12 or BGRA) wrapped as SafePixelBuffer.
 /// The pixel buffer is retained and passed through the channel without locking or copying.
-fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
+fn extract_frame_buffer(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
     // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
@@ -320,7 +325,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         return None;
     }
 
-    // Extract dirty rects (same logic as the BGRA path)
+    // Extract dirty rects (same logic as the copy path)
     let dirty_rects = sample
         .dirty_rects()
         .unwrap_or_default()
@@ -348,7 +353,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         width,
         height,
         data: FrameData::PixelBuffer(safe_buf),
-        stride: 0, // Not applicable for NV12 PixelBuffer mode
+        stride: 0, // Not applicable for PixelBuffer mode
         timestamp_us,
         dirty_rects,
     }))
@@ -463,20 +468,26 @@ impl ScreenCapturer {
         let frame_interval = CMTime::new(1, config.frame_rate as i32);
 
         let captures_audio = audio_tx.is_some();
-        let stream_config = SCStreamConfiguration::new()
+        let mut stream_config = SCStreamConfiguration::new()
             .with_width(actual_width)
             .with_height(actual_height)
             .with_scales_to_fit(true)
             .with_minimum_frame_interval(&frame_interval)
             .with_pixel_format(match config.pixel_format {
                 CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
-                CapturePixelFormat::Bgra => PixelFormat::BGRA,
+                CapturePixelFormat::Bgra | CapturePixelFormat::BgraBuffer => PixelFormat::BGRA,
             })
             .with_shows_cursor(config.show_cursor)
             .with_captures_audio(captures_audio)
             .with_sample_rate(AudioSampleRate::Rate48000)
             .with_channel_count(AudioChannelCount::Stereo)
             .with_excludes_current_process_audio(true);
+        if config.pixel_format == CapturePixelFormat::BgraBuffer {
+            // Retained buffers stay out of the capture pool: frames in the
+            // channel, a held frame, the frame being encoded and the last sent
+            // frame (kept for lossless refinement).
+            stream_config.set_queue_depth(8);
+        }
 
         // Channel for capture events: buffer 2 entries to allow for jitter
         let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
@@ -505,6 +516,7 @@ impl ScreenCapturer {
             height = actual_height,
             fps = config.frame_rate,
             pixel_format = ?config.pixel_format,
+            queue_depth = stream_config.queue_depth(),
             audio = captures_audio,
             "Screen capture started"
         );
@@ -614,7 +626,14 @@ extern "C" {
     fn CVPixelBufferGetBaseAddressOfPlane(pixel_buffer: *mut c_void, plane: usize) -> *mut u8;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
     fn CVPixelBufferGetHeightOfPlane(pixel_buffer: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetBaseAddress(pixel_buffer: *mut c_void) -> *mut c_void;
+    fn CVPixelBufferGetBytesPerRow(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetHeight(pixel_buffer: *mut c_void) -> usize;
+    fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
 }
+
+/// kCVPixelFormatType_32BGRA ('BGRA')
+const CV_PIXEL_FORMAT_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
 /// kCVPixelBufferLock_ReadOnly
 const CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 0x0000_0001;
@@ -690,6 +709,30 @@ impl SafePixelBuffer {
             CVPixelBufferRetain(self.ptr);
         }
         Self { ptr: self.ptr }
+    }
+
+    /// Whether the buffer holds BGRA pixels (else NV12).
+    pub fn is_bgra(&self) -> bool {
+        unsafe { CVPixelBufferGetPixelFormatType(self.ptr) == CV_PIXEL_FORMAT_32BGRA }
+    }
+
+    /// Lock a BGRA pixel buffer read-only and call `f` with its bytes and
+    /// bytes per row. Returns None if the lock fails.
+    pub fn read_bgra<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
+        unsafe {
+            let status = CVPixelBufferLockBaseAddress(self.ptr, CV_PIXEL_BUFFER_LOCK_READ_ONLY);
+            if status != 0 {
+                tracing::warn!(status, "CVPixelBufferLockBaseAddress failed");
+                return None;
+            }
+            let base = CVPixelBufferGetBaseAddress(self.ptr) as *const u8;
+            let stride = CVPixelBufferGetBytesPerRow(self.ptr);
+            let height = CVPixelBufferGetHeight(self.ptr);
+            let result = (!base.is_null())
+                .then(|| f(std::slice::from_raw_parts(base, stride * height), stride));
+            CVPixelBufferUnlockBaseAddress(self.ptr, CV_PIXEL_BUFFER_LOCK_READ_ONLY);
+            result
+        }
     }
 
     /// Lock the pixel buffer, copy NV12 plane data out, and unlock.
