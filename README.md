@@ -19,8 +19,9 @@ macOS has no RDP server. Its built-in Screen Sharing (VNC) sends lossless ZRLE t
 third-party viewers, so it is slow over normal networks. macrdp encodes the screen as
 H.264 with the hardware encoder and sends it over RDP.
 
-Measured on an M1 Mac (1280x720, Wi-Fi), client in a Linux VM
-(method and scripts: [`tests/bench`](tests/bench/README.md)):
+Measured with the earlier macrdp build on the old IronRDP fork, on an M1 Mac (1280x720,
+Wi-Fi), client in a Linux VM (method and scripts: [`tests/bench`](tests/bench/README.md)).
+The current build on IronRDP master has not been benchmarked yet; its numbers can differ.
 
 | | macrdp | macOS Screen Sharing |
 |---|---|---|
@@ -45,7 +46,8 @@ Measured on an M1 Mac (1280x720, Wi-Fi), client in a Linux VM
   "disconnected by other connection". The encoder is reused and a keyframe is replayed.
 - **Audio** — system audio over `rdpsnd` (PCM 48 kHz stereo). Silent periods are not sent.
   The server respects the client's audio mode (see [Audio](#audio)).
-- **Clipboard** — text and file copy/paste between client and Mac.
+- **Clipboard** — text and file copy/paste in both directions (client to Mac and Mac to
+  client). File copy in both directions is tested with FreeRDP (e2e test 10).
 - **Keyboard and mouse** — scancode mapping, modifiers, wheel.
 - **Lock screen** — falls back to CoreGraphics capture when ScreenCaptureKit cannot capture.
 - **TLS and NLA (CredSSP)** — self-signed certificate generated on first run.
