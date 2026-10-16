@@ -149,7 +149,7 @@ impl RdpServerInputHandler for MacInputHandler {
             }
             MouseEvent::VerticalScroll { value } => m.scroll(value),
             _ => {
-                tracing::debug!(?event, "Unhandled mouse event");
+                tracing::trace!(?event, "Unhandled mouse event");
                 Ok(())
             }
         };
