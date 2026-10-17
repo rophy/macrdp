@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use crate::gfx::{self, SharedGfx};
 use crate::handler::MouseCoordMapper;
+use crate::keep_awake::{KeepAwake, KeepAwakeLoop};
 use crate::perf_stats::SharedPerfStats;
 use crate::pointer::PointerCache;
 use crate::refine::{self, TileGrid, TileRect};
@@ -398,6 +399,8 @@ enum LoopEvent {
     RefineReady(Option<gfx::CompressedPdus>),
     /// Time to try the held frame again.
     Retry,
+    /// Nothing went out for a while: keep the Wi-Fi radio awake.
+    KeepAwake,
     Frame(Option<CapturedFrame>),
 }
 
@@ -590,6 +593,8 @@ pub struct MacDisplay {
     last_keyframe: KeyframeSlot,
     /// Set by the server while the client sends SuppressOutput (e.g. minimised)
     display_suppressed: Arc<AtomicBool>,
+    /// Wi-Fi keep-awake (None: off by config)
+    keep_awake: Option<KeepAwake>,
 }
 
 /// Desktop size from a Display Control layout that the client has not been sent yet
@@ -638,6 +643,7 @@ impl MacDisplay {
         perf_stats: Option<SharedPerfStats>,
         gfx: SharedGfx,
         display_suppressed: Arc<AtomicBool>,
+        keep_awake: Option<KeepAwake>,
     ) -> Self {
         let base_bitrate = bitrate_override.unwrap_or_else(|| {
             macrdp_encode::screen_bitrate(width as u32, height as u32, frame_rate as f32, quality)
@@ -678,6 +684,7 @@ impl MacDisplay {
             cached_encoder_dims: (0, 0),
             last_keyframe: Arc::new(Mutex::new(None)),
             display_suppressed,
+            keep_awake,
         }
     }
 
@@ -896,6 +903,7 @@ impl RdpServerDisplay for MacDisplay {
             overload_count: 0,
             perf_stats: self.perf_stats.clone(),
             start: Instant::now(),
+            keep_awake: self.keep_awake.clone().map(KeepAwakeLoop::new),
         }))
     }
 }
@@ -983,6 +991,8 @@ struct MacDisplayUpdates {
     perf_stats: Option<SharedPerfStats>,
     /// Time base for EGFX frame timestamps
     start: Instant,
+    /// Sends a small request when nothing went out for a while (see keep_awake)
+    keep_awake: Option<KeepAwakeLoop>,
 }
 
 impl Drop for MacDisplayUpdates {
@@ -1001,6 +1011,16 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
     /// EGFX pipeline inside this loop; a frame that is sent that way or dropped
     /// does not end the call (returning `Ok(None)` disconnects the client).
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
+        let update = self.next_update_inner().await;
+        if let (Ok(Some(_)), Some(k)) = (&update, &mut self.keep_awake) {
+            k.on_output(Instant::now());
+        }
+        update
+    }
+}
+
+impl MacDisplayUpdates {
+    async fn next_update_inner(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         loop {
             if self.pending_resize.is_set() && self.wait_for_frames_before_resize() {
                 tokio::time::sleep(RESIZE_DRAIN_POLL).await;
@@ -1049,6 +1069,13 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 self.retry_at
             };
             let refine_at = self.refine.as_ref().and_then(|r| r.due);
+            // Only while the client shows the session.
+            let awake_at = self
+                .keep_awake
+                .as_ref()
+                .filter(|_| self.delivered && !suppressed)
+                .and_then(|k| k.due(Instant::now()))
+                .map(tokio::time::Instant::from_std);
             let mut job = self.refine_job.take();
             let has_job = job.is_some();
             let event = tokio::select! {
@@ -1063,6 +1090,8 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 frame = self.next_frame() => LoopEvent::Frame(frame),
                 _ = async { tokio::time::sleep_until(refine_at.expect("checked")).await },
                     if refine_at.is_some() && !suppressed => LoopEvent::Refine,
+                _ = async { tokio::time::sleep_until(awake_at.expect("checked")).await },
+                    if awake_at.is_some() => LoopEvent::KeepAwake,
             };
             self.cursor_interval = cursor_iv;
             self.refine_job = job;
@@ -1082,6 +1111,12 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                 }
                 LoopEvent::Refine => {
                     self.refine_quiet_screen();
+                    continue;
+                }
+                LoopEvent::KeepAwake => {
+                    if let Some(k) = &mut self.keep_awake {
+                        k.tick(Instant::now());
+                    }
                     continue;
                 }
                 LoopEvent::RefineReady(compressed) => {
@@ -1572,6 +1607,9 @@ impl MacDisplayUpdates {
         match result {
             Ok(()) => {
                 self.surface_frames += 1;
+                if let Some(k) = &mut self.keep_awake {
+                    k.on_output(Instant::now());
+                }
                 if self.surface_frames == 1 || self.surface_frames.is_multiple_of(600) {
                     let (window, base_rtt_ms, queue_depth) = gfx::window_stats(&self.gfx);
                     tracing::info!(

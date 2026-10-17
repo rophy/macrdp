@@ -149,6 +149,7 @@ macrdp uses the first `config.toml` it finds in:
 | `encoder` | software | `hardware` (VideoToolbox) or `software` (OpenH264) |
 | `chroma_mode` | `avc420` | `avc420`, or `avc444` for full chroma |
 | `lossless_text` | `true` | After 200 ms without change, send text and UI tiles again losslessly (ClearCodec); H.264 then updates only changed tiles. AVC420 only. |
+| `wifi_keep_awake` | `true` | While a client uses the session, send a small ECHO request when nothing else was sent for 100 ms, so that Wi-Fi power save on the Mac does not delay input by 50-100 ms. Stops 10 minutes after the last input. Needs a client that opens the ECHO channel (mstsc; FreeRDP with `/echo`). |
 | `ctrl_as_cmd` | `false` | Keyboard for Windows users: Ctrl is Command, Alt is Option, Win is Control (Ctrl+C / Ctrl+V copy and paste). Default: Ctrl is Control, Alt is Command, Win is Option. |
 | `bitrate_mbps` | auto | Bitrate ceiling |
 | `cursor_channel` | `true` | Send the cursor as pointer updates instead of in the video |

@@ -119,6 +119,11 @@ pub struct ServerConfig {
     /// Alt -> Option, Win -> Control, so Ctrl+C / Ctrl+V copy and paste.
     /// Default mapping: Ctrl -> Control, Alt -> Command, Win -> Option.
     pub ctrl_as_cmd: Option<bool>,
+    /// Keep the Mac's Wi-Fi radio awake while a client uses the session
+    /// (default: true): a small ECHO request when nothing else was sent for
+    /// 100 ms, until 10 minutes after the last input. Without it, Wi-Fi power
+    /// save delays input that comes after a quiet moment by 50-100 ms.
+    pub wifi_keep_awake: Option<bool>,
     /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")
     #[serde(alias = "hidpi_scale")]
     pub resolution: Option<String>,
@@ -161,6 +166,7 @@ impl Default for ServerConfig {
             chroma_mode: None,
             lossless_text: None,
             ctrl_as_cmd: None,
+            wifi_keep_awake: None,
             resolution: None,
             show_cursor: None,
             cursor_channel: None,

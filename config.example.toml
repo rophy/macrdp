@@ -83,6 +83,14 @@ encoder = "hardware"
 # Control, Alt is Command, Win is Option (by key position).
 # ctrl_as_cmd = false
 
+# Wi-Fi keep-awake: while a client uses the session, send a small ECHO request
+# when nothing else was sent for 100 ms (until 10 minutes after the last input).
+# Wi-Fi power save on the Mac otherwise delays input after a quiet moment by
+# 50-100 ms. Cost: about 30 small packets/s (3 KB/s) while the screen is still.
+# Works with clients that open the ECHO channel (mstsc; FreeRDP with /echo).
+# Default: true
+# wifi_keep_awake = true
+
 # ─── TLS ───────────────────────────────────────────────────────────────────────
 
 # Path to TLS certificate file (PEM format)

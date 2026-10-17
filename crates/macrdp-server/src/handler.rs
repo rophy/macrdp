@@ -7,6 +7,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::keep_awake::KeepAwake;
+
 /// How many recent client-caused cursor positions are kept to recognise an echo.
 /// The cursor tick (16 ms) reads the position after some of the client's moves
 /// were posted, so it can see any of the last few, not only the newest one.
@@ -170,11 +172,17 @@ pub struct MacInputHandler {
     last_mouse_x: u16,
     last_mouse_y: u16,
     coord_mapper: MouseCoordMapper,
+    keep_awake: Option<KeepAwake>,
 }
 
 impl MacInputHandler {
     /// `ctrl_as_cmd`: post the client's Ctrl as Command (config `ctrl_as_cmd`).
-    pub fn new(coord_mapper: MouseCoordMapper, ctrl_as_cmd: bool) -> Self {
+    /// `keep_awake`: told about each input (config `wifi_keep_awake`).
+    pub fn new(
+        coord_mapper: MouseCoordMapper,
+        ctrl_as_cmd: bool,
+        keep_awake: Option<KeepAwake>,
+    ) -> Self {
         let keyboard = KeyboardInjector::new(ctrl_as_cmd)
             .map_err(|e| tracing::error!("Failed to create keyboard injector: {e}"))
             .ok();
@@ -192,12 +200,16 @@ impl MacInputHandler {
             last_mouse_x: 0,
             last_mouse_y: 0,
             coord_mapper,
+            keep_awake,
         }
     }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        if let Some(k) = &self.keep_awake {
+            k.note_input();
+        }
         let Some(kb) = &mut self.keyboard else { return };
 
         let result = match event {
@@ -217,6 +229,9 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        if let Some(k) = &self.keep_awake {
+            k.note_input();
+        }
         let Some(m) = &mut self.mouse else { return };
         // Mouse events carry the client's modifiers (Shift+click, Cmd+click), not the HID state.
         let flags = self.keyboard.as_ref().map_or(0, |k| k.modifier_flags());

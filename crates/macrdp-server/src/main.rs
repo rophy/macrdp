@@ -3,6 +3,7 @@ mod display;
 mod frame_window;
 mod gfx;
 mod handler;
+mod keep_awake;
 mod perf_stats;
 mod pointer;
 mod refine;
@@ -178,8 +179,16 @@ async fn main() -> Result<()> {
     );
 
     // Create input handler with coordinate mapper
-    let input_handler =
-        MacInputHandler::new(coord_mapper.clone(), config.ctrl_as_cmd.unwrap_or(false));
+    // Wi-Fi keep-awake: input marks the session as used (see keep_awake).
+    let keep_awake = config
+        .wifi_keep_awake
+        .unwrap_or(true)
+        .then(keep_awake::KeepAwake::new);
+    let input_handler = MacInputHandler::new(
+        coord_mapper.clone(),
+        config.ctrl_as_cmd.unwrap_or(false),
+        keep_awake.clone(),
+    );
 
     // Audio setup — shared sender slot, recreated per connection by AudioFactory
     let shared_audio_tx = if config.audio.enabled {
@@ -259,6 +268,7 @@ async fn main() -> Result<()> {
         perf_stats.clone(),
         std::sync::Arc::clone(&gfx_shared),
         std::sync::Arc::clone(&display_suppressed),
+        keep_awake.clone(),
     );
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
@@ -294,6 +304,9 @@ async fn main() -> Result<()> {
         .with_honor_client_desktop_size(honor_client_size)
         .with_display_suppressed_handle(display_suppressed)
         .build();
+    if let Some(k) = &keep_awake {
+        k.set_echo(server.echo_handle().clone());
+    }
 
     // Set credentials — required for RDP authentication
     let (username, password) = match (&config.username, &config.password) {
