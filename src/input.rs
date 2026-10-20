@@ -368,6 +368,18 @@ mod coord_tests {
         assert!(h.take_all().is_empty());
     }
 
+    /// `Inner::key` call sequence for --map-ctrl-to-cmd: C goes down on the
+    /// plain path (noted), Ctrl goes down, the auto-repeat of C goes out as
+    /// Cmd+C (remap path, not noted), then the up goes out on the remap path,
+    /// which also notes the up. Nothing is left for `release_all`.
+    #[test]
+    fn remapped_key_up_clears_a_plain_held_key() {
+        let mut h = HeldKeys::default();
+        h.note(0x08, true); // C down, plain path
+        h.note(0x08, false); // C up, remap path
+        assert!(h.take_all().is_empty(), "no stray C up at connection end");
+    }
+
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
     /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
     /// is not excluded. Every other combination must leave the click alone.
@@ -1374,6 +1386,11 @@ mod macos {
             // there.
             if !down && self.remapped_keys.remove(&vk) {
                 self.post_ctrl_as_cmd(vk, false);
+                // The key may also have gone down on the plain path before
+                // Ctrl was pressed (held key, then auto-repeat under Ctrl).
+                // This up releases it too, so `release_all` must not post a
+                // second up at connection end.
+                self.held_keys.note(vk, false);
                 return;
             }
             if down
