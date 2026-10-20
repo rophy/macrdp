@@ -2113,3 +2113,14 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (pub) decides; `ClientSession::audio_playback` carries it. The lossy-UDP
     audio DVC (multitransport, opt-in) is not gated. Ported from macrdp-v1's
     IronRDP fork (rophy/IronRDP 6ead8214), relicensed by the author.
+
+(32) `ServerEvent::Disconnect(ErrorInfo)` (NOT upstreamed in this shape;
+    added 2026-10-21). Ends the connection after a Server Set Error Info PDU
+    with the given code (MS-RDPBCGR 2.2.5.1.1), sent only to a client that set
+    `RNS_UD_CS_SUPPORT_ERRINFO_PDU` (3.3.5.7.1; flags from acceptor divergence
+    (30)). macrdp's idle timeout sends it with ERRINFO_IDLE_TIMEOUT.
+    `discard_stale_eviction_events` now also drops queued `Disconnect` events
+    and runs at the top of `run_connection` too, so an event meant for a
+    connection that ended cannot end the next one. Upstream has a similar
+    graceful disconnect (f7253861, #1798, `ServerEvent::Disconnect`); drop
+    on a pin bump past it.

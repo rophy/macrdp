@@ -192,6 +192,9 @@ pub struct ClientSession {
     /// (vendored, divergence (31)) The client wants the audio played on its
     /// side; see [`audio_playback_wanted`].
     pub audio_playback: bool,
+    /// (vendored, divergence (32)) The client takes Server Set Error Info PDUs
+    /// (`RNS_UD_CS_SUPPORT_ERRINFO_PDU`), so `ServerEvent::Disconnect` tells it why.
+    pub supports_error_info: bool,
 }
 
 /// (vendored, divergence (31)) The client asks for audio on its side unless it
@@ -752,6 +755,12 @@ pub enum ServerEvent {
     /// ~1-2 s per cycle). Telling the loser WHY it was disconnected is what
     /// makes it stay away.
     EvictedByOtherConnection,
+    /// (vendored, divergence (32)) End this connection and tell the client
+    /// why: a Server Set Error Info PDU with this code (MS-RDPBCGR 2.2.5.1.1),
+    /// if the client advertised `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, then the
+    /// disconnect. An event still queued when its connection ended is dropped
+    /// before the next connection is served.
+    Disconnect(rdp::server_error_info::ErrorInfo),
     Clipboard(ClipboardMessage),
     /// File-copy initiation that bypasses `ClipboardMessage::SendInitiateCopy`
     /// and reaches `CliprdrServer::initiate_file_copy` directly. The only
@@ -1599,7 +1608,9 @@ impl RdpServer {
         let mut discarded = 0usize;
         loop {
             match ev_receiver.try_recv() {
-                Ok(ServerEvent::EvictedByOtherConnection) => discarded += 1,
+                // (divergence (32)) A Disconnect is also addressed to the
+                // connection that is gone.
+                Ok(ServerEvent::EvictedByOtherConnection | ServerEvent::Disconnect(_)) => discarded += 1,
                 Ok(other) => keep.push(other),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -1691,6 +1702,9 @@ impl RdpServer {
         if let Some(flag) = &self.input_reset_request {
             flag.store(true, Ordering::Relaxed);
         }
+        // (vendored, divergence (32)) A Disconnect (or eviction) queued for the
+        // previous connection must not end this one.
+        self.discard_stale_eviction_events().await;
 
         let framed = TokioFramed::new(stream);
 
@@ -2533,6 +2547,27 @@ impl RdpServer {
                         Err(error) => {
                             warn!(?error, "could not encode the eviction reason; disconnecting anyway");
                         }
+                    }
+                    return Ok(RunState::Disconnect);
+                }
+                ServerEvent::Disconnect(info) => {
+                    // MS-RDPBCGR 3.3.5.7.1: a client that did not advertise
+                    // SUPPORT_ERR_INFO_PDU MUST NOT get the PDU.
+                    if self.client_supports_error_info() {
+                        debug!(?info, "disconnecting the client with Error Info");
+                        let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(
+                            rdp::server_error_info::ServerSetErrorInfoPdu(info),
+                        );
+                        match encode_share_data_pdu(pdu, io_channel_id, user_channel_id) {
+                            Ok(bytes) => {
+                                if let Err(error) = writer.write_all(&bytes).await {
+                                    debug!(?error, "could not send the Error Info; disconnecting anyway");
+                                }
+                            }
+                            Err(error) => warn!(?error, "could not encode the Error Info; disconnecting anyway"),
+                        }
+                    } else {
+                        debug!(?info, "disconnecting the client (it takes no Error Info PDU)");
                     }
                     return Ok(RunState::Disconnect);
                 }
@@ -3544,6 +3579,7 @@ impl RdpServer {
             let session = ClientSession {
                 supports_heartbeat: self.client_supports_heartbeat(),
                 audio_playback: audio_playback_wanted(result.client_info_flags),
+                supports_error_info: self.client_supports_error_info(),
             };
             info!(?session, "client session");
             handler.borrow_mut().on_client_session(&session);
@@ -4039,6 +4075,13 @@ impl RdpServer {
             && self
                 .client_early_capability_flags
                 .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU)
+    }
+
+    /// (vendored, divergence (32)) MS-RDPBCGR 3.3.5.7.1: only a client that
+    /// set `RNS_UD_CS_SUPPORT_ERRINFO_PDU` gets a Set Error Info PDU.
+    fn client_supports_error_info(&self) -> bool {
+        self.client_early_capability_flags
+            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU)
     }
 
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {

@@ -242,6 +242,10 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           moment gets the next packet 50-200 ms late, so a key
                           after a pause shows late. About 10 small packets per
                           second while it runs. Config: WIFI_KEEP_AWAKE=0.
+--idle-timeout SECS       Disconnect the client after SECS seconds without keyboard
+                          or mouse input (default 0 = off). The client gets a Set
+                          Error Info PDU with ERRINFO_IDLE_TIMEOUT, so mstsc shows
+                          why the session ended. Config: IDLE_TIMEOUT_SECS.
 --cert-dir PATH           Persisted self-signed TLS cert (default ~/Library/Application Support/macrdp)
 --cert PATH / --key PATH  Operator-supplied TLS cert + key (PEM) — serve a real CA / ACME /
                           Let's Encrypt cert instead of self-signed. Both required; no

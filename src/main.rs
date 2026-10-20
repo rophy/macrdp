@@ -28,6 +28,7 @@ mod file_promise_lazy;
 #[cfg(target_os = "macos")]
 mod h264;
 mod health;
+mod idle;
 mod input;
 mod keep_awake;
 mod keyboard_layout;
@@ -559,6 +560,12 @@ struct Args {
     /// moment by 50-100 ms. Costs about 10 small packets per second.
     #[arg(long = "no-wifi-keep-awake", action = clap::ArgAction::SetTrue)]
     no_wifi_keep_awake: bool,
+
+    /// Disconnect the client after this many seconds without keyboard or
+    /// mouse input (0 = off, the default). The client is told why
+    /// (ERRINFO_IDLE_TIMEOUT: mstsc shows the idle-time message).
+    #[arg(long = "idle-timeout", value_name = "SECS", default_value_t = 0)]
+    idle_timeout: u64,
 
     /// Compress forwarded audio as AAC-LC over RDPSND (MS-RDPEA
     /// WAVE_FORMAT_AAC_MS) instead of raw 16-bit PCM — ~11x less audio
@@ -2366,6 +2373,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if !on("WIFI_KEEP_AWAKE", true) {
         argv.push("--no-wifi-keep-awake".into());
     }
+    if let Some(secs) = cfg.get("IDLE_TIMEOUT_SECS") {
+        if !secs.is_empty() {
+            argv.push("--idle-timeout".into());
+            argv.push(secs.clone());
+        }
+    }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
@@ -3402,9 +3415,13 @@ async fn async_main() -> Result<()> {
     )?;
     // Wi-Fi keep-awake: input marks the session as used (see keep_awake).
     let keep_awake = (!args.no_wifi_keep_awake).then(keep_awake::KeepAwake::new);
-    input_handler.set_session_input(session::SessionInput {
+    // Idle timeout: input restarts it (--idle-timeout, 0 = off).
+    let idle = idle::IdleTimeout::new(args.idle_timeout);
+    let session_input = session::SessionInput {
         keep_awake: keep_awake.clone(),
-    });
+        idle: idle.clone(),
+    };
+    input_handler.set_session_input(session_input.clone());
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
@@ -3496,11 +3513,8 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
-    // Connection edges for the session features (keep-awake).
-    let conn_handler = Some(session::SessionHandler::wrap(
-        conn_handler,
-        keep_awake.clone(),
-    ));
+    // Connection edges for the session features (keep-awake, idle timeout).
+    let conn_handler = Some(session::SessionHandler::wrap(conn_handler, session_input));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -3539,6 +3553,10 @@ async fn async_main() -> Result<()> {
         k.set_heartbeat(server.heartbeat_handle());
         tokio::spawn(k.clone().run(server.output_activity()));
         info!("Wi-Fi keep-awake on (--no-wifi-keep-awake to turn it off)");
+    }
+    if let Some(idle) = idle {
+        info!(secs = args.idle_timeout, "idle timeout on");
+        tokio::spawn(idle.run(server.event_sender().clone()));
     }
 
     // The acceptor records the client's announced keyboard-layout id (KLID) in
@@ -4063,6 +4081,19 @@ mod config_tests {
         let args = args_from_config(&path).unwrap();
         fs::remove_file(&path).ok();
         assert!(args.no_wifi_keep_awake);
+    }
+
+    /// IDLE_TIMEOUT_SECS sets --idle-timeout; off by default.
+    #[test]
+    fn idle_timeout_config_key() {
+        let path = write_temp("idle-default", "USE_KEYCHAIN=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert_eq!(args.idle_timeout, 0);
+        let path = write_temp("idle-on", "IDLE_TIMEOUT_SECS=1800\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert_eq!(args.idle_timeout, 1800);
     }
 
     #[test]
