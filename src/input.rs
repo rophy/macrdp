@@ -649,6 +649,9 @@ pub fn init_focus_observer() {}
 #[cfg(target_os = "macos")]
 mod scancodes;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod keystate;
+
 // Re-export the gather-windows sweep so the capture path can trigger it
 // automatically after a live virtual-display re-mode (see
 // `capture.rs::sync_virtual_display`), the same routine the Ctrl+Alt+G hotkey
@@ -663,7 +666,8 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
+    use super::keystate::{NumLock, SCANCODE_NUM_LOCK};
+    use super::scancodes::{is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode};
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -962,6 +966,9 @@ mod macos {
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
         remapped_keys: HashSet<u16>,
+        // The client's Num Lock (macOS has none): with it off the keypad
+        // keys post navigation keys, as on Windows.
+        num_lock: NumLock,
         // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
         // button, latched at button-down and reused for the drag and the up.
         // The verdict must not be recomputed per event: the down itself fires
@@ -1054,6 +1061,7 @@ mod macos {
                 consumed_keys: HashSet::new(),
                 held_keys: super::HeldKeys::default(),
                 remapped_keys: HashSet::new(),
+                num_lock: NumLock::default(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
@@ -1110,9 +1118,15 @@ mod macos {
         /// CGEventFlag equivalent on macOS, so we reconcile that one: if our
         /// internal toggle disagrees with the client, flip ours and emit a
         /// FlagsChanged so any focused app's AlphaShift query is correct
-        /// from the first keystroke. (Num/Scroll/Kana Lock are kernel-side
-        /// concepts on Windows that macOS doesn't model.)
+        /// from the first keystroke. Num Lock is kept here (`num_lock`): it
+        /// decides what the keypad keys post. (Scroll/Kana Lock are
+        /// kernel-side concepts on Windows that macOS doesn't model.)
         fn synchronize(&mut self, sync: SynchronizeFlags) {
+            let want_num = sync.contains(SynchronizeFlags::NUM_LOCK);
+            if want_num != self.num_lock.is_on() {
+                debug!(want = want_num, "syncing Num Lock to client state");
+                self.num_lock.synchronize(want_num);
+            }
             let want_caps = sync.contains(SynchronizeFlags::CAPS_LOCK);
             if want_caps != self.mods.caps_lock {
                 debug!(
@@ -1260,6 +1274,8 @@ mod macos {
             }
             // Swallowed hotkey downs: nothing was posted, so nothing to release.
             self.consumed_keys.clear();
+            // A posted Num Lock press was in `keys`; the state stays.
+            self.num_lock.forget_key();
             self.left_click_remapped = false;
 
             let stuck = self.mods.cg_flags().bits();
@@ -1318,7 +1334,18 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
-            let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
+            if scancode == SCANCODE_NUM_LOCK && !extended && !self.num_lock.key(down) {
+                trace!(down, "Num Lock key-up not posted (no posted press)");
+                return;
+            }
+            // With Num Lock off the keypad keys move the cursor, as on
+            // Windows (the client sends the same scancode either way).
+            let keypad_nav = if !extended && !self.num_lock.is_on() {
+                keypad_navigation_vk(scancode)
+            } else {
+                None
+            };
+            let Some(vk) = keypad_nav.or_else(|| scancode_to_cgkeycode(scancode, extended)) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
