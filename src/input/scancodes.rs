@@ -162,6 +162,20 @@ pub(crate) fn keypad_navigation_vk(scancode: u8) -> Option<u16> {
     })
 }
 
+/// The Windows modifier layout (`--ctrl-as-cmd`): takes the keycode of the
+/// default table (Ctrl → Control, Alt → Option, Win → Command) and returns the
+/// one to post, so that Ctrl → Command, Alt → Option, Win → Control. That is a
+/// Control/Command swap, per side; every other key is unchanged.
+pub(crate) fn ctrl_as_cmd_vk(vk: u16) -> u16 {
+    match vk {
+        0x3B => 0x37, // Left Ctrl: Control → Command
+        0x3E => 0x36, // Right Ctrl: Right Control → Right Command
+        0x37 => 0x3B, // Left Win: Command → Control
+        0x36 => 0x3E, // Right Win: Right Command → Right Control
+        other => other,
+    }
+}
+
 /// True for any macOS vk that hardware would mark with
 /// `CGEventFlagNumericPad` — keypad digits, operators, decimal,
 /// Enter, Clear. The cluster sits in the kVK_ANSI_Keypad* range
@@ -241,6 +255,19 @@ mod tests {
 
         // Num Lock itself is posted as keypad Clear.
         assert_eq!(scancode_to_cgkeycode(0x45, false), Some(0x47));
+    }
+
+    #[test]
+    fn ctrl_as_cmd_is_the_windows_modifier_layout() {
+        let map = |sc, ext| ctrl_as_cmd_vk(scancode_to_cgkeycode(sc, ext).unwrap());
+        assert_eq!(map(0x1D, false), 0x37); // Left Ctrl → Left Command
+        assert_eq!(map(0x1D, true), 0x36); // Right Ctrl → Right Command
+        assert_eq!(map(0x38, false), 0x3A); // Left Alt → Left Option
+        assert_eq!(map(0x38, true), 0x3D); // Right Alt → Right Option
+        assert_eq!(map(0x5B, true), 0x3B); // Left Win → Left Control
+        assert_eq!(map(0x5C, true), 0x3E); // Right Win → Right Control
+        assert_eq!(map(0x2E, false), 0x08); // C stays C
+        assert_eq!(map(0x2A, false), 0x38); // Shift stays Shift
     }
 
     #[test]

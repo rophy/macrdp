@@ -76,6 +76,15 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           need the client's Win/Super key). Cmd+Q is never produced
                           (Q excluded); nav keys untouched. Always suppressed when a
                           terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
+--ctrl-as-cmd             Windows modifier layout for every key: the client's
+                          Ctrl is Cmd, Alt is Option, Win is Control (default:
+                          Ctrl = Control, Alt = Option, Win = Cmd). Every Ctrl
+                          combo is the Cmd combo in every app: Ctrl+C/V/Z/S/Q,
+                          Ctrl+Tab, Ctrl+arrows, Ctrl+click. In a terminal Ctrl+C
+                          copies; Win+C sends SIGINT. Alt+Tab switches apps with
+                          --alt-tab-switch. The Ctrl+Alt+G and Ctrl+Alt+Shift+R
+                          hotkeys become Win+Alt+G / Win+Alt+Shift+R. Cannot be
+                          combined with --map-ctrl-to-cmd. macOS-only.
 --no-remap-apps LIST      Comma-separated bundle ids where --map-ctrl-to-cmd is
                           suppressed, on top of the built-in terminal list. For
                           apps with an embedded terminal that can't be auto-detected

@@ -774,8 +774,18 @@ struct Args {
     /// macOS shortcuts need Cmd, i.e. the client's Windows/Super key). Cmd+Q is
     /// deliberately NOT produced (Q is excluded); nav keys are untouched. Always
     /// suppressed when a terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
-    #[arg(long = "map-ctrl-to-cmd")]
+    #[arg(long = "map-ctrl-to-cmd", conflicts_with = "ctrl_as_cmd")]
     map_ctrl_to_cmd: bool,
+
+    /// Windows modifier layout for every key: the client's Ctrl is Cmd, Alt is
+    /// Option and the Windows key is Control (the default layout is Ctrl =
+    /// Control, Alt = Option, Win = Cmd). So Ctrl+C/V/Z/S/Q/Tab/arrows and
+    /// Ctrl+click are the Cmd combos in every app, terminals included (there
+    /// Ctrl+C copies; Win+C sends SIGINT). Alt+Tab switches apps only with
+    /// --alt-tab-switch. Cannot be combined with --map-ctrl-to-cmd (the curated,
+    /// terminal-aware remap). macOS-only.
+    #[arg(long = "ctrl-as-cmd")]
+    ctrl_as_cmd: bool,
 
     /// Bundle ids (comma-separated) where --map-ctrl-to-cmd is suppressed, in
     /// addition to the built-in terminal list. Use this for apps with an embedded
@@ -2343,6 +2353,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
     }
+    if on("CTRL_AS_CMD", false) {
+        argv.push("--ctrl-as-cmd".into());
+    }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
             argv.push("--no-remap-apps".into());
@@ -3186,6 +3199,10 @@ async fn async_main() -> Result<()> {
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
+    crate::input::set_ctrl_as_cmd(args.ctrl_as_cmd);
+    if args.ctrl_as_cmd {
+        info!("Windows modifier layout enabled (--ctrl-as-cmd): Ctrl=Cmd, Alt=Option, Win=Control");
+    }
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
     if args.map_ctrl_to_cmd {
         info!(

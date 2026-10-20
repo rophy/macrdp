@@ -587,6 +587,17 @@ pub fn set_map_ctrl_to_cmd(on: bool) {
     MAP_CTRL_TO_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, post the client's modifiers in the Windows layout for every key
+/// (`--ctrl-as-cmd`): Ctrl as Command, Alt as Option, Win as Control. Unlike
+/// `MAP_CTRL_TO_CMD` (a curated key set, suppressed in terminals) this swaps
+/// the modifier keys themselves, so every Ctrl combo is the Cmd combo
+/// (`scancodes::ctrl_as_cmd_vk`). Off by default.
+static CTRL_AS_CMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ctrl_as_cmd(on: bool) {
+    CTRL_AS_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Shared per-SERVED-connection reset flag for held-modifier + button state.
 ///
 /// Modifier state lives in `Inner`, which is constructed ONCE for the process,
@@ -667,7 +678,9 @@ mod macos {
 
     use super::is_remappable_shortcut;
     use super::keystate::{NumLock, PostedKeys, UnicodeAction, UnicodeKeys, SCANCODE_NUM_LOCK};
-    use super::scancodes::{is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode};
+    use super::scancodes::{
+        ctrl_as_cmd_vk, is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode,
+    };
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -1374,6 +1387,11 @@ mod macos {
             let Some(vk) = keypad_nav.or_else(|| scancode_to_cgkeycode(scancode, extended)) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
+            };
+            let vk = if super::CTRL_AS_CMD.load(std::sync::atomic::Ordering::Relaxed) {
+                ctrl_as_cmd_vk(vk)
+            } else {
+                vk
             };
             let vk = self.posted.vk_for((scancode, extended), down, vk);
             self.refresh_auto_layout();
