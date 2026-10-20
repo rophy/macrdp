@@ -136,6 +136,7 @@ const fn build_scancode_extended() -> [u16; 256] {
     t[0x53] = 0x75; // Delete (forward delete)
     t[0x5B] = 0x37; // left GUI / Windows → kVK_Command
     t[0x5C] = 0x36; // right GUI → kVK_RightCommand
+    t[0x5D] = 0x6E; // Menu (Apps) → kVK_ContextualMenu, what a PC keyboard sends on a Mac
     t
 }
 
@@ -212,6 +213,8 @@ mod tests {
         // 0x48 is numpad-8 normally but the Up arrow when extended.
         assert_eq!(scancode_to_cgkeycode(0x48, false), Some(0x5B));
         assert_eq!(scancode_to_cgkeycode(0x48, true), Some(0x7E));
+        // Menu (Apps) key: extended 0x5D.
+        assert_eq!(scancode_to_cgkeycode(0x5D, true), Some(0x6E));
         // GUI / Windows key only exists in the extended table.
         assert_eq!(scancode_to_cgkeycode(0x5B, true), Some(0x37));
         assert_eq!(scancode_to_cgkeycode(0x5B, false), None);
