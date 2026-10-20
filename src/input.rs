@@ -666,7 +666,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::keystate::{NumLock, PostedKeys, SCANCODE_NUM_LOCK};
+    use super::keystate::{NumLock, PostedKeys, UnicodeAction, UnicodeKeys, SCANCODE_NUM_LOCK};
     use super::scancodes::{is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode};
 
     use anyhow::{anyhow, Result};
@@ -972,6 +972,8 @@ mod macos {
         // Keycode each held client key went down with; its key-up posts the
         // same one (Num Lock may change in between).
         posted: PostedKeys,
+        // RDP Unicode key events: surrogate pairs joined, downs counted.
+        unicode: UnicodeKeys,
         // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
         // button, latched at button-down and reused for the drag and the up.
         // The verdict must not be recomputed per event: the down itself fires
@@ -1066,6 +1068,7 @@ mod macos {
                 remapped_keys: HashSet::new(),
                 num_lock: NumLock::default(),
                 posted: PostedKeys::default(),
+                unicode: UnicodeKeys::default(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
@@ -1270,6 +1273,14 @@ mod macos {
                     warn!(vk, "CGEvent::new_keyboard_event failed (release)");
                 }
             }
+            // A Unicode key-down (keycode 0) whose up never came.
+            let unicode_down = self.unicode.take_down();
+            if unicode_down {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, false) {
+                    ev.set_flags(flags);
+                    ev.post(CGEventTapLocation::HID);
+                }
+            }
             // Remapped Ctrl->Cmd keys: the down went out as Cmd+key, so the
             // up does too (`post_ctrl_as_cmd` also restores the real flags).
             let remapped: Vec<u16> = self.remapped_keys.drain().collect();
@@ -1289,10 +1300,16 @@ mod macos {
                 self.post_flags_changed(VK_LCMD);
             }
 
-            if released_buttons > 0 || !keys.is_empty() || !remapped.is_empty() || had_mods {
+            if released_buttons > 0
+                || !keys.is_empty()
+                || !remapped.is_empty()
+                || had_mods
+                || unicode_down
+            {
                 tracing::info!(
                     why,
                     keycodes = ?keys,
+                    unicode_down,
                     remapped = ?remapped,
                     modifier_flags = format!("0x{stuck:08X}"),
                     buttons = released_buttons,
@@ -1777,17 +1794,21 @@ mod macos {
             }
         }
 
-        fn unicode(&self, c: u16, down: bool) {
-            // For unicode, send a "null" keycode and set the string. Only fire
-            // on key-down — Mac doesn't have a release-side for typed text.
-            if !down {
-                return;
-            }
-            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, true) else {
+        /// RDP Unicode key event (one UTF-16 unit): a key-down and a key-up
+        /// with keycode 0 carrying the character. A surrogate pair (emoji)
+        /// is joined into one character; a lone unit of a pair was not valid
+        /// text and got lost. The key-up pairs the down, as a real key does.
+        fn unicode(&mut self, c: u16, down: bool) {
+            let (down, text) = match self.unicode.feed(c, down) {
+                UnicodeAction::Down(text) => (true, text),
+                UnicodeAction::Up(text) => (false, text),
+                UnicodeAction::None => return,
+            };
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, down) else {
                 warn!("unicode CGEvent create failed");
                 return;
             };
-            ev.set_string_from_utf16_unchecked(&[c]);
+            ev.set_string_from_utf16_unchecked(&text);
             ev.post(CGEventTapLocation::HID);
         }
 

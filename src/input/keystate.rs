@@ -1,5 +1,5 @@
-//! Pure keyboard state for the input handler: the client's Num Lock and the
-//! keycode each held key went down with.
+//! Pure keyboard state for the input handler: the client's Num Lock, the
+//! keycode each held key went down with, and RDP Unicode key events.
 //!
 //! No platform calls, so it is unit-tested on every target. Ported from
 //! macrdp-v1 (crates/macrdp-input/src/flags.rs and keyboard.rs, commits
@@ -111,9 +111,148 @@ impl PostedKeys {
     }
 }
 
+/// What to post for an RDP Unicode keyboard event.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum UnicodeAction {
+    /// Key-down carrying these UTF-16 units (one character).
+    Down(Vec<u16>),
+    /// Key-up carrying these UTF-16 units (the character of the down).
+    Up(Vec<u16>),
+    /// Nothing to post.
+    None,
+}
+
+/// RDP Unicode key events (MS-RDPBCGR TS_UNICODE_KEYBOARD_EVENT): one UTF-16
+/// unit per event, a down and an up for each. A character outside the BMP
+/// (emoji) comes as a high and a low surrogate; a lone surrogate is not valid
+/// text, so the pair is joined into one key-down. Also counts the downs
+/// posted without their up, for the connection end.
+#[derive(Debug, Default)]
+pub(super) struct UnicodeKeys {
+    high: Option<u16>,
+    /// The joined pair posted as a key-down: its low surrogate release posts
+    /// the key-up.
+    pair_down: Option<[u16; 2]>,
+    /// Key-downs posted and not released yet.
+    down: u32,
+}
+
+impl UnicodeKeys {
+    pub(super) fn feed(&mut self, unit: u16, pressed: bool) -> UnicodeAction {
+        let action = match unit {
+            0xD800..=0xDBFF => {
+                // High surrogate: wait for the low one; its release posts nothing.
+                if pressed {
+                    self.high = Some(unit);
+                }
+                UnicodeAction::None
+            }
+            0xDC00..=0xDFFF => match (pressed, self.high) {
+                (true, Some(high)) => {
+                    self.high = None;
+                    self.pair_down = Some([high, unit]);
+                    UnicodeAction::Down(vec![high, unit])
+                }
+                // A low surrogate without a high one is dropped.
+                (true, None) => UnicodeAction::None,
+                (false, _) => match self.pair_down.take() {
+                    Some(pair) => UnicodeAction::Up(pair.to_vec()),
+                    None => UnicodeAction::None,
+                },
+            },
+            _ => {
+                if pressed {
+                    self.high = None;
+                    UnicodeAction::Down(vec![unit])
+                } else {
+                    UnicodeAction::Up(vec![unit])
+                }
+            }
+        };
+        match action {
+            UnicodeAction::Down(_) => self.down += 1,
+            UnicodeAction::Up(_) => self.down = self.down.saturating_sub(1),
+            UnicodeAction::None => {}
+        }
+        action
+    }
+
+    /// Forget every Unicode key; returns whether one was down (then one
+    /// key-up is due: all Unicode downs use the same keycode).
+    pub(super) fn take_down(&mut self) -> bool {
+        std::mem::take(self).down > 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bmp_character_is_posted_as_is() {
+        let mut u = UnicodeKeys::default();
+        assert_eq!(u.feed(0x00E9, true), UnicodeAction::Down(vec![0x00E9]));
+        assert_eq!(u.feed(0x00E9, false), UnicodeAction::Up(vec![0x00E9]));
+        assert!(!u.take_down());
+    }
+
+    #[test]
+    fn surrogate_pair_becomes_one_character() {
+        // U+1F600 = D83D DE00; mstsc order: high down, high up, low down, low up
+        let mut u = UnicodeKeys::default();
+        assert_eq!(u.feed(0xD83D, true), UnicodeAction::None);
+        assert_eq!(u.feed(0xD83D, false), UnicodeAction::None);
+        assert_eq!(
+            u.feed(0xDE00, true),
+            UnicodeAction::Down(vec![0xD83D, 0xDE00])
+        );
+        assert_eq!(
+            u.feed(0xDE00, false),
+            UnicodeAction::Up(vec![0xD83D, 0xDE00])
+        );
+        assert!(!u.take_down());
+    }
+
+    #[test]
+    fn surrogate_pair_with_nested_releases() {
+        let mut u = UnicodeKeys::default();
+        assert_eq!(u.feed(0xD83D, true), UnicodeAction::None);
+        assert_eq!(
+            u.feed(0xDE00, true),
+            UnicodeAction::Down(vec![0xD83D, 0xDE00])
+        );
+        assert_eq!(
+            u.feed(0xDE00, false),
+            UnicodeAction::Up(vec![0xD83D, 0xDE00])
+        );
+        assert_eq!(u.feed(0xD83D, false), UnicodeAction::None);
+    }
+
+    #[test]
+    fn lone_surrogates_are_dropped() {
+        let mut u = UnicodeKeys::default();
+        assert_eq!(u.feed(0xDE00, true), UnicodeAction::None);
+        assert_eq!(u.feed(0xDE00, false), UnicodeAction::None);
+        // a high surrogate followed by a BMP character is dropped too
+        assert_eq!(u.feed(0xD83D, true), UnicodeAction::None);
+        assert_eq!(u.feed(0x0041, true), UnicodeAction::Down(vec![0x0041]));
+        assert_eq!(u.feed(0xDE00, true), UnicodeAction::None);
+    }
+
+    #[test]
+    fn a_unicode_key_stays_down_until_all_are_up() {
+        let mut u = UnicodeKeys::default();
+        u.feed(0x00E9, true);
+        u.feed(0x00FC, true);
+        u.feed(0x00E9, false);
+        assert!(u.take_down(), "one is still down");
+        assert!(!u.take_down(), "take_down forgets it");
+        // Both up and a stray up: nothing is down.
+        u.feed(0x00E9, true);
+        u.feed(0x00E9, false);
+        u.feed(0x00E9, false);
+        assert!(!u.take_down());
+    }
 
     #[test]
     fn key_up_posts_the_keycode_of_its_key_down() {
