@@ -1139,3 +1139,31 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
         }
     }
 }
+
+/// (vendored divergence 28) A horizontal wheel PDU (PTRFLAGS_HWHEEL) must
+/// arrive as `HorizontalScroll` with its signed rotation units, not fall
+/// through to a `Move` to the PDU's (meaningless) x/y.
+#[test]
+fn horizontal_wheel_pdu_is_a_horizontal_scroll() {
+    use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
+    use ironrdp_server::MouseEvent;
+
+    for units in [-120_i16, -1, 1, 120] {
+        let mut flags = PointerFlags::HORIZONTAL_WHEEL;
+        if units < 0 {
+            flags |= PointerFlags::WHEEL_NEGATIVE;
+        }
+        let pdu = MousePdu {
+            flags,
+            number_of_wheel_rotation_units: units,
+            x_position: 7,
+            y_position: 9,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
+        let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
+        match MouseEvent::from(decoded) {
+            MouseEvent::HorizontalScroll { value } => assert_eq!(value, units),
+            other => panic!("expected HorizontalScroll for {units}, got {other:?}"),
+        }
+    }
+}

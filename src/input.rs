@@ -293,10 +293,21 @@ impl WheelAccumulator {
     }
 }
 
+/// CGEvent scroll wheel counts for `v` / `h` lines in RDP's sign convention
+/// (vertical: positive = wheel forward / up; horizontal: positive = tilt
+/// right, as Windows WM_MOUSEHWHEEL and FreeRDP's ainput `x`). macOS: wheel1
+/// positive scrolls up, wheel2 positive scrolls LEFT, so horizontal flips.
+/// Measured 2026-10-21 in Chrome: RDP +120 horizontal posted as wheel2 = +3
+/// gave `deltaX` -120 (scroll left); macrdp-v1 (wheel2 = -lines) gives +120.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn wheel_counts(v: i32, h: i32) -> (i32, i32) {
+    (v, h.saturating_neg())
+}
+
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, should_remap_click, HeldKeys,
+        is_remappable_shortcut, map_client_to_display, should_remap_click, wheel_counts, HeldKeys,
         WheelAccumulator, WHEEL_FIXED_ONE,
     };
 
@@ -322,6 +333,16 @@ mod coord_tests {
         // Half a notch (high-resolution wheel) twice = one notch.
         assert_eq!(w.lines(60 << 16), 1);
         assert_eq!(w.lines(60 << 16), 2);
+    }
+
+    /// RDP tilt right (+) must scroll right: CG wheel2 is positive = left.
+    #[test]
+    fn horizontal_sign_flips_for_cg_vertical_does_not() {
+        assert_eq!(wheel_counts(3, 0), (3, 0));
+        assert_eq!(wheel_counts(-3, 0), (-3, 0));
+        assert_eq!(wheel_counts(0, 3), (0, -3));
+        assert_eq!(wheel_counts(0, -3), (0, 3));
+        assert_eq!(wheel_counts(0, i32::MIN), (0, i32::MAX));
     }
 
     #[test]
@@ -1754,6 +1775,11 @@ mod macos {
                 MouseEvent::VerticalScroll { value } => {
                     self.scroll(i64::from(value) * super::WHEEL_FIXED_ONE, 0)
                 }
+                // Fast-path horizontal wheel (mstsc tilt): plain units,
+                // positive = right.
+                MouseEvent::HorizontalScroll { value } => {
+                    self.scroll(0, i64::from(value) * super::WHEEL_FIXED_ONE)
+                }
                 // ainput channel (FreeRDP): 16.16 fixed-point rotation units.
                 MouseEvent::Scroll { x, y } => self.scroll(i64::from(y), i64::from(x)),
                 MouseEvent::Button4Pressed
@@ -1945,9 +1971,15 @@ mod macos {
             if v == 0 && h == 0 {
                 return;
             }
-            let Ok(ev) =
-                CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::LINE, 2, v, h, 0)
-            else {
+            let (wheel1, wheel2) = super::wheel_counts(v, h);
+            let Ok(ev) = CGEvent::new_scroll_event(
+                self.source.clone(),
+                ScrollEventUnit::LINE,
+                2,
+                wheel1,
+                wheel2,
+                0,
+            ) else {
                 return;
             };
             // Carry the held modifiers so Shift+scroll (horizontal in most apps)

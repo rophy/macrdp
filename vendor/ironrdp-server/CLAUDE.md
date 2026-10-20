@@ -2049,3 +2049,15 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     was pressed again). Divergence 24 still fires at the start of the next
     served connection and now finds nothing left. Default method, so other
     implementors are unchanged.
+
+(28) Horizontal mouse wheel (NOT upstreamed; added 2026-10-21).
+    `capabilities.rs` advertises `InputFlags::TS_MOUSE_HWHEEL` (MS-RDPBCGR
+    2.2.7.1.6); without it mstsc sends no horizontal wheel at all and FreeRDP
+    drops it on the fast path (it still sends it on ainput). `handler.rs`
+    gains `MouseEvent::HorizontalScroll { value: i16 }` and maps
+    `PointerFlags::HORIZONTAL_WHEEL` (PTRFLAGS_HWHEEL, 2.2.8.1.1.3.1.1.3) to
+    it; before, such a PDU fell through to `Move` with the PDU's x/y. Value is
+    the signed rotation units, positive = tilt right. Adding an enum variant
+    breaks exhaustive matches in other implementors; the ones in this repo use
+    a wildcard arm or match every variant. Same shape as macrdp-v1's IronRDP
+    fork (commit f080dca6 for the capability).

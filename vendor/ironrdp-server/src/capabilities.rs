@@ -64,7 +64,10 @@ fn input_capabilities() -> capability_sets::Input {
             | capability_sets::InputFlags::MOUSEX
             | capability_sets::InputFlags::FASTPATH_INPUT
             | capability_sets::InputFlags::UNICODE
-            | capability_sets::InputFlags::FASTPATH_INPUT_2,
+            | capability_sets::InputFlags::FASTPATH_INPUT_2
+            // (vendored, divergence 28) MS-RDPBCGR 2.2.7.1.6: without it the
+            // client (mstsc, FreeRDP fast-path) sends no horizontal wheel.
+            | capability_sets::InputFlags::TS_MOUSE_HWHEEL,
         keyboard_layout: 0,
         keyboard_type: None,
         keyboard_subtype: 0,

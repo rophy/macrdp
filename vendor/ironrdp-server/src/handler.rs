@@ -37,6 +37,10 @@ pub enum MouseEvent {
     Button5Pressed,
     Button5Released,
     VerticalScroll { value: i16 },
+    /// (vendored, divergence 28) Fast-path / slow-path horizontal wheel
+    /// (PTRFLAGS_HWHEEL, MS-RDPBCGR 2.2.8.1.1.3.1.1.3): rotation units,
+    /// positive = tilt right (Windows WM_MOUSEHWHEEL convention).
+    HorizontalScroll { value: i16 },
     Scroll { x: i32, y: i32 },
     RelMove { x: i32, y: i32 },
 }
@@ -179,6 +183,13 @@ impl From<MousePdu> for MouseEvent {
             // future pin regresses upstream's decode, fix it in ironrdp-pdu
             // rather than compensating here.
             MouseEvent::VerticalScroll {
+                value: value.number_of_wheel_rotation_units,
+            }
+        } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
+            // (vendored, divergence 28) Without this arm a horizontal wheel
+            // PDU fell through to `Move` with the PDU's x/y (which the spec
+            // says to ignore on wheel events).
+            MouseEvent::HorizontalScroll {
                 value: value.number_of_wheel_rotation_units,
             }
         } else {
