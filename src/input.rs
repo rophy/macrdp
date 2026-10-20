@@ -1383,17 +1383,23 @@ mod macos {
             // the next move posts as MouseMoved, not a phantom
             // `LeftMouseDragged`. An interrupted drag completes as a drop at
             // the last cursor position (docs/known-quirks.md).
-            let held_buttons = [
-                (self.left_down, CGMouseButton::Left),
-                (self.right_down, CGMouseButton::Right),
-                (self.middle_down, CGMouseButton::Center),
-            ];
+            let to_release =
+                release.buttons_to_release([self.left_down, self.right_down, self.middle_down]);
             let mut released_buttons = 0;
-            for (held, button) in held_buttons {
-                if held && buttons {
+            for (go, button) in to_release.into_iter().zip([
+                CGMouseButton::Left,
+                CGMouseButton::Right,
+                CGMouseButton::Center,
+            ]) {
+                if go {
                     self.button(button, false);
                     released_buttons += 1;
                 }
+            }
+            // A connection edge: a Tab up of the old connection must not make
+            // the first Synchronize of the next one a focus-in.
+            if release.resets_focus_in() {
+                self.focus_in = FocusIn::default();
             }
 
             // Keys whose key-up never came. Posted with the current modifier

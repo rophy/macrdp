@@ -98,8 +98,10 @@ const SCANCODE_TAB: u8 = 0x0F;
 /// Measured at the server (2026-10-21): mstsc (Windows 10) 0.1-1 ms, FreeRDP
 /// 3.30 0.2 ms; the client sends the two together. A typed Tab followed by a
 /// key that makes guacd change a lock is a keystroke later (157 ms measured
-/// with a scripted 150 ms gap); the margin is for a split network packet.
-const FOCUS_IN_WINDOW_MS: u64 = 50;
+/// with a scripted 150 ms gap). 20 ms keeps a margin for a split network
+/// packet and makes a false focus-in (a real Tab up, then a guacd lock
+/// Synchronize) need a gap of under 20 ms between two keys.
+pub(super) const FOCUS_IN_WINDOW_MS: u64 = 20;
 
 /// What a trigger releases on the Mac.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +125,18 @@ impl Release {
     pub(super) fn buttons(self) -> bool {
         self == Release::All
     }
+
+    /// The held mouse buttons (left, right, middle) this release lets go of.
+    /// `release_held` releases exactly these.
+    pub(super) fn buttons_to_release(self, held: [bool; 3]) -> [bool; 3] {
+        held.map(|down| down && self.buttons())
+    }
+
+    /// A connection edge also forgets the focus-in state: a Tab up at the
+    /// end of one connection is not part of a Synchronize of the next.
+    pub(super) fn resets_focus_in(self) -> bool {
+        self == Release::All
+    }
 }
 
 /// Tells a focus-in Synchronize from one that only changes a lock state.
@@ -143,7 +157,7 @@ impl Release {
 ///
 /// So the keys are released only on a Synchronize that follows a Tab key-up
 /// within `FOCUS_IN_WINDOW_MS`, with no key-down in between.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct FocusIn {
     /// When the last Tab key-up came, if no key went down after it.
     tab_up_ms: Option<u64>,
@@ -361,6 +375,61 @@ mod tests {
         f.note_key(0x0F, false, false, 0);
         assert!(!f.synchronize(0).buttons());
         assert!(!f.synchronize(0).buttons());
+    }
+
+    /// The decisions `release_held` takes, for each Synchronize kind: the
+    /// buttons it lets go of and whether it forgets the focus-in state.
+    /// `Inner::synchronize` calls `release_held` with what `FocusIn` returns
+    /// when `keys()` is true, and does nothing for `Nothing`.
+    #[test]
+    fn release_held_keeps_buttons_on_a_synchronize() {
+        let held = [true, true, true];
+        // mstsc focus-in, focus click held: keys go, the click stays.
+        let mut f = FocusIn::default();
+        f.note_key(0x0F, false, false, 100);
+        let release = f.synchronize(100);
+        assert_eq!(release, Release::KeysOnly);
+        assert!(release.keys());
+        assert_eq!(release.buttons_to_release(held), [false; 3]);
+        assert!(!release.resets_focus_in());
+        // guacd lock Synchronize: nothing at all.
+        let release = f.synchronize(5_000);
+        assert_eq!(release, Release::Nothing);
+        assert!(!release.keys());
+        assert_eq!(release.buttons_to_release(held), [false; 3]);
+        // Connection edge: only the buttons that are down, and a fresh FocusIn.
+        assert_eq!(
+            Release::All.buttons_to_release([true, false, true]),
+            [true, false, true]
+        );
+        assert!(Release::All.resets_focus_in());
+    }
+
+    /// The window edge: a Synchronize exactly `FOCUS_IN_WINDOW_MS` after the
+    /// Tab up is a focus-in, one millisecond later it is not.
+    #[test]
+    fn focus_in_window_boundary() {
+        let mut f = FocusIn::default();
+        f.note_key(0x0F, false, false, 1_000);
+        assert_eq!(f.synchronize(1_000 + FOCUS_IN_WINDOW_MS), Release::KeysOnly);
+        f.note_key(0x0F, false, false, 2_000);
+        assert_eq!(
+            f.synchronize(2_000 + FOCUS_IN_WINDOW_MS + 1),
+            Release::Nothing
+        );
+    }
+
+    /// A Tab up at the end of a connection does not count for the first
+    /// Synchronize of the next one: `release_held(All)` resets the state.
+    #[test]
+    fn a_connection_edge_forgets_the_tab_up() {
+        let mut f = FocusIn::default();
+        f.note_key(0x0F, false, false, 500);
+        if Release::All.resets_focus_in() {
+            f = FocusIn::default();
+        }
+        assert_eq!(f, FocusIn::default());
+        assert_eq!(f.synchronize(505), Release::Nothing);
     }
 
     #[test]
