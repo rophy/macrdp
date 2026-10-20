@@ -1551,7 +1551,7 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
         warn!("auto-unlock: CGEventSource::new failed");
         return AutoUnlockOutcome::SkippedUnsafe;
     };
-    // Modifier state has to be posted on both sources — see `post_flags` below.
+    // Second source for the doubled modifier post — see `post_flags` below.
     let Ok(source_hid) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         warn!("auto-unlock: CGEventSource::new (HID) failed");
         return AutoUnlockOutcome::SkippedUnsafe;
@@ -1586,10 +1586,14 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // consumed waking/focusing the lock screen instead of entering text.
     // Round 1's mistake was using RETURN as that wake (it submitted an empty
     // password); a bare SHIFT tap cannot insert text and cannot submit, so
-    // it wakes the field harmlessly. Posted as FlagsChanged on BOTH event
-    // sources, the pattern `input.rs::post_flags_changed` established —
-    // `[NSEvent modifierFlags]` and the HID-level state are backed by
-    // different sources and both need to see it.
+    // it wakes the field harmlessly. Posted as FlagsChanged from BOTH event
+    // sources, the pattern `input.rs::post_flags_changed` had when this was
+    // live-tested. `input.rs` has since dropped the second post: on macOS
+    // 15.7.9 one FlagsChanged from either source updates both the session
+    // and the HID modifier state (see `Inner::new`), so here the second post
+    // is most likely redundant (an app would see each Shift change twice;
+    // nothing at the lock screen acts on that). It is kept because this
+    // path has not been re-tested with one post.
     const VK_SHIFT: u16 = 0x38;
     let post_flags = |flags: CGEventFlags| {
         for src in [&source, &source_hid] {
@@ -1628,7 +1632,7 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // keystrokes; no amount of settle delay or Return-retry fixes a bulk
     // fill. Modifiers are held across runs via real FlagsChanged events (not
     // just per-event flags) so a shifted character can't come out unshifted
-    // — same reasoning as `input.rs::post_flags_changed`.
+    // (posted from both sources, see the wake above).
     let mut shift_held = false;
     let mut option_held = false;
     let flags_for = |shift: bool, option: bool| {

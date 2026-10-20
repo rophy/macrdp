@@ -1116,11 +1116,14 @@ mod macos {
         ///  * **A new served connection** (`reset_request`, raised by the
         ///    vendored server once at the top of `run_connection` /
         ///    `serve_negotiated` — never on a reactivation, never for a
-        ///    preemption candidate) — clears EVERYTHING, unconditionally:
-        ///    modifiers, non-modifier keys still down, the click latch,
-        ///    outstanding remapped key-downs, and any button still down — which is RELEASED (a synthetic Up through
+        ///    preemption candidate) — clears EVERYTHING, unconditionally,
+        ///    through `release_all`: modifiers, non-modifier keys still down,
+        ///    the click latch, outstanding remapped key-downs, and any button
+        ///    still down — which is RELEASED (a synthetic Up through
         ///    `button()`), not merely forgotten, since macOS itself still
-        ///    believes it held. Nothing from the previous connection is live,
+        ///    believes it held. `release_all` normally already ran when the
+        ///    previous connection ended (`connection_ended`), so this second
+        ///    call usually finds nothing. Nothing from the previous connection is live,
         ///    so none of it is worth preserving — and the button release in
         ///    particular fixes a pre-existing hazard: a drop between a left-down
         ///    and its up left `left_down` stuck, so every move on the next
@@ -1359,13 +1362,14 @@ mod macos {
                 "key post"
             );
 
-            // Symbolic-hotkey interception: WindowServer's internal hotkey
-            // dispatcher (which fires Cmd+Tab, Cmd+Space, Cmd+Shift+3/4/5,
-            // Mission Control, etc.) only triggers on kernel-injected HID
-            // events — user-space CGEventPost cannot wake it, regardless of
-            // source state or tap location. For the common combos we
-            // re-implement the action in user space and swallow the
-            // keystroke. Triggers on key-down; the matching key-up is
+            // Symbolic-hotkey interception. The commit that added it
+            // (1648380) found that WindowServer's hotkey dispatcher does not
+            // fire Cmd+Tab, Cmd+Space or the screenshot combos from a
+            // CGEventPost keystroke (not re-tested since). Not every symbolic
+            // hotkey is like that: Ctrl+Up (Mission Control) fired from one
+            // session-source post on macOS 15.7.9 (2026-10-21, see
+            // `Inner::new`). For the combos below we re-implement the action
+            // in user space and swallow the keystroke. Triggers on key-down; the matching key-up is
             // tracked in `consumed_keys` so the bare key-up doesn't reach
             // the focused app either.
             if down && self.try_symbolic_hotkey(vk) {
