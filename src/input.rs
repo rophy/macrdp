@@ -702,9 +702,9 @@ pub fn set_ctrl_as_cmd(on: bool) {
 /// reconnect, clearing only on a server restart. That was survivable while mouse
 /// events ignored `mods`; now that clicks carry the modifier flags, a stuck Ctrl
 /// turns every left click into a secondary click, so it needs a way out. The
-/// MS-RDPBCGR Synchronize PDU can't provide one — it carries only lock keys
-/// (Caps/Num/Scroll/Kana), never Ctrl/Shift/Alt/Cmd — hence this out-of-band
-/// flag. The same reset also clears button-down tracking, which fixes a
+/// MS-RDPBCGR Synchronize PDU sets all keys up (`Inner::synchronize` releases
+/// everything), but a client sends it on focus, not at the start of a new
+/// connection after a drop — hence this out-of-band flag. The same reset also clears button-down tracking, which fixes a
 /// pre-existing hazard: a connection dropped between a left-down and its up
 /// left `left_down` stuck, so every move on the next connection posted as
 /// `LeftMouseDragged`.
@@ -1235,7 +1235,16 @@ mod macos {
         /// from the first keystroke. Num Lock is kept here (`num_lock`): it
         /// decides what the keypad keys post. (Scroll/Kana Lock are
         /// kernel-side concepts on Windows that macOS doesn't model.)
+        ///
+        /// Synchronize also sets every key up (MS-RDPBCGR 2.2.8.1.1.3.1.1.5:
+        /// the client sends key-downs for the keys still down after it). mstsc
+        /// sends it when its window gets the focus back; a key released while
+        /// another window had the focus never sends its key-up, and stayed
+        /// down on the Mac (mstsc re-sends ups for the modifiers only). So
+        /// release everything first, as at a connection end. Ported from
+        /// macrdp-v1 f708d80 / d7a9e68, relicensed by the author.
         fn synchronize(&mut self, sync: SynchronizeFlags) {
+            self.release_all("synchronize");
             let want_num = sync.contains(SynchronizeFlags::NUM_LOCK);
             if want_num != self.num_lock.is_on() {
                 debug!(want = want_num, "syncing Num Lock to client state");
@@ -1258,8 +1267,9 @@ mod macos {
         /// Both triggers exist because a modifier key-up that never arrived
         /// leaves `mods` asserting a key the user is not holding, and once
         /// clicks carry the modifier flags a stuck Ctrl turns every left click
-        /// into a secondary click. Nothing in the protocol reconciles a held
-        /// modifier (Synchronize carries lock keys only). But the two triggers
+        /// into a secondary click. A Synchronize from the client also releases
+        /// everything (`synchronize`), but only when the client sends one
+        /// (on focus). The two triggers here
         /// clear DIFFERENT amounts, deliberately:
         ///
         ///  * **A new served connection** (`reset_request`, raised by the
@@ -1332,7 +1342,8 @@ mod macos {
             }
         }
 
-        /// Release everything a connection may have left pressed on the Mac:
+        /// Release everything a connection (or a lost window focus, see
+        /// `synchronize`) may have left pressed on the Mac:
         /// mouse buttons, non-modifier keys, remapped Ctrl->Cmd keys and held
         /// modifiers (Caps Lock, a toggle, stays). Runs when a connection ends
         /// (`MacInputHandler::connection_ended`, called by the vendored server
