@@ -2061,3 +2061,14 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     breaks exhaustive matches in other implementors; the ones in this repo use
     a wildcard arm or match every variant. Same shape as macrdp-v1's IronRDP
     fork (commit f080dca6 for the capability).
+
+(29) Middle mouse button on the fast/slow path (NOT upstreamed; added 2026-10-21).
+    `From<MousePdu>` maps `PointerFlags::MIDDLE_BUTTON_OR_WHEEL` (0x4000,
+    PTRFLAGS_BUTTON3, MS-RDPBCGR 2.2.8.1.1.3.1.1.3) to
+    `MouseEvent::MiddlePressed` / `MiddleReleased`; before, an mstsc middle
+    click fell through to `Move`. `mouse_events_from_pdu` puts the PDU's
+    position before a middle button event too, as (21) does for left and
+    right. The function is now `pub` and re-exported `#[doc(hidden)]` so that
+    macrdp's `src/conn_test.rs` tests the path the server dispatches through.
+    Upstream fixed the same arm in e9c5b1c5 (#1769) with a breaking
+    `MouseEvent::Button` shape; drop this divergence when the pin moves past it.

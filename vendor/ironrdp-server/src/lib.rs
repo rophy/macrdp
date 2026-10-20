@@ -40,6 +40,8 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+#[doc(hidden)] // (divergence 29) for macrdp's tests only
+pub use handler::mouse_events_from_pdu;
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
 #[cfg(feature = "multitransport")]

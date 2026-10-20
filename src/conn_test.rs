@@ -1167,3 +1167,34 @@ fn horizontal_wheel_pdu_is_a_horizontal_scroll() {
         }
     }
 }
+
+/// (vendored divergence 29) An mstsc middle click is a MousePdu with
+/// PTRFLAGS_BUTTON3 (0x4000). It must arrive as a Move to the PDU's position,
+/// then MiddlePressed / MiddleReleased, through the same function the server's
+/// fast-path and slow-path dispatch use. Before, it fell through to a `Move`.
+#[test]
+fn middle_button_pdu_is_a_middle_click_at_its_position() {
+    use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
+    use ironrdp_server::{mouse_events_from_pdu, MouseEvent};
+
+    for down in [true, false] {
+        let mut flags = PointerFlags::MIDDLE_BUTTON_OR_WHEEL;
+        if down {
+            flags |= PointerFlags::DOWN;
+        }
+        let pdu = MousePdu {
+            flags,
+            number_of_wheel_rotation_units: 0,
+            x_position: 300,
+            y_position: 400,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
+        let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
+        let events: Vec<MouseEvent> = mouse_events_from_pdu(decoded).collect();
+        match events.as_slice() {
+            [MouseEvent::Move { x: 300, y: 400 }, MouseEvent::MiddlePressed] if down => {}
+            [MouseEvent::Move { x: 300, y: 400 }, MouseEvent::MiddleReleased] if !down => {}
+            other => panic!("middle down={down}: unexpected events {other:?}"),
+        }
+    }
+}

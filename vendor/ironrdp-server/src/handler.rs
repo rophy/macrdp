@@ -171,6 +171,16 @@ impl From<MousePdu> for MouseEvent {
             } else {
                 MouseEvent::RightReleased
             }
+        } else if value.flags.contains(PointerFlags::MIDDLE_BUTTON_OR_WHEEL) {
+            // (vendored, divergence 29) PTRFLAGS_BUTTON3 (MS-RDPBCGR
+            // 2.2.8.1.1.3.1.1.3), the middle button. Without this arm mstsc's
+            // middle click fell through to `Move`. The flag name is upstream's;
+            // the wheel has its own flags (VERTICAL_WHEEL, HORIZONTAL_WHEEL).
+            if value.flags.contains(PointerFlags::DOWN) {
+                MouseEvent::MiddlePressed
+            } else {
+                MouseEvent::MiddleReleased
+            }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
             // NO correction here — see the retired divergence (17). ironrdp-pdu
             // used to decode the 9-bit WheelRotationMask as sign-magnitude
@@ -215,11 +225,15 @@ impl From<MousePdu> for MouseEvent {
 /// however, sends a tap as a SINGLE button PDU with no preceding move — so
 /// without this its taps register at the previous cursor position (clicks
 /// "not working" / aim off). Plain move and wheel PDUs are unchanged.
-pub(crate) fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> {
-    let lead = if pdu
-        .flags
-        .intersects(PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON)
-    {
+///
+/// (divergence 29) `pub` and re-exported `#[doc(hidden)]` so macrdp's own
+/// tests can drive the exact path the server uses (the root `cargo test` does
+/// not run tests inside this vendored crate). Not part of the public API.
+pub fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> {
+    // (divergence 29) The middle button too: its PDU also carries the position.
+    let lead = if pdu.flags.intersects(
+        PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON | PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
+    ) {
         Some(MouseEvent::Move {
             x: pdu.x_position,
             y: pdu.y_position,
