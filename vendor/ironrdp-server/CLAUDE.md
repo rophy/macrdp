@@ -2070,5 +2070,9 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     position before a middle button event too, as (21) does for left and
     right. The function is now `pub` and re-exported `#[doc(hidden)]` so that
     macrdp's `src/conn_test.rs` tests the path the server dispatches through.
-    Upstream fixed the same arm in e9c5b1c5 (#1769) with a breaking
+    Same divergence: `From<MouseXPdu>` maps PTRXFLAGS_BUTTON1/2 (the extended
+    buttons 4 and 5, back/forward, 2.2.8.1.1.3.1.1.4) to `Button4*` /
+    `Button5*`; it mapped them to Left/Right before, so an mstsc back-button
+    press was a left click. macrdp ignores buttons 4 and 5 (as macrdp-v1 does).
+    Upstream fixed the same arms in e9c5b1c5 (#1769) with a breaking
     `MouseEvent::Button` shape; drop this divergence when the pin moves past it.

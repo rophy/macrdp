@@ -246,17 +246,21 @@ pub fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> 
 
 impl From<MouseXPdu> for MouseEvent {
     fn from(value: MouseXPdu) -> Self {
+        // (vendored, divergence 29) PTRXFLAGS_BUTTON1/2 are the extended
+        // buttons 4 and 5 (X1/X2, back/forward; MS-RDPBCGR 2.2.8.1.1.3.1.1.4),
+        // not left and right. Mapped to Left/Right before, so a back-button
+        // press from mstsc was a left click on the server.
         if value.flags.contains(PointerXFlags::BUTTON1) {
             if value.flags.contains(PointerXFlags::DOWN) {
-                MouseEvent::LeftPressed
+                MouseEvent::Button4Pressed
             } else {
-                MouseEvent::LeftReleased
+                MouseEvent::Button4Released
             }
         } else if value.flags.contains(PointerXFlags::BUTTON2) {
             if value.flags.contains(PointerXFlags::DOWN) {
-                MouseEvent::RightPressed
+                MouseEvent::Button5Pressed
             } else {
-                MouseEvent::RightReleased
+                MouseEvent::Button5Released
             }
         } else {
             MouseEvent::Move {

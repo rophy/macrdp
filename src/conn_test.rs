@@ -1200,3 +1200,37 @@ fn middle_button_pdu_is_a_middle_click_at_its_position() {
         }
     }
 }
+
+/// (vendored divergence 29) PTRXFLAGS_BUTTON1/2 (TS_POINTERX_EVENT) are the
+/// extended buttons 4 and 5 (back / forward), not left and right: an mstsc
+/// back-button press must not become a left click.
+#[test]
+fn extended_button_pdu_is_button_4_or_5_not_left_or_right() {
+    use ironrdp_pdu::input::mouse_x::{MouseXPdu, PointerXFlags};
+    use ironrdp_server::MouseEvent;
+
+    for (button, down) in [(1, true), (1, false), (2, true), (2, false)] {
+        let mut flags = if button == 1 {
+            PointerXFlags::BUTTON1
+        } else {
+            PointerXFlags::BUTTON2
+        };
+        if down {
+            flags |= PointerXFlags::DOWN;
+        }
+        let pdu = MouseXPdu {
+            flags,
+            x_position: 300,
+            y_position: 400,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse x pdu");
+        let decoded: MouseXPdu = ironrdp_core::decode(&encoded).expect("decode mouse x pdu");
+        match (button, down, MouseEvent::from(decoded)) {
+            (1, true, MouseEvent::Button4Pressed)
+            | (1, false, MouseEvent::Button4Released)
+            | (2, true, MouseEvent::Button5Pressed)
+            | (2, false, MouseEvent::Button5Released) => {}
+            (b, d, other) => panic!("X button {b} down={d}: got {other:?}"),
+        }
+    }
+}
