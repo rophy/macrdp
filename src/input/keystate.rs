@@ -1,4 +1,5 @@
-//! Pure keyboard state for the input handler: the client's Num Lock.
+//! Pure keyboard state for the input handler: the client's Num Lock and the
+//! keycode each held key went down with.
 //!
 //! No platform calls, so it is unit-tested on every target. Ported from
 //! macrdp-v1 (crates/macrdp-input/src/flags.rs and keyboard.rs, commits
@@ -83,9 +84,53 @@ impl NumLock {
     }
 }
 
+/// The macOS keycode posted for each client key that is down, by
+/// (scancode, extended). The key-up posts the same keycode, also when the
+/// state that chose it changed in between: keypad 4 down with Num Lock off
+/// posts Left Arrow; if Num Lock goes on before the release, the release must
+/// be Left Arrow too, not keypad 4 (the arrow would stay down).
+#[derive(Debug, Default)]
+pub(super) struct PostedKeys {
+    down: std::collections::HashMap<(u8, bool), u16>,
+}
+
+impl PostedKeys {
+    /// The keycode to post for this scancode event; `vk` is the one the
+    /// current state gives.
+    pub(super) fn vk_for(&mut self, key: (u8, bool), pressed: bool, vk: u16) -> u16 {
+        if pressed {
+            *self.down.entry(key).or_insert(vk)
+        } else {
+            self.down.remove(&key).unwrap_or(vk)
+        }
+    }
+
+    /// All keys are up (connection end).
+    pub(super) fn clear(&mut self) {
+        self.down.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_up_posts_the_keycode_of_its_key_down() {
+        let mut p = PostedKeys::default();
+        // Keypad 4 (0x4B) down with Num Lock off: Left Arrow.
+        assert_eq!(p.vk_for((0x4B, false), true, 0x7B), 0x7B);
+        // Client key repeat after Num Lock went on: still Left Arrow.
+        assert_eq!(p.vk_for((0x4B, false), true, 0x56), 0x7B);
+        // The release with Num Lock on is also Left Arrow, not keypad 4.
+        assert_eq!(p.vk_for((0x4B, false), false, 0x56), 0x7B);
+        // The next press uses the state again.
+        assert_eq!(p.vk_for((0x4B, false), true, 0x56), 0x56);
+        // The extended scancode is another key.
+        assert_eq!(p.vk_for((0x4B, true), false, 0x7B), 0x7B);
+        p.clear();
+        assert_eq!(p.vk_for((0x4B, false), false, 0x7B), 0x7B);
+    }
 
     #[test]
     fn num_lock_starts_on_and_follows_synchronize() {

@@ -666,7 +666,7 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::keystate::{NumLock, SCANCODE_NUM_LOCK};
+    use super::keystate::{NumLock, PostedKeys, SCANCODE_NUM_LOCK};
     use super::scancodes::{is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode};
 
     use anyhow::{anyhow, Result};
@@ -969,6 +969,9 @@ mod macos {
         // The client's Num Lock (macOS has none): with it off the keypad
         // keys post navigation keys, as on Windows.
         num_lock: NumLock,
+        // Keycode each held client key went down with; its key-up posts the
+        // same one (Num Lock may change in between).
+        posted: PostedKeys,
         // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
         // button, latched at button-down and reused for the drag and the up.
         // The verdict must not be recomputed per event: the down itself fires
@@ -1062,6 +1065,7 @@ mod macos {
                 held_keys: super::HeldKeys::default(),
                 remapped_keys: HashSet::new(),
                 num_lock: NumLock::default(),
+                posted: PostedKeys::default(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
@@ -1276,6 +1280,7 @@ mod macos {
             self.consumed_keys.clear();
             // A posted Num Lock press was in `keys`; the state stays.
             self.num_lock.forget_key();
+            self.posted.clear();
             self.left_click_remapped = false;
 
             let stuck = self.mods.cg_flags().bits();
@@ -1353,6 +1358,7 @@ mod macos {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
+            let vk = self.posted.vk_for((scancode, extended), down, vk);
             self.refresh_auto_layout();
 
             // Modifier path: update per-side state and emit one FlagsChanged. We do this BEFORE any of the
