@@ -2185,7 +2185,7 @@ impl RdpServer {
                 let (result, preempted_by) = outcome;
                 let duration = started.elapsed();
 
-                // (vendored, divergence 25) The connection is over (on its own
+                // (vendored, divergence 27) The connection is over (on its own
                 // or preempted): let the input handler release what it left
                 // pressed. Here, and not in `run_connection`, so it also runs
                 // when the connection future is dropped by a takeover or an

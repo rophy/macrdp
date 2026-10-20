@@ -74,7 +74,7 @@ pub trait RdpServerInputHandler: Send {
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
 
-    /// (vendored, divergence 25) Called once after a served connection ends,
+    /// (vendored, divergence 27) Called once after a served connection ends,
     /// cleanly or not (client disconnect, dropped link, takeover by another
     /// client). No key-up or button-up comes for input that was down at that
     /// moment, so a handler that injects input into a shared desktop can

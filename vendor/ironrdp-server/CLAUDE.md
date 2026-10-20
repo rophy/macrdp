@@ -2037,8 +2037,8 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     reactivation, never for a losing candidate. Off by default (`None`), so the
     upstream-shaped path is byte-identical unless macrdp installs the handle.
 
-(25) Connection-end input hook — `RdpServerInputHandler::connection_ended`
-    (NOT upstreamed; added 2026-10-21).
+(27) Connection-end input hook — `RdpServerInputHandler::connection_ended`
+    (NOT upstreamed; added 2026-10-21; first written as a second (25); renumbered to (27) because (26) is taken on branch fix/win10-mstsc-black).
     The input trait gains a default no-op method `connection_ended(&mut self)`.
     The accept loop in `run` calls it once after each served connection is
     over — after the preemption race resolves, so it runs for a clean end, an

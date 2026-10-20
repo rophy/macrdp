@@ -1187,7 +1187,7 @@ mod macos {
         /// mouse buttons, non-modifier keys, remapped Ctrl->Cmd keys and held
         /// modifiers (Caps Lock, a toggle, stays). Runs when a connection ends
         /// (`MacInputHandler::connection_ended`, called by the vendored server
-        /// after each served connection, divergence 25) and again on the first
+        /// after each served connection, divergence 27) and again on the first
         /// input of a new connection (`reset_request`), which then finds
         /// nothing left unless input came in between. Nothing from the
         /// previous connection is live, so none of it is worth keeping.
