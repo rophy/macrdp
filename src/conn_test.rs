@@ -1234,3 +1234,197 @@ fn extended_button_pdu_is_button_4_or_5_not_left_or_right() {
         }
     }
 }
+
+// ---- idle-timeout disconnect (vendored divergence (32)) --------------------
+
+/// Is this raw server PDU a Server Set Error Info carrying `ERRINFO_IDLE_TIMEOUT`
+/// (MS-RDPBCGR 2.2.5.1.1)? The twin of [`is_disconnected_by_other_connection`].
+fn is_idle_timeout_error_info(bytes: &[u8]) -> bool {
+    use ironrdp_core::decode;
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::rdp::headers::{ShareControlPdu, ShareDataPdu};
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_pdu::x224::X224;
+
+    let Ok(x224) = decode::<X224<McsMessage<'_>>>(bytes) else {
+        return false;
+    };
+    let McsMessage::SendDataIndication(data) = x224.0 else {
+        return false;
+    };
+    let Ok(ctrl) = decode::<ironrdp_pdu::rdp::headers::ShareControlHeader>(&data.user_data) else {
+        return false;
+    };
+    let ShareControlPdu::Data(share_data) = ctrl.share_control_pdu else {
+        return false;
+    };
+    matches!(
+        share_data.share_data_pdu,
+        ShareDataPdu::ServerSetErrorInfo(pdu)
+            if pdu.0 == ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::IdleTimeout)
+    )
+}
+
+/// Read one TPKT-framed PDU (version 3, big-endian length in bytes 2..4).
+async fn read_tpkt<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut pdu = vec![0u8; 4];
+    r.read_exact(&mut pdu).await?;
+    anyhow::ensure!(pdu[0] == 3, "not a TPKT header: {:#04x}", pdu[0]);
+    let len = usize::from(u16::from_be_bytes([pdu[2], pdu[3]]));
+    anyhow::ensure!(len >= 4, "TPKT length {len}");
+    pdu.resize(len, 0);
+    r.read_exact(&mut pdu[4..]).await?;
+    Ok(pdu)
+}
+
+/// The client's MCS Connect Initial with `RNS_UD_CS_SUPPORT_ERRINFO_PDU` cleared
+/// in its Client Core Data, as FreeRDP 3.30 sends it.
+fn without_error_info_support(connect_initial: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::gcc::{ClientEarlyCapabilityFlags, ConferenceCreateRequest};
+    use ironrdp_pdu::mcs::ConnectInitial;
+    use ironrdp_pdu::x224::{X224Data, X224};
+
+    let x224 = decode::<X224<X224Data<'_>>>(connect_initial)
+        .map_err(|e| anyhow::anyhow!("X.224 data: {e:?}"))?;
+    let mut ci = decode::<ConnectInitial>(&x224.0.data)
+        .map_err(|e| anyhow::anyhow!("Connect Initial: {e:?}"))?;
+    let mut blocks = ci.conference_create_request.into_gcc_blocks();
+    let flags = blocks
+        .core
+        .optional_data
+        .early_capability_flags
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("no earlyCapabilityFlags"))?;
+    anyhow::ensure!(flags.contains(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU));
+    flags.remove(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
+    ci.conference_create_request =
+        ConferenceCreateRequest::new(blocks).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let data = encode_vec(&ci).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    encode_vec(&X224(X224Data {
+        data: std::borrow::Cow::Owned(data),
+    }))
+    .map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
+/// A TLS man in the middle between the test client and the server that clears
+/// SUPPORT_ERR_INFO_PDU in the Connect Initial and passes everything else
+/// unchanged. The IronRDP client always sets the flag, and CredSSP is off, so
+/// this is the only way to make an in-process client without it.
+async fn strip_error_info_support(
+    client: tokio::io::DuplexStream,
+    server: tokio::io::DuplexStream,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut client, mut server) = (client, server);
+    // X.224 Connection Request and Confirm go through as they are.
+    let request = read_tpkt(&mut client).await?;
+    server.write_all(&request).await?;
+    let confirm = read_tpkt(&mut server).await?;
+    client.write_all(&confirm).await?;
+
+    let mut client = server_tls_acceptor().accept(client).await?;
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+        .with_no_client_auth();
+    tls_cfg.resumption = rustls::client::Resumption::disabled();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+    let mut server = TlsConnector::from(Arc::new(tls_cfg))
+        .connect(server_name, server)
+        .await?;
+
+    // The first PDU over TLS is the MCS Connect Initial.
+    let connect_initial = read_tpkt(&mut client).await?;
+    server
+        .write_all(&without_error_info_support(&connect_initial)?)
+        .await?;
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+    Ok(())
+}
+
+/// What a connected client reads after the server sends
+/// `ServerEvent::Disconnect(ERRINFO_IDLE_TIMEOUT)` (`src/idle.rs`): whether a
+/// Set Error Info with that code came before the connection closed.
+async fn idle_timeout_disconnect(strip_error_info: bool) -> anyhow::Result<bool> {
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_server::ServerEvent;
+
+    init_tracing();
+    let (client_io, proxy_client_io) = tokio::io::duplex(64 * 1024);
+    let (proxy_server_io, server_io) = tokio::io::duplex(64 * 1024);
+    // A live session (see `KeepAliveSound`), so the Disconnect is what ends it.
+    let mut server =
+        build_test_server_full(3389, 1024, 768, true, None, crate::bitmap_codecs(), true);
+    let events = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let proxy_task = tokio::task::spawn_local(async move {
+                if strip_error_info {
+                    strip_error_info_support(proxy_client_io, proxy_server_io).await
+                } else {
+                    let (mut a, mut b) = (proxy_client_io, proxy_server_io);
+                    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                    Ok(())
+                }
+            });
+            let (_size, mut framed) = connect_client(client_io, 1024, 768).await?;
+
+            // Sent after the connect: `run_connection` drops a Disconnect that is
+            // already queued when it starts (it belongs to an older connection).
+            events
+                .send(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::IdleTimeout,
+                )))
+                .map_err(|_| anyhow::anyhow!("server event channel closed"))?;
+
+            let mut saw_idle_timeout = false;
+            loop {
+                let read =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), framed.read_pdu())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("the session was left alive"))?;
+                match read {
+                    Ok((_action, bytes)) => saw_idle_timeout |= is_idle_timeout_error_info(&bytes),
+                    Err(_) => break,
+                }
+            }
+            server_task.abort();
+            proxy_task.abort();
+            anyhow::Ok(saw_idle_timeout)
+        })
+        .await
+}
+
+/// `--idle-timeout` (`src/idle.rs`) ends the session with
+/// `ServerEvent::Disconnect(ERRINFO_IDLE_TIMEOUT)`. A client that advertised
+/// SUPPORT_ERR_INFO_PDU (mstsc, the IronRDP client) gets the Set Error Info
+/// first, so mstsc shows its idle message and does not auto-reconnect.
+#[tokio::test]
+async fn idle_timeout_disconnect_tells_an_error_info_client_why() -> anyhow::Result<()> {
+    assert!(
+        idle_timeout_disconnect(false).await?,
+        "the client must get ERRINFO_IDLE_TIMEOUT before the connection closes"
+    );
+    Ok(())
+}
+
+/// MS-RDPBCGR 3.3.5.7.1: a client without SUPPORT_ERR_INFO_PDU (FreeRDP 3.30)
+/// MUST NOT get the Set Error Info PDU; the connection just closes.
+#[tokio::test]
+async fn idle_timeout_disconnect_sends_no_error_info_to_a_client_without_it() -> anyhow::Result<()>
+{
+    assert!(
+        !idle_timeout_disconnect(true).await?,
+        "a client without SUPPORT_ERR_INFO_PDU must not get the Set Error Info PDU"
+    );
+    Ok(())
+}
