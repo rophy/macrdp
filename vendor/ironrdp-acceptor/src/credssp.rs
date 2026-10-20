@@ -214,4 +214,42 @@ mod tests {
         let altered = sspi::Error::new(sspi::ErrorKind::MessageAltered, "MIC verification failed");
         assert_eq!(client_error_code(&altered), None);
     }
+
+    /// The code that `handle_process_result` writes to the client, for a CredSSP error whose
+    /// `TsRequest` carries `sspi_code` (what sspi 0.21.3 builds from the SSPI error).
+    fn written_error_code(kind: sspi::ErrorKind, sspi_code: u32) -> Option<NStatusCode> {
+        let creds = AuthIdentity {
+            username: Username::new("user", None).unwrap(),
+            password: String::from("secret").into(),
+        };
+        let mut sequence = CredsspSequence::init(&creds, ServerName::new("client"), vec![0x30, 0x00], None).unwrap();
+        let ts_request = TsRequest {
+            error_code: Some(NStatusCode(sspi_code)),
+            ..TsRequest::default()
+        };
+        let result = Err(ServerError {
+            ts_request: Some(Box::new(ts_request)),
+            error: sspi::Error::new(kind, "test"),
+        });
+        let mut output = WriteBuf::new();
+        let written = sequence.handle_process_result(result, &mut output).unwrap();
+        assert_eq!(written.size(), Some(output.filled_len()));
+        assert!(matches!(sequence.state, CredsspState::ServerError(_)));
+        TsRequest::from_buffer(output.filled()).unwrap().error_code
+    }
+
+    /// (divergence (33)) The TsRequest that goes on the wire has STATUS_LOGON_FAILURE for a
+    /// denied logon (sspi alone sends 0xC007030C, and mstsc shows error 0x904), and the code
+    /// from sspi for other errors.
+    #[test]
+    fn the_written_ts_request_has_logon_failure_for_a_denied_logon() {
+        assert_eq!(
+            written_error_code(sspi::ErrorKind::LogonDenied, 0xC007_030C),
+            Some(NStatusCode::LOGON_FAILURE)
+        );
+        assert_eq!(
+            written_error_code(sspi::ErrorKind::MessageAltered, 0xC007_030F),
+            Some(NStatusCode(0xC007_030F))
+        );
+    }
 }
