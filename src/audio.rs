@@ -485,6 +485,12 @@ async fn capture_loop(
     // roughly `--aac-bitrate` (~128). The clearest in-log proof `--enable-aac`
     // is doing what it claims.
     let mut bytes_emitted: u64 = 0;
+    // Resampled chunks not sent because they were digital silence (see
+    // `is_silent`), per rate-log window, and whether the last chunk was one.
+    let mut silent_skipped: u64 = 0;
+    let mut in_silence = false;
+    // Silent chunks in a row; starts as "long silent", so no tail at start.
+    let mut silent_run: u32 = SILENCE_TAIL_CHUNKS;
 
     'reconnect: loop {
         if generation.load(Ordering::SeqCst) != my_gen {
@@ -635,6 +641,7 @@ async fn capture_loop(
                     avg_wave_samples,
                     avg_wave_ms,
                     wire_kbps,
+                    silent_skipped,
                     codec = if use_aac { "aac" } else { "pcm" },
                     model_wave_ms = 1024.0 / 48.0,
                     "audio capture rates"
@@ -643,6 +650,7 @@ async fn capture_loop(
                 output_samples = 0;
                 waves_emitted = 0;
                 bytes_emitted = 0;
+                silent_skipped = 0;
                 last_rate_log = std::time::Instant::now();
             }
 
@@ -695,6 +703,33 @@ async fn capture_loop(
                 let pcm = planar_f32_to_interleaved_i16(&resampled);
                 if pcm.is_empty() {
                     continue;
+                }
+
+                // SCK delivers buffers even when nothing plays. Sending digital
+                // silence as PCM costs ~1.4 Mbps and keeps the link busy (the
+                // Wi-Fi keep-awake then never runs), so skip it. The resampler
+                // still sees every input chunk, so the sound that follows has no
+                // seam; its timestamp is wall-clock time, and the client plays
+                // it as soon as it arrives (its queue ran empty in the gap).
+                // Ported from macrdp-v1 2e842a7, relicensed by the author.
+                // The first `SILENCE_TAIL_CHUNKS` silent chunks after a sound
+                // still go out (see there).
+                if is_silent(&pcm) {
+                    silent_run = silent_run.saturating_add(1);
+                    if silent_run > SILENCE_TAIL_CHUNKS {
+                        silent_skipped += 1;
+                        if !in_silence {
+                            in_silence = true;
+                            debug!("audio: digital silence, waves paused");
+                        }
+                        continue;
+                    }
+                } else {
+                    silent_run = 0;
+                    if in_silence {
+                        in_silence = false;
+                        debug!("audio: sound again, waves resumed");
+                    }
                 }
 
                 // The wave(s) to ship for this resampled chunk. PCM emits exactly
@@ -862,6 +897,21 @@ fn planar_f32_to_interleaved_i16(planar: &[Vec<f32>]) -> Vec<u8> {
     out
 }
 
+/// Silent chunks (~23 ms each) still sent after a sound ends, before the
+/// waves pause. Without them the client's queue runs empty right after the
+/// last sound: FreeRDP 3.30 (ALSA) then cut the end of the sound at a
+/// non-zero sample, a click, in 6 of 20 tries (0 of 12 with 8 chunks;
+/// 2026-10-21, 3 s tone recorded at the client). Costs ~33 KB per sound end.
+#[cfg(target_os = "macos")]
+const SILENCE_TAIL_CHUNKS: u32 = 8;
+
+/// True when every S16LE sample in the chunk is zero.
+/// Ported from macrdp-v1 2e842a7, relicensed by the author.
+#[cfg(any(target_os = "macos", test))]
+fn is_silent(wave_data: &[u8]) -> bool {
+    wave_data.iter().all(|&b| b == 0)
+}
+
 #[cfg(target_os = "macos")]
 fn float_to_i16(v: f32) -> i16 {
     let clamped = v.clamp(-1.0, 1.0);
@@ -871,6 +921,12 @@ fn float_to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_chunk_detected() {
+        assert!(is_silent(&[0u8; 8]));
+        assert!(!is_silent(&[0, 0, 1, 0]));
+    }
 
     #[test]
     fn server_formats_prefer_aac_ahead_of_pcm() {
