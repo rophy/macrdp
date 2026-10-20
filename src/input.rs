@@ -773,7 +773,9 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::keystate::{NumLock, PostedKeys, UnicodeAction, UnicodeKeys, SCANCODE_NUM_LOCK};
+    use super::keystate::{
+        FocusIn, NumLock, PostedKeys, Release, UnicodeAction, UnicodeKeys, SCANCODE_NUM_LOCK,
+    };
     use super::scancodes::{
         ctrl_as_cmd_vk, is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode,
     };
@@ -1082,6 +1084,9 @@ mod macos {
         posted: PostedKeys,
         // RDP Unicode key events: surrogate pairs joined, downs counted.
         unicode: UnicodeKeys,
+        // Tells a focus-in Synchronize (release the keys) from a lock-only
+        // one (keep them).
+        focus_in: FocusIn,
         // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
         // button, latched at button-down and reused for the drag and the up.
         // The verdict must not be recomputed per event: the down itself fires
@@ -1176,6 +1181,7 @@ mod macos {
                 num_lock: NumLock::default(),
                 posted: PostedKeys::default(),
                 unicode: UnicodeKeys::default(),
+                focus_in: FocusIn::default(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
@@ -1240,16 +1246,19 @@ mod macos {
         /// the client sends key-downs for the keys still down after it). mstsc
         /// sends it when its window gets the focus back; a key released while
         /// another window had the focus never sends its key-up, and stayed
-        /// down on the Mac (mstsc re-sends ups for the modifiers only). So
-        /// release the keys first, as at a connection end. Ported from
-        /// macrdp-v1 f708d80 / d7a9e68, relicensed by the author.
+        /// down on the Mac. So on a focus-in the held keys are released, as at
+        /// a connection end. Ported from macrdp-v1 f708d80 / d7a9e68,
+        /// relicensed by the author. guacd also sends Synchronize in the
+        /// middle of typing to change a lock, and does not send the held keys
+        /// again: there the keys stay (`FocusIn` tells the two apart).
         ///
-        /// Mouse buttons stay: when a click gives mstsc the focus, it sends
-        /// the button-down BEFORE the Synchronize (measured on Windows 10
-        /// mstsc, 2026-10-21), so releasing buttons here turned that click
-        /// into a click-and-release at once, and its real up into a stray up.
+        /// Mouse buttons always stay (`Release::buttons`).
         fn synchronize(&mut self, sync: SynchronizeFlags) {
-            self.release_held("synchronize", false);
+            let release = self.focus_in.synchronize(monotonic_ms());
+            debug!(flags = ?sync, ?release, "client Synchronize");
+            if release.keys() {
+                self.release_held("synchronize", release);
+            }
             let want_num = sync.contains(SynchronizeFlags::NUM_LOCK);
             if want_num != self.num_lock.is_on() {
                 debug!(want = want_num, "syncing Num Lock to client state");
@@ -1360,12 +1369,13 @@ mod macos {
         /// Order is the order of a user letting go: buttons, then keys with
         /// the modifier flags still set, then the modifiers.
         pub fn release_all(&mut self, why: &'static str) {
-            self.release_held(why, true);
+            self.release_held(why, Release::All);
         }
 
-        /// `release_all`, with the mouse buttons only when `buttons` (see
-        /// `synchronize` for why it keeps them).
-        fn release_held(&mut self, why: &'static str, buttons: bool) {
+        /// `release_all`, with the mouse buttons only when `release` says so
+        /// (see `synchronize` for why it keeps them).
+        fn release_held(&mut self, why: &'static str, release: Release) {
+            let buttons = release.buttons();
             // A button macOS still believes is held: we posted the Down, the
             // connection died before the Up. Go through `button()` so the Up
             // carries the same (latched) flags the Down did and the click
@@ -1488,6 +1498,8 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
+            self.focus_in
+                .note_key(scancode, extended, down, monotonic_ms());
             self.num_lock.note_scancode(scancode, extended, down);
             if scancode == SCANCODE_NUM_LOCK && !extended && !self.num_lock.key(down) {
                 trace!(
@@ -1931,6 +1943,7 @@ mod macos {
         /// is joined into one character; a lone unit of a pair was not valid
         /// text and got lost. The key-up pairs the down, as a real key does.
         fn unicode(&mut self, c: u16, down: bool) {
+            self.focus_in.note_unicode(down);
             let (down, text) = match self.unicode.feed(c, down) {
                 UnicodeAction::Down(text) => (true, text),
                 UnicodeAction::Up(text) => (false, text),

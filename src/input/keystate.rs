@@ -75,18 +75,103 @@ impl NumLock {
         true
     }
 
-    /// RDP Synchronize: the client's Num Lock state; all keys are up.
+    /// RDP Synchronize: the client's Num Lock state. Whether the keys went
+    /// up with it is decided elsewhere (`FocusIn`); if they did, `forget_key`
+    /// follows.
     pub(super) fn synchronize(&mut self, on: bool) {
         self.on = on;
-        self.left_ctrl = false;
     }
 
     /// The posted Num Lock press was released by other means (connection
-    /// end): no key-up is due any more, and no client key is down. The state
-    /// stays.
+    /// end, focus-in Synchronize): no key-up is due any more, and no client
+    /// key is down. The state stays.
     pub(super) fn forget_key(&mut self) {
         self.key_down = false;
         self.left_ctrl = false;
+    }
+}
+
+/// RDP scancode of Tab (non-extended).
+const SCANCODE_TAB: u8 = 0x0F;
+
+/// How long after its Tab key-up a Synchronize still counts as a focus-in.
+/// Measured at the server (2026-10-21): mstsc (Windows 10) 0.1-1 ms, FreeRDP
+/// 3.30 0.2 ms; the client sends the two together. A typed Tab followed by a
+/// key that makes guacd change a lock is a keystroke later (157 ms measured
+/// with a scripted 150 ms gap); the margin is for a split network packet.
+const FOCUS_IN_WINDOW_MS: u64 = 50;
+
+/// What a trigger releases on the Mac.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Release {
+    /// Keys, modifiers and mouse buttons: a connection ends or starts.
+    All,
+    /// Keys and modifiers, not the mouse buttons: a focus-in Synchronize.
+    KeysOnly,
+    /// Nothing: a Synchronize that only changes a lock state.
+    Nothing,
+}
+
+impl Release {
+    pub(super) fn keys(self) -> bool {
+        self != Release::Nothing
+    }
+
+    /// Only at a connection edge. mstsc sends the button-down of the click
+    /// that gives it the focus BEFORE the Synchronize (measured 2026-10-21),
+    /// so releasing buttons on a Synchronize ended that click at once.
+    pub(super) fn buttons(self) -> bool {
+        self == Release::All
+    }
+}
+
+/// Tells a focus-in Synchronize from one that only changes a lock state.
+///
+/// MS-RDPBCGR 2.2.8.1.1.3.1.1.5 says a Synchronize sets all keys up, and the
+/// client then sends key-downs for the keys still down. Clients do not all
+/// work that way:
+/// - mstsc and FreeRDP send it when their window gets the focus back, as Tab
+///   up, Synchronize, Tab up (mstsc: three times, with the modifier key-ups
+///   after each Synchronize and a key-down for a modifier still held). mstsc
+///   does not send the key-ups of keys released in another window, so those
+///   keys must be released here.
+/// - guacd also sends it in the middle of typing, when the next key needs
+///   another lock state (keypad digits need Num Lock on; guacamole-server
+///   src/protocols/rdp/keyboard.c `guac_rdp_keyboard_update_locks`), without
+///   a Tab up and without sending the held keys again. Releasing there let go
+///   of a Ctrl that the user still held.
+///
+/// So the keys are released only on a Synchronize that follows a Tab key-up
+/// within `FOCUS_IN_WINDOW_MS`, with no key-down in between.
+#[derive(Debug, Default)]
+pub(super) struct FocusIn {
+    /// When the last Tab key-up came, if no key went down after it.
+    tab_up_ms: Option<u64>,
+}
+
+impl FocusIn {
+    /// Every scancode key event.
+    pub(super) fn note_key(&mut self, scancode: u8, extended: bool, pressed: bool, now_ms: u64) {
+        if pressed {
+            self.tab_up_ms = None;
+        } else if scancode == SCANCODE_TAB && !extended {
+            self.tab_up_ms = Some(now_ms);
+        }
+    }
+
+    /// Every Unicode key event.
+    pub(super) fn note_unicode(&mut self, pressed: bool) {
+        if pressed {
+            self.tab_up_ms = None;
+        }
+    }
+
+    /// A Synchronize: what to release.
+    pub(super) fn synchronize(&mut self, now_ms: u64) -> Release {
+        match self.tab_up_ms.take() {
+            Some(t) if now_ms.saturating_sub(t) <= FOCUS_IN_WINDOW_MS => Release::KeysOnly,
+            _ => Release::Nothing,
+        }
     }
 }
 
@@ -193,6 +278,90 @@ impl UnicodeKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Synchronize: focus-in or lock change (sequences measured 2026-10-21,
+    // see FocusIn) ---
+
+    /// FreeRDP and mstsc on focus-in: Tab up, Synchronize, Tab up.
+    #[test]
+    fn focus_in_synchronize_releases_the_keys() {
+        let mut f = FocusIn::default();
+        f.note_key(0x25, false, true, 1_000); // K down, then the focus goes
+        f.note_key(0x0F, false, false, 9_000);
+        assert_eq!(f.synchronize(9_000), Release::KeysOnly);
+        f.note_key(0x0F, false, false, 9_000);
+    }
+
+    /// guacd: a Synchronize in the middle of typing when a key needs another
+    /// lock state (Ctrl held, keypad 1 with Num Lock off): no Tab up before it.
+    #[test]
+    fn lock_synchronize_while_typing_keeps_the_keys() {
+        let mut f = FocusIn::default();
+        assert_eq!(
+            f.synchronize(500),
+            Release::Nothing,
+            "first key of the session"
+        );
+        f.note_key(0x1D, false, true, 500); // Ctrl down
+        assert_eq!(f.synchronize(800), Release::Nothing);
+    }
+
+    /// A Tab typed by the user, then a lock Synchronize at the next key: the
+    /// Tab up is too old to be a focus-in, or a key went down after it.
+    #[test]
+    fn a_typed_tab_is_not_a_focus_in() {
+        let mut f = FocusIn::default();
+        f.note_key(0x1D, false, true, 0);
+        f.note_key(0x0F, false, true, 100);
+        f.note_key(0x0F, false, false, 180);
+        assert_eq!(f.synchronize(400), Release::Nothing, "too late");
+
+        f.note_key(0x0F, false, true, 1_000);
+        f.note_key(0x0F, false, false, 1_080);
+        f.note_key(0x4F, false, true, 1_090);
+        assert_eq!(
+            f.synchronize(1_090),
+            Release::Nothing,
+            "a key went down after the Tab up"
+        );
+    }
+
+    /// Key-ups between the Tab up and the Synchronize (mstsc re-sends the
+    /// modifier ups) keep the pattern; a Unicode key-down breaks it.
+    #[test]
+    fn key_ups_keep_the_focus_in_pattern() {
+        let mut f = FocusIn::default();
+        f.note_key(0x0F, false, false, 50);
+        f.note_key(0x2A, false, false, 50);
+        assert_eq!(f.synchronize(51), Release::KeysOnly);
+        f.note_key(0x0F, false, false, 60);
+        f.note_unicode(true);
+        assert_eq!(f.synchronize(60), Release::Nothing);
+    }
+
+    /// Each Synchronize uses up its Tab up.
+    #[test]
+    fn one_tab_up_is_one_focus_in() {
+        let mut f = FocusIn::default();
+        f.note_key(0x0F, false, false, 0);
+        assert_eq!(f.synchronize(0), Release::KeysOnly);
+        assert_eq!(f.synchronize(1), Release::Nothing);
+    }
+
+    /// What each trigger releases. Buttons go only at a connection edge: mstsc
+    /// sends the button-down of the click that gives it the focus BEFORE the
+    /// Synchronize, so releasing buttons there ended that click at once.
+    #[test]
+    fn synchronize_never_releases_mouse_buttons() {
+        assert!(Release::All.keys() && Release::All.buttons());
+        assert!(Release::KeysOnly.keys());
+        assert!(!Release::KeysOnly.buttons());
+        assert!(!Release::Nothing.keys() && !Release::Nothing.buttons());
+        let mut f = FocusIn::default();
+        f.note_key(0x0F, false, false, 0);
+        assert!(!f.synchronize(0).buttons());
+        assert!(!f.synchronize(0).buttons());
+    }
 
     #[test]
     fn bmp_character_is_posted_as_is() {
@@ -348,10 +517,21 @@ mod tests {
     }
 
     #[test]
-    fn synchronize_forgets_a_held_left_ctrl() {
+    fn released_keys_forget_a_held_left_ctrl() {
         let mut n = NumLock::default();
         n.note_scancode(0x1D, false, true);
-        n.synchronize(true);
-        assert!(n.key(true), "Ctrl went up with the Synchronize");
+        n.forget_key();
+        assert!(n.key(true), "Ctrl went up with the focus-in");
+    }
+
+    /// guacd's lock Synchronize keeps the keys: a Left Ctrl still held still
+    /// makes 0x45 Pause.
+    #[test]
+    fn lock_synchronize_keeps_a_held_left_ctrl() {
+        let mut n = NumLock::default();
+        n.note_scancode(0x1D, false, true);
+        n.synchronize(false);
+        assert!(!n.key(true), "still Pause");
+        assert!(!n.is_on());
     }
 }
