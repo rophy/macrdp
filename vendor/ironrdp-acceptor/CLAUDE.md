@@ -207,3 +207,14 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     and `AcceptorResult` exposes it. The server uses the audio-mode flags
     (server divergence (31)). Ported from macrdp-v1's IronRDP fork
     (rophy/IronRDP 6ead8214), relicensed by the author.
+
+(33) STATUS_LOGON_FAILURE for a failed NLA logon (UPSTREAMED as
+    Devolutions/IronRDP#2138, commit cddbe5f7, after the a5d1c682 pin; added
+    here 2026-10-21, same code). `CredsspSequence::handle_process_result` sets
+    `TsRequest.errorCode` to STATUS_LOGON_FAILURE (0xC000006D) when sspi
+    reports `LogonDenied` (wrong password or unknown user; sspi 0.21.3 gives
+    that kind: `ntlm/messages/server/complete_authenticate.rs` "no candidate
+    credential matched", `credssp/mod.rs` user lookup). Before, the client got
+    the code sspi builds from the SSPI error (not an NTSTATUS value), and mstsc
+    showed error 0x904 instead of asking for the password again. Other errors
+    keep the sspi code. Drop on a pin bump past cddbe5f7.
