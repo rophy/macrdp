@@ -226,6 +226,9 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
 #[derive(Debug, Default)]
 struct HeldKeys {
     down: std::collections::BTreeSet<u16>,
+    /// Keys held whose key-down went out remapped Ctrl→Cmd
+    /// (--map-ctrl-to-cmd): their key-up goes out the same way.
+    remapped: std::collections::BTreeSet<u16>,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -243,6 +246,30 @@ impl HeldKeys {
     /// a key-up each.
     fn take_all(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.down).into_iter().collect()
+    }
+
+    /// Record a key-down of `vk` posted remapped Ctrl→Cmd.
+    fn note_remapped_down(&mut self, vk: u16) {
+        self.remapped.insert(vk);
+    }
+
+    /// A key-up of `vk`: true if its down went out remapped, so the up must
+    /// go out remapped too. That up also releases a down of the same key that
+    /// went out on the plain path before Ctrl was pressed (a held key, then
+    /// auto-repeat under Ctrl), so the key is no longer held either: no second
+    /// key-up at the connection end.
+    fn remapped_up(&mut self, vk: u16) -> bool {
+        if !self.remapped.remove(&vk) {
+            return false;
+        }
+        self.down.remove(&vk);
+        true
+    }
+
+    /// Forget every remapped key; returns them (ascending) for the caller to
+    /// post a remapped key-up each.
+    fn take_remapped(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.remapped).into_iter().collect()
     }
 }
 
@@ -293,6 +320,24 @@ impl WheelAccumulator {
     }
 }
 
+/// Wheel rotation of a mouse event, routed to its axis: `(vertical,
+/// horizontal)` in 16.16 fixed point (`WHEEL_FIXED_ONE` = one RDP rotation
+/// unit), RDP sign convention. `None` for events that are not a wheel.
+/// Fast-path / slow-path wheel PDUs (mstsc) carry plain rotation units and are
+/// scaled up; the ainput channel (FreeRDP, `Scroll`) is already 16.16.
+///
+/// Pure (no platform deps) so it is unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn wheel_units(event: &MouseEvent) -> Option<(i64, i64)> {
+    match *event {
+        MouseEvent::VerticalScroll { value } => Some((i64::from(value) * WHEEL_FIXED_ONE, 0)),
+        // mstsc tilt: positive = right.
+        MouseEvent::HorizontalScroll { value } => Some((0, i64::from(value) * WHEEL_FIXED_ONE)),
+        MouseEvent::Scroll { x, y } => Some((i64::from(y), i64::from(x))),
+        _ => None,
+    }
+}
+
 /// CGEvent scroll wheel counts for `v` / `h` lines in RDP's sign convention
 /// (vertical: positive = wheel forward / up; horizontal: positive = tilt
 /// right, as Windows WM_MOUSEHWHEEL and FreeRDP's ainput `x`). macOS: wheel1
@@ -307,9 +352,10 @@ fn wheel_counts(v: i32, h: i32) -> (i32, i32) {
 #[cfg(test)]
 mod coord_tests {
     use super::{
-        is_remappable_shortcut, map_client_to_display, should_remap_click, wheel_counts, HeldKeys,
-        WheelAccumulator, WHEEL_FIXED_ONE,
+        is_remappable_shortcut, map_client_to_display, should_remap_click, wheel_counts,
+        wheel_units, HeldKeys, WheelAccumulator, WHEEL_FIXED_ONE,
     };
+    use ironrdp_server::MouseEvent;
 
     /// Plain RDP rotation units (fast-path wheel PDU) in the accumulator's unit.
     fn units(u: i64) -> i64 {
@@ -333,6 +379,39 @@ mod coord_tests {
         // Half a notch (high-resolution wheel) twice = one notch.
         assert_eq!(w.lines(60 << 16), 1);
         assert_eq!(w.lines(60 << 16), 2);
+    }
+
+    /// Each wheel event reaches its own axis: the fast-path horizontal wheel
+    /// (mstsc tilt) and the ainput `x` (FreeRDP) go to the horizontal axis,
+    /// vertical ones to the vertical axis. Fast-path units are scaled to
+    /// 16.16; ainput values are already 16.16.
+    #[test]
+    fn wheel_events_route_to_their_axis() {
+        assert_eq!(
+            wheel_units(&MouseEvent::HorizontalScroll { value: 120 }),
+            Some((0, units(120)))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::HorizontalScroll { value: -1 }),
+            Some((0, units(-1)))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::VerticalScroll { value: -120 }),
+            Some((units(-120), 0))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::Scroll { x: 7_864_320, y: 0 }),
+            Some((0, 7_864_320))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::Scroll {
+                x: 0,
+                y: -7_864_320
+            }),
+            Some((-7_864_320, 0))
+        );
+        assert_eq!(wheel_units(&MouseEvent::Move { x: 1, y: 2 }), None);
+        assert_eq!(wheel_units(&MouseEvent::MiddlePressed), None);
     }
 
     /// RDP tilt right (+) must scroll right: CG wheel2 is positive = left.
@@ -391,14 +470,31 @@ mod coord_tests {
 
     /// `Inner::key` call sequence for --map-ctrl-to-cmd: C goes down on the
     /// plain path (noted), Ctrl goes down, the auto-repeat of C goes out as
-    /// Cmd+C (remap path, not noted), then the up goes out on the remap path,
-    /// which also notes the up. Nothing is left for `release_all`.
+    /// Cmd+C (remap path), then the up goes out on the remap path. Nothing is
+    /// left for `release_all`: no stray plain C up at the connection end.
     #[test]
     fn remapped_key_up_clears_a_plain_held_key() {
         let mut h = HeldKeys::default();
         h.note(0x08, true); // C down, plain path
-        h.note(0x08, false); // C up, remap path
+        h.note_remapped_down(0x08); // auto-repeat under Ctrl: Cmd+C
+        assert!(h.remapped_up(0x08), "the up goes out remapped");
         assert!(h.take_all().is_empty(), "no stray C up at connection end");
+        assert!(h.take_remapped().is_empty());
+        // An up of a key that did not go down remapped takes the plain path.
+        h.note(0x09, true);
+        assert!(!h.remapped_up(0x09));
+        assert_eq!(h.take_all(), vec![0x09]);
+    }
+
+    /// A remapped key still down at the connection end gets one remapped up.
+    #[test]
+    fn take_remapped_returns_the_keys_still_down() {
+        let mut h = HeldKeys::default();
+        h.note_remapped_down(0x08);
+        h.note_remapped_down(0x09);
+        assert!(h.remapped_up(0x09));
+        assert_eq!(h.take_remapped(), vec![0x08]);
+        assert!(h.take_remapped().is_empty());
     }
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
@@ -975,10 +1071,9 @@ mod macos {
         // Non-modifier keys posted down and not up yet; released by
         // `release_all` when a connection ends or starts.
         held_keys: super::HeldKeys,
-        // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
-        // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
-        // Cmd swap + restores the real (Ctrl) modifier state.
-        remapped_keys: HashSet<u16>,
+        // (`held_keys` also has the keys held that we remapped Ctrl→Cmd on
+        // the way down, --map-ctrl-to-cmd: the matching key-up is posted with
+        // the same Cmd swap + restores the real (Ctrl) modifier state.)
         // The client's Num Lock (macOS has none): with it off the keypad
         // keys post navigation keys, as on Windows.
         num_lock: NumLock,
@@ -1078,7 +1173,6 @@ mod macos {
                 scroll_h: super::WheelAccumulator::default(),
                 consumed_keys: HashSet::new(),
                 held_keys: super::HeldKeys::default(),
-                remapped_keys: HashSet::new(),
                 num_lock: NumLock::default(),
                 posted: PostedKeys::default(),
                 unicode: UnicodeKeys::default(),
@@ -1296,7 +1390,7 @@ mod macos {
             }
             // Remapped Ctrl->Cmd keys: the down went out as Cmd+key, so the
             // up does too (`post_ctrl_as_cmd` also restores the real flags).
-            let remapped: Vec<u16> = self.remapped_keys.drain().collect();
+            let remapped = self.held_keys.take_remapped();
             for &vk in &remapped {
                 self.post_ctrl_as_cmd(vk, false);
             }
@@ -1481,13 +1575,8 @@ mod macos {
             // when a terminal / excluded app is frontmost so Ctrl+C stays SIGINT.
             // Checked before the layout branch so a remapped key-up isn't swallowed
             // there.
-            if !down && self.remapped_keys.remove(&vk) {
+            if !down && self.held_keys.remapped_up(vk) {
                 self.post_ctrl_as_cmd(vk, false);
-                // The key may also have gone down on the plain path before
-                // Ctrl was pressed (held key, then auto-repeat under Ctrl).
-                // This up releases it too, so `release_all` must not post a
-                // second up at connection end.
-                self.held_keys.note(vk, false);
                 return;
             }
             if down
@@ -1499,7 +1588,7 @@ mod macos {
                 && !frontmost_is_excluded()
             {
                 self.post_ctrl_as_cmd(vk, true);
-                self.remapped_keys.insert(vk);
+                self.held_keys.note_remapped_down(vk);
                 return;
             }
 
@@ -1847,17 +1936,14 @@ mod macos {
                 MouseEvent::RightReleased => self.button(CGMouseButton::Right, false),
                 MouseEvent::MiddlePressed => self.button(CGMouseButton::Center, true),
                 MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
-                // Fast-path wheel PDU: plain rotation units (mstsc: 120 per notch).
-                MouseEvent::VerticalScroll { value } => {
-                    self.scroll(i64::from(value) * super::WHEEL_FIXED_ONE, 0)
+                // Wheel: routed to its axis and scaled by `wheel_units`.
+                MouseEvent::VerticalScroll { .. }
+                | MouseEvent::HorizontalScroll { .. }
+                | MouseEvent::Scroll { .. } => {
+                    if let Some((v, h)) = super::wheel_units(&event) {
+                        self.scroll(v, h);
+                    }
                 }
-                // Fast-path horizontal wheel (mstsc tilt): plain units,
-                // positive = right.
-                MouseEvent::HorizontalScroll { value } => {
-                    self.scroll(0, i64::from(value) * super::WHEEL_FIXED_ONE)
-                }
-                // ainput channel (FreeRDP): 16.16 fixed-point rotation units.
-                MouseEvent::Scroll { x, y } => self.scroll(i64::from(y), i64::from(x)),
                 MouseEvent::Button4Pressed
                 | MouseEvent::Button4Released
                 | MouseEvent::Button5Pressed

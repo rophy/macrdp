@@ -1141,12 +1141,13 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
 }
 
 /// (vendored divergence 28) A horizontal wheel PDU (PTRFLAGS_HWHEEL) must
-/// arrive as `HorizontalScroll` with its signed rotation units, not fall
-/// through to a `Move` to the PDU's (meaningless) x/y.
+/// arrive as exactly one `HorizontalScroll` with its signed rotation units,
+/// through the function the server's fast-path and slow-path dispatch use:
+/// not a `Move` to the PDU's (meaningless) x/y, and no lead `Move` either.
 #[test]
 fn horizontal_wheel_pdu_is_a_horizontal_scroll() {
     use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
-    use ironrdp_server::MouseEvent;
+    use ironrdp_server::{mouse_events_from_pdu, MouseEvent};
 
     for units in [-120_i16, -1, 1, 120] {
         let mut flags = PointerFlags::HORIZONTAL_WHEEL;
@@ -1161,9 +1162,10 @@ fn horizontal_wheel_pdu_is_a_horizontal_scroll() {
         };
         let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
         let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
-        match MouseEvent::from(decoded) {
-            MouseEvent::HorizontalScroll { value } => assert_eq!(value, units),
-            other => panic!("expected HorizontalScroll for {units}, got {other:?}"),
+        let events: Vec<MouseEvent> = mouse_events_from_pdu(decoded).collect();
+        match events.as_slice() {
+            [MouseEvent::HorizontalScroll { value }] => assert_eq!(*value, units),
+            other => panic!("expected one HorizontalScroll for {units}, got {other:?}"),
         }
     }
 }
