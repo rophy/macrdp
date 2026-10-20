@@ -208,6 +208,9 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     (server divergence (31)). Ported from macrdp-v1's IronRDP fork
     (rophy/IronRDP 6ead8214), relicensed by the author.
 
+(There is no acceptor (32): server divergence (32), `ServerEvent::Disconnect`,
+    needs no acceptor change.)
+
 (33) STATUS_LOGON_FAILURE for a failed NLA logon (UPSTREAMED as
     Devolutions/IronRDP#2138, commit cddbe5f7, after the a5d1c682 pin; added
     here 2026-10-21, same code). `CredsspSequence::handle_process_result` sets

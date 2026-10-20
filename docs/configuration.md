@@ -239,7 +239,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           request (MS-RDPEECO; a Heartbeat PDU to a client without
                           the ECHO channel) when nothing else went out for 100 ms.
                           With Wi-Fi power save, a Mac that sent nothing for a
-                          moment gets the next packet 50-200 ms late, so a key
+                          moment gets the next packet 50-150 ms late, so a key
                           after a pause shows late. About 10 small packets per
                           second while it runs. Config: WIFI_KEEP_AWAKE=0.
 --idle-timeout SECS       Disconnect the client after SECS seconds without keyboard

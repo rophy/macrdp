@@ -11,8 +11,9 @@
 //! one each 330 ms does not). The access point then holds packets for the Mac
 //! until the radio wakes up: a ping to an idle Mac took 70 ms on average and
 //! up to 180 ms, against 5 ms while the Mac sends. So a key press after a
-//! quiet moment reached the server 50-100 ms late (mstsc key-to-screen
-//! 155 ms on an idle link, 105 ms on a busy one).
+//! quiet moment reaches the screen 50-150 ms late (key-to-screen p50 on an
+//! idle link minus a busy one: mstsc 50-65 ms here, 58 ms with v1; FreeRDP
+//! 50-150 ms with v1).
 //!
 //! While a client is connected and sent input not long ago, the task sends a
 //! small ECHO request (MS-RDPEECO, 1 byte of payload; the client answers it)

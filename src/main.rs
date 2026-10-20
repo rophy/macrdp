@@ -557,7 +557,7 @@ struct Args {
     /// server sends a small ECHO request (or a Heartbeat PDU to a client
     /// without the ECHO channel) when nothing else went out for 100 ms.
     /// Without it, Wi-Fi power save delays input that comes after a quiet
-    /// moment by 50-100 ms. Costs about 10 small packets per second.
+    /// moment by 50-150 ms. Costs about 10 small packets per second.
     #[arg(long = "no-wifi-keep-awake", action = clap::ArgAction::SetTrue)]
     no_wifi_keep_awake: bool,
 
