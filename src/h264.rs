@@ -345,6 +345,15 @@ struct ConnectionContext {
     /// `on_qoe_metrics` (which only sees the context, not the owning `Gfx`) can
     /// set the [`QoeEvidence::presented_clean`] latch. Not RTT-scaled.
     min_render_reports: u64,
+    /// True once EGFX went ready with AVC on this connection. A later
+    /// `on_close` clears `is_ready` but not this, so the legacy hold (see
+    /// [`hold_legacy_for_egfx`]) applies only before the first ready.
+    egfx_ever_ready: bool,
+    /// When capture first asked for the legacy path on this connection while
+    /// EGFX was not ready yet: the start of the legacy hold.
+    legacy_hold_since: Option<Instant>,
+    /// One-shot guard for the "legacy hold expired" log line.
+    legacy_hold_expired_logged: bool,
 }
 
 impl ConnectionContext {
@@ -457,6 +466,31 @@ fn should_demigrate_to_tcp(
         && !acks_suspended
         && since_ship <= active_window
         && since_ack >= wedge_timeout
+}
+
+/// Whether capture must hold back a legacy bitmap update because this
+/// connection is still negotiating EGFX. Pure, unit-tested.
+///
+/// Windows 10 mstsc, full screen 1920x1080 (2026-10-21): when legacy surface
+/// bits (RemoteFX) reach the client between activation and EGFX ready, the
+/// session often stays frozen on that first legacy picture after EGFX starts:
+/// every AVC420 frame is decoded and acknowledged, but none is shown, and
+/// every QoE report has `timeDiffEDR == 0` (7 of 14 fresh connects; 3 of 10
+/// in a 1024x768 window). With the legacy updates held back until EGFX is
+/// ready: 0 of 22 full screen, 0 of 10 window. MS-RDPEGFX
+/// clients render legacy output only while the pipeline is not active, and
+/// the two paths are not meant to be mixed on one connection start.
+///
+/// Hold while EGFX has not yet been ready on this connection, the client
+/// has not declined it (no AVC), and the hold has lasted less than `limit`:
+/// a client that never opens EGFX gets legacy updates after `limit`.
+fn hold_legacy_for_egfx(
+    ever_ready: bool,
+    declined: bool,
+    held_for: Duration,
+    limit: Duration,
+) -> bool {
+    !ever_ready && !declined && held_for < limit
 }
 
 /// Tunables for the blank-presentation detector + recovery (the mstsc
@@ -673,16 +707,26 @@ fn blank_drop_capped(consecutive_drops: u32, cap: u32) -> bool {
 }
 
 /// Whether an in-flight connection should clear the reconnect-storm drop counter
-/// (see the call site + [`blank_drop_capped`]). Only a genuinely-ESTABLISHED
-/// connection resets it — a brief blip (a few post-reactivation frames that then
+/// (see the call site + [`blank_drop_capped`]). A genuinely-ESTABLISHED
+/// connection resets it, and so does one that latched
+/// [`QoeEvidence::presented_clean`] (it presented on its own before any
+/// recovery attempt). A brief blip (a few post-reactivation frames that then
 /// relapse to black) does NOT, so a brief-present-then-drop still counts toward
 /// the cap. Reset only matters when the counter is non-zero. Pure, unit-tested.
+///
+/// Why `presented_clean` too (2026-10-21, Windows 10 mstsc FS 1920x1080): this
+/// client interleaves zero `timeDiffEDR` reports with nonzero ones while it
+/// presents, so it never reaches the ESTABLISHED run of consecutive nonzero
+/// reports. The auto-reconnects that rendered after a blank drop therefore
+/// never cleared the counter, and after 3 such drops in the server's lifetime
+/// (3 separate client sessions) the guard disabled recovery for a 4th, real
+/// blank: frozen picture, "giving up" in the log.
 fn storm_guard_should_reset(
     qoe: QoeEvidence,
     established_render_reports: u64,
     current_drops: u32,
 ) -> bool {
-    current_drops != 0 && qoe.established(established_render_reports)
+    current_drops != 0 && (qoe.established(established_render_reports) || qoe.presented_clean)
 }
 
 /// Raw QoE decode+render-time counters for the blank detector — pure tallies,
@@ -734,8 +778,10 @@ struct QoeEvidence {
     /// `max_nonzero_streak` which spans the whole connection.
     nonzero_max_since_reset: u64,
     /// Durable "this connection genuinely presented at connect" latch (v0.9.2).
-    /// Set by the caller (`on_qoe_metrics`) the moment a sustained nonzero-EDR
-    /// run appears **while no recovery attempt has yet fired**, and never
+    /// Set by the caller (`on_qoe_metrics`) the moment `min_render_reports`
+    /// nonzero-EDR reports have arrived (in total, not necessarily in a row —
+    /// see [`should_latch_presented_clean`]) **while no recovery attempt has
+    /// yet fired**, and never
     /// cleared for the connection. When set, [`should_blank_recover`] returns
     /// false unconditionally — the v0.9.0 one-shot-disarm behavior, restored.
     ///
@@ -794,6 +840,30 @@ impl QoeEvidence {
     fn established(&self, established_render_reports: u64) -> bool {
         self.max_nonzero_streak >= established_render_reports
     }
+
+    /// Nonzero reports in the current evidence window (cumulative, not a run).
+    fn nonzero_since_reset(&self) -> u64 {
+        self.reports_since_reset
+            .saturating_sub(self.zeros_since_reset)
+    }
+}
+
+/// Whether to set the durable [`QoeEvidence::presented_clean`] latch now.
+/// Pure, unit-tested.
+///
+/// Only before any recovery attempt (see the field doc), and on
+/// `min_render_reports` nonzero reports in total since connect — NOT a run of
+/// consecutive ones. Windows 10 mstsc, full screen 1920x1080, moving picture
+/// (2026-10-21): about 40 % of its QoE reports have `timeDiffEDR == 0`,
+/// interleaved with the nonzero ones (e.g. `0, 5, 0, 2, 18, 0, 16, 0, 18`),
+/// so 3 consecutive nonzero reports often did not occur before the 4 s
+/// wall-clock fast path, which then fired on the next zero report: 3 of 10
+/// healthy fresh connects were reactivated and then dropped. A frozen or
+/// blank mstsc session reports zero on every frame (0 nonzero of 70+ reports
+/// in 17 s, measured the same day), so a count of nonzero reports separates
+/// the two as well as a run does.
+fn should_latch_presented_clean(qoe: &QoeEvidence, attempts: u32, min_render_reports: u64) -> bool {
+    !qoe.presented_clean && attempts == 0 && qoe.nonzero_since_reset() >= min_render_reports
 }
 
 /// Decide whether to run a blank-recovery attempt. Pure (counters + Durations,
@@ -919,11 +989,19 @@ fn should_blank_recover(
     // out a client that sends no QoE, e.g. FreeRDP, from ever firing on the
     // wall-clock branch). That last fast path is withheld once the session is
     // established: with `blank_min_reports` as low as 1, a single stray zero
-    // from a healthy long-running session would otherwise satisfy it.
+    // from a healthy long-running session would otherwise satisfy it. It is
+    // also withheld after a recovery attempt (2026-10-21, Windows 10 mstsc):
+    // since_connect is then already past `blank_max_wait`, so one zero report
+    // fired the fallback drop `retry_interval` after a reactivation even when
+    // the reactivation had healed the session — a healthy mstsc interleaves
+    // zero reports with nonzero ones (see `should_latch_presented_clean`).
+    // After an attempt the count path and the heal-confirmation deadline
+    // decide; both need more than one stray zero.
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
         || post_attempt_unconfirmed
-        || (since_connect >= p.blank_max_wait
+        || (attempts == 0
+            && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
             && !established);
     blank_evidence
@@ -1307,6 +1385,10 @@ pub struct Gfx {
     /// experimentation) — see [`BlankAction`].
     blank_recovery_enabled: bool,
     blank_params: BlankRecoveryParams,
+    /// How long capture holds back legacy bitmap updates on a new connection
+    /// while EGFX is not ready yet (see [`hold_legacy_for_egfx`]).
+    /// `MACRDP_EGFX_LEGACY_HOLD_MS`, default 3000; 0 disables the hold.
+    legacy_hold: Duration,
     /// Consecutive connections (process lifetime) that ended in a blank-recovery
     /// DROP with no connection presenting in between — the reconnect-storm guard
     /// counter (see [`blank_drop_capped`]). Incremented when a drop is armed;
@@ -1511,6 +1593,10 @@ impl Gfx {
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        let legacy_hold = Duration::from_millis(u64::from(env_u32_zero_ok(
+            "MACRDP_EGFX_LEGACY_HOLD_MS",
+            3000,
+        )));
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -1571,6 +1657,7 @@ impl Gfx {
             adaptive_min_fps_interval,
             blank_recovery_enabled,
             blank_params,
+            legacy_hold,
             consecutive_blank_drops: Arc::new(AtomicU32::new(0)),
             link_rtt_ms,
             adaptive_seed_rtt_ms,
@@ -1632,6 +1719,43 @@ impl Gfx {
     /// particular frame was skipped for backpressure or isn't encoded yet).
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
+    /// Called by capture when [`Self::submit_bgra`] returned `Ok(false)`:
+    /// true means "drop this frame, do not send it as a legacy bitmap update"
+    /// because the connection is still negotiating EGFX (see
+    /// [`hold_legacy_for_egfx`]).
+    pub fn hold_legacy(&self) -> bool {
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(ctx) = guard.as_mut() else {
+            return false;
+        };
+        if ctx.is_ready {
+            return false;
+        }
+        let now = Instant::now();
+        let since = *ctx.legacy_hold_since.get_or_insert_with(|| {
+            debug!(
+                limit_ms = self.legacy_hold.as_millis() as u64,
+                "EGFX not ready yet — holding back legacy bitmap updates"
+            );
+            now
+        });
+        let hold = hold_legacy_for_egfx(
+            ctx.egfx_ever_ready,
+            ctx.egfx_declined.load(Ordering::Relaxed),
+            now.saturating_duration_since(since),
+            self.legacy_hold,
+        );
+        if !hold && !ctx.egfx_ever_ready && !ctx.legacy_hold_expired_logged {
+            ctx.legacy_hold_expired_logged = true;
+            info!(
+                held_ms = now.saturating_duration_since(since).as_millis() as u64,
+                declined = ctx.egfx_declined.load(Ordering::Relaxed),
+                "EGFX did not become ready — sending legacy bitmap updates"
+            );
+        }
+        hold
+    }
+
     pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
@@ -1737,9 +1861,10 @@ impl Gfx {
             // Decision here (under ctx), action after the guard drops.
             // `qoe_reports` resets so a re-fire needs a fresh all-zero window.
             if self.blank_recovery_enabled && ctx.surface_id.is_some() {
-                // A GENUINELY-ESTABLISHED connection clears the reconnect-storm
-                // guard: the consecutive-drop counter only tracks UNBROKEN runs
-                // of blank-dropped connections (see `blank_drop_capped`).
+                // A GENUINELY-ESTABLISHED connection (or one that latched
+                // `presented_clean`, see `storm_guard_should_reset`) clears the
+                // reconnect-storm guard: the consecutive-drop counter only tracks
+                // UNBROKEN runs of blank-dropped connections (see `blank_drop_capped`).
                 //
                 // Gate on the ESTABLISHED bar (~5 s of sustained presentation),
                 // NOT the low `min_render_reports` bar (3 frames). REVERSED
@@ -1762,7 +1887,10 @@ impl Gfx {
                     self.consecutive_blank_drops.load(Ordering::Relaxed),
                 ) {
                     self.consecutive_blank_drops.store(0, Ordering::Relaxed);
-                    debug!("EGFX connection established — consecutive blank-drop counter reset");
+                    debug!(
+                        "EGFX connection established or presented cleanly — consecutive \
+                         blank-drop counter reset"
+                    );
                 }
                 // RTT gate (2026-07-05): on a slow link the EDR==0 signal is
                 // unreliable (a rendering ZeroTier client reports zero), so the
@@ -2905,6 +3033,9 @@ impl GfxServerFactory for Gfx {
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
+            egfx_ever_ready: false,
+            legacy_hold_since: None,
+            legacy_hold_expired_logged: false,
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -2996,6 +3127,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                     ctx.start_clocks(Instant::now());
                 }
                 ctx.is_ready = true;
+                ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
                 info!(?negotiated, "EGFX channel ready (H.264 active)");
             } else {
@@ -3135,19 +3267,23 @@ impl GraphicsPipelineHandler for GfxHandler {
                 );
             }
             // Durable clean-presentation latch (v0.9.2): once the connection has
-            // shown a sustained nonzero-EDR run WHILE no recovery attempt has yet
-            // fired, it genuinely presented at connect — latch the detector off
-            // for the connection (v0.9.0 behavior). Gated on `attempts == 0`
-            // because a nonzero run AFTER a reactivation can be the #172 blank
-            // client's post-reactivation flicker-while-black, which must NOT
-            // disarm. `min_render_reports` is not RTT-scaled, so read it raw.
-            if !ctx.qoe.presented_clean
-                && ctx.blank_recovery_attempts == 0
-                && ctx.qoe.nonzero_streak >= ctx.min_render_reports
-            {
+            // shown `min_render_reports` nonzero-EDR reports (in total; see
+            // `should_latch_presented_clean` for why not a run) WHILE no
+            // recovery attempt has yet fired, it genuinely presented at connect
+            // — latch the detector off for the connection (v0.9.0 behavior).
+            // Gated on `attempts == 0` because nonzero reports AFTER a
+            // reactivation can be the #172 blank client's post-reactivation
+            // flicker-while-black, which must NOT disarm. `min_render_reports`
+            // is not RTT-scaled, so read it raw.
+            if should_latch_presented_clean(
+                &ctx.qoe,
+                ctx.blank_recovery_attempts,
+                ctx.min_render_reports,
+            ) {
                 ctx.qoe.presented_clean = true;
                 debug!(
-                    nonzero_streak = ctx.qoe.nonzero_streak,
+                    nonzero_reports = ctx.qoe.nonzero_since_reset(),
+                    reports = ctx.qoe.reports_since_reset,
                     "EGFX connection presented cleanly before any recovery — blank detector \
                      latched off for this connection"
                 );
@@ -4580,6 +4716,182 @@ mod tests {
         ));
     }
 
+    /// Fold a recorded QoE `timeDiffEDR` sequence into fresh evidence.
+    fn qoe_from(drs: &[u16]) -> QoeEvidence {
+        let mut q = QoeEvidence::default();
+        for &d in drs {
+            q.record(d);
+        }
+        q
+    }
+
+    /// Windows 10 mstsc, FS 1920x1080, moving picture (live 2026-10-21, run
+    /// xnl-3): the first QoE reports of a healthy fresh connect.
+    const MSTSC_FS_HEALTHY: [u16; 18] =
+        [0, 5, 0, 2, 18, 0, 16, 0, 18, 4, 0, 13, 0, 24, 0, 20, 0, 0];
+
+    #[test]
+    fn presented_clean_latches_on_interleaved_nonzero_reports() {
+        // Healthy mstsc never has 3 nonzero reports in a row here, but its
+        // 3rd nonzero report (the 5th report, ~1 s in) latches.
+        assert!(qoe_from(&MSTSC_FS_HEALTHY).max_nonzero_streak < 3);
+        let first_latch = (1..=MSTSC_FS_HEALTHY.len())
+            .find(|&n| should_latch_presented_clean(&qoe_from(&MSTSC_FS_HEALTHY[..n]), 0, 3));
+        assert_eq!(first_latch, Some(5));
+        // A frozen session (zero on every report) never latches.
+        assert!(!should_latch_presented_clean(&qoe_from(&[0; 70]), 0, 3));
+        // Nonzero reports after a recovery attempt never latch (#172).
+        assert!(!should_latch_presented_clean(
+            &qoe_from(&MSTSC_FS_HEALTHY),
+            1,
+            3
+        ));
+        // Already latched: nothing to do.
+        let mut q = qoe_from(&MSTSC_FS_HEALTHY);
+        q.presented_clean = true;
+        assert!(!should_latch_presented_clean(&q, 0, 3));
+    }
+
+    #[test]
+    fn healthy_interleaved_mstsc_is_not_recovered() {
+        // Production-like fast path: 1 zero report after 4 s.
+        let p = BlankRecoveryParams {
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        };
+        let mut q = qoe_from(&MSTSC_FS_HEALTHY);
+        // Before the change (latch on a run of 3): no latch, last report 0,
+        // 4 s in → the fast path fired on this healthy session.
+        assert!(!q.presented_clean);
+        assert!(should_blank_recover(
+            q,
+            true,
+            false,
+            ms(4000),
+            ms(0),
+            ms(60_000),
+            0,
+            false,
+            &p
+        ));
+        // With the cumulative latch the caller has set it by the 5th report.
+        q.presented_clean = should_latch_presented_clean(&q, 0, p.min_render_reports);
+        assert!(!should_blank_recover(
+            q,
+            true,
+            false,
+            ms(4000),
+            ms(0),
+            ms(60_000),
+            0,
+            false,
+            &p
+        ));
+    }
+
+    #[test]
+    fn wall_clock_fast_path_is_for_the_first_attempt_only() {
+        let p = BlankRecoveryParams {
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        };
+        // After a reactivation that healed: interleaved reports, the latest
+        // one zero. Live 2026-10-21 the fast path dropped this session 4 s
+        // after the reactivation; now it does not.
+        let healed = qoe_from(&[1, 1, 16, 5, 12, 0, 0, 0, 17, 28, 18, 0, 0, 15, 5, 15, 0]);
+        assert!(!should_blank_recover(
+            healed,
+            true,
+            false,
+            ms(8200),
+            ms(0),
+            ms(5000),
+            1,
+            true,
+            &p
+        ));
+        // …even past the heal-confirmation deadline: it presented since the attempt.
+        assert!(!should_blank_recover(
+            healed,
+            true,
+            false,
+            ms(20_000),
+            ms(0),
+            ms(16_000),
+            1,
+            true,
+            &p
+        ));
+        // A reactivation that did NOT heal (live: all zero after it) still
+        // escalates: by the count path once `min_qoe_reports` zeros are in…
+        let still_blank = qoe(p.min_qoe_reports, 0, 0);
+        assert!(should_blank_recover(
+            still_blank,
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(5000),
+            1,
+            true,
+            &p
+        ));
+        // …and before that by the heal-confirmation deadline.
+        let few_zeros = qoe(18, 0, 0);
+        assert!(!should_blank_recover(
+            few_zeros,
+            true,
+            false,
+            ms(8000),
+            ms(0),
+            ms(5000),
+            1,
+            true,
+            &p
+        ));
+        assert!(should_blank_recover(
+            few_zeros,
+            true,
+            false,
+            ms(12_000),
+            ms(0),
+            ms(8000),
+            1,
+            true,
+            &p
+        ));
+        // The first attempt keeps the fast path (connect-time static blank).
+        assert!(should_blank_recover(
+            qoe(1, 0, 0),
+            true,
+            false,
+            ms(4000),
+            ms(0),
+            ms(60_000),
+            0,
+            false,
+            &p
+        ));
+    }
+
+    #[test]
+    fn legacy_hold_rules() {
+        let limit = ms(3000);
+        // New connection, EGFX not ready yet: hold.
+        assert!(hold_legacy_for_egfx(false, false, ms(0), limit));
+        assert!(hold_legacy_for_egfx(false, false, ms(2999), limit));
+        // EGFX never came: legacy after the limit.
+        assert!(!hold_legacy_for_egfx(false, false, ms(3000), limit));
+        // Client declined EGFX (no AVC): legacy at once.
+        assert!(!hold_legacy_for_egfx(false, true, ms(0), limit));
+        // EGFX was ready and closed later: legacy as before.
+        assert!(!hold_legacy_for_egfx(true, false, ms(0), limit));
+        // Limit 0 = hold disabled.
+        assert!(!hold_legacy_for_egfx(false, false, ms(0), ms(0)));
+    }
+
     #[test]
     fn blank_action_remaps_then_drops() {
         // DEFAULT max_attempts=1: straight to the drop — the remap was
@@ -4689,6 +5001,15 @@ mod tests {
             established,
             0
         ));
+
+        // A connection that presented on its own before any attempt (the
+        // latch; mstsc with interleaved zero reports never establishes) has
+        // escaped the cycle too → reset.
+        let mut q = qoe_from(&MSTSC_FS_HEALTHY);
+        assert!(!q.established(established));
+        assert!(!storm_guard_should_reset(q, established, 2));
+        q.presented_clean = true;
+        assert!(storm_guard_should_reset(q, established, 2));
     }
 
     // ---- P2b: frame_drop_at_floor ----

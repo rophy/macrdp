@@ -1635,6 +1635,11 @@ mod macos {
                             self.flush_remaining = self.flush_frames;
                             continue;
                         }
+                        // EGFX still negotiating on this connection: drop the
+                        // frame instead of sending it as a legacy update (Windows
+                        // 10 mstsc can stay frozen on a legacy picture sent just
+                        // before EGFX starts; see `hold_legacy_for_egfx`).
+                        Ok(false) if gfx.hold_legacy() => continue,
                         Ok(false) => {}
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
