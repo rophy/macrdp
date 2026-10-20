@@ -1393,8 +1393,13 @@ mod macos {
             // the next move posts as MouseMoved, not a phantom
             // `LeftMouseDragged`. An interrupted drag completes as a drop at
             // the last cursor position (docs/known-quirks.md).
-            let to_release =
-                release.buttons_to_release([self.left_down, self.right_down, self.middle_down]);
+            // Also forgets the focus-in state at a connection edge: a Tab up of
+            // the old connection must not make the first Synchronize of the
+            // next one a focus-in.
+            let to_release = release.apply(
+                &mut self.focus_in,
+                [self.left_down, self.right_down, self.middle_down],
+            );
             let mut released_buttons = 0;
             for (go, button) in to_release.into_iter().zip([
                 CGMouseButton::Left,
@@ -1406,12 +1411,6 @@ mod macos {
                     released_buttons += 1;
                 }
             }
-            // A connection edge: a Tab up of the old connection must not make
-            // the first Synchronize of the next one a focus-in.
-            if release.resets_focus_in() {
-                self.focus_in = FocusIn::default();
-            }
-
             // Keys whose key-up never came. Posted with the current modifier
             // flags, before the modifiers go up, as a real keyboard would.
             let keys = self.held_keys.take_all();

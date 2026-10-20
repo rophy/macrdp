@@ -137,6 +137,16 @@ impl Release {
     pub(super) fn resets_focus_in(self) -> bool {
         self == Release::All
     }
+
+    /// The state part of `release_held`, which then posts the events: at a
+    /// connection edge forget the focus-in state, and return the held mouse
+    /// buttons (left, right, middle) to let go of.
+    pub(super) fn apply(self, focus_in: &mut FocusIn, held: [bool; 3]) -> [bool; 3] {
+        if self.resets_focus_in() {
+            *focus_in = FocusIn::default();
+        }
+        self.buttons_to_release(held)
+    }
 }
 
 /// Tells a focus-in Synchronize from one that only changes a lock state.
@@ -420,14 +430,22 @@ mod tests {
     }
 
     /// A Tab up at the end of a connection does not count for the first
-    /// Synchronize of the next one: `release_held(All)` resets the state.
+    /// Synchronize of the next one: `release_held(All)` resets the state
+    /// through `Release::apply`. A focus-in Synchronize keeps it and the
+    /// buttons.
     #[test]
     fn a_connection_edge_forgets_the_tab_up() {
         let mut f = FocusIn::default();
         f.note_key(0x0F, false, false, 500);
-        if Release::All.resets_focus_in() {
-            f = FocusIn::default();
-        }
+        assert_eq!(
+            Release::KeysOnly.apply(&mut f, [true, false, false]),
+            [false; 3]
+        );
+        assert_ne!(f, FocusIn::default(), "a Synchronize keeps the state");
+        assert_eq!(
+            Release::All.apply(&mut f, [true, false, true]),
+            [true, false, true]
+        );
         assert_eq!(f, FocusIn::default());
         assert_eq!(f.synchronize(505), Release::Nothing);
     }
