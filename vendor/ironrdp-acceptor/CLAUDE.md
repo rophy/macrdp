@@ -191,3 +191,12 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
     22621) + its hostname; FreeRDP hardcodes build 2600. Informational
     fingerprinting only — a client can claim anything.
+
+(30) `earlyCapabilityFlags` of the Client Core Data on `AcceptorResult`
+    (NOT upstreamed; added 2026-10-21; numbered (30) to match the server
+    divergence it serves). `Acceptor` keeps `client_early_capability_flags`
+    (empty until the MCS Connect Initial, carried across
+    `new_deactivation_reactivation`) and `AcceptorResult` exposes it. The
+    server uses `SUPPORT_HEART_BEAT_PDU` to decide whether the client gets
+    Heartbeat PDUs (server divergence (30)). Upstream has the same field
+    (`client_early_capability_flags`) after a5d1c682; drop on a pin bump.

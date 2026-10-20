@@ -29,6 +29,7 @@ mod file_promise_lazy;
 mod h264;
 mod health;
 mod input;
+mod keep_awake;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
@@ -37,6 +38,7 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+mod session;
 mod shield;
 mod stats;
 mod switcher_hud;
@@ -548,6 +550,15 @@ struct Args {
     /// at the cost of accepting that drift on refocus.
     #[arg(long = "no-mute-on-minimize", action = clap::ArgAction::SetTrue)]
     no_mute_on_minimize: bool,
+
+    /// Do not keep the Mac's Wi-Fi radio awake during a session. By default,
+    /// while a client is connected and sent input in the last 10 minutes, the
+    /// server sends a small ECHO request (or a Heartbeat PDU to a client
+    /// without the ECHO channel) when nothing else went out for 100 ms.
+    /// Without it, Wi-Fi power save delays input that comes after a quiet
+    /// moment by 50-100 ms. Costs about 10 small packets per second.
+    #[arg(long = "no-wifi-keep-awake", action = clap::ArgAction::SetTrue)]
+    no_wifi_keep_awake: bool,
 
     /// Compress forwarded audio as AAC-LC over RDPSND (MS-RDPEA
     /// WAVE_FORMAT_AAC_MS) instead of raw 16-bit PCM — ~11x less audio
@@ -2352,6 +2363,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if !on("RICH_CLIPBOARD", true) {
         argv.push("--no-rich-clipboard".into());
     }
+    if !on("WIFI_KEEP_AWAKE", true) {
+        argv.push("--no-wifi-keep-awake".into());
+    }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
@@ -3379,13 +3393,18 @@ async fn async_main() -> Result<()> {
     // id, for auto-detecting a non-US layout when --keyboard-layout isn't given.
     let keyboard_layout_klid: crate::input::SharedKeyboardLayout =
         std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let input_handler = MacInputHandler::new(
+    let mut input_handler = MacInputHandler::new(
         desktop_size.clone(),
         capture_display_id,
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),
     )?;
+    // Wi-Fi keep-awake: input marks the session as used (see keep_awake).
+    let keep_awake = (!args.no_wifi_keep_awake).then(keep_awake::KeepAwake::new);
+    input_handler.set_session_input(session::SessionInput {
+        keep_awake: keep_awake.clone(),
+    });
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
@@ -3477,6 +3496,11 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
+    // Connection edges for the session features (keep-awake).
+    let conn_handler = Some(session::SessionHandler::wrap(
+        conn_handler,
+        keep_awake.clone(),
+    ));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -3508,6 +3532,14 @@ async fn async_main() -> Result<()> {
     // `input::modifier_reset_handle` for why the display `updates()` path and
     // `on_accept` were both the wrong seam.
     server.set_input_reset_handle(input::modifier_reset_handle());
+
+    // Wi-Fi keep-awake: ECHO requests and Heartbeat PDUs on a quiet link.
+    if let Some(k) = &keep_awake {
+        k.set_echo(server.echo_handle().clone());
+        k.set_heartbeat(server.heartbeat_handle());
+        tokio::spawn(k.clone().run(server.output_activity()));
+        info!("Wi-Fi keep-awake on (--no-wifi-keep-awake to turn it off)");
+    }
 
     // The acceptor records the client's announced keyboard-layout id (KLID) in
     // its Client Core Data; the server publishes it here so the input handler
@@ -4018,6 +4050,19 @@ mod config_tests {
         fs::remove_file(&path).ok();
         assert!(args.map_ctrl_to_cmd);
         assert!(args.config_warnings.is_empty());
+    }
+
+    /// Wi-Fi keep-awake is on unless WIFI_KEEP_AWAKE=0.
+    #[test]
+    fn wifi_keep_awake_config_key() {
+        let path = write_temp("wka-default", "USE_KEYCHAIN=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(!args.no_wifi_keep_awake);
+        let path = write_temp("wka-off", "WIFI_KEEP_AWAKE=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.no_wifi_keep_awake);
     }
 
     #[test]

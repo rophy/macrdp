@@ -17,6 +17,7 @@ mod encoder;
 #[cfg(feature = "egfx")]
 mod gfx;
 mod handler;
+mod heartbeat;
 #[cfg(feature = "helper")]
 mod helper;
 #[cfg(feature = "multitransport")]
@@ -40,6 +41,7 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+pub use heartbeat::{HeartbeatConfig, HeartbeatHandle, OutputActivity};
 #[doc(hidden)] // (divergence 29) for macrdp's tests only
 pub use handler::mouse_events_from_pdu;
 #[cfg(feature = "helper")]
@@ -66,7 +68,7 @@ pub use rdpeusb::{
     UsbHandle, UsbPipe,
 };
 pub use server::{
-    ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
+    ClientSession, ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
     ServerEventSender, tcp_srtt_ms,
 };
 pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};

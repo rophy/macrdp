@@ -41,6 +41,7 @@ use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxServerFactory};
 use crate::handler::RdpServerInputHandler;
+use crate::heartbeat::{HeartbeatHandle, OutputActivity, encode_heartbeat};
 use crate::{SoundServerFactory, builder, capabilities};
 
 /// TCP listen backlog size for the RDP server socket.
@@ -171,6 +172,23 @@ pub trait ConnectionHandler: Send {
     fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
         let _ = (client_name, rdp_version, client_build, platform);
     }
+
+    /// (vendored, divergence (30)) Called once per served connection when the
+    /// capability exchange completes (not on a deactivation–reactivation),
+    /// with what the client said it takes. Default: no-op.
+    fn on_client_session(&mut self, session: &ClientSession) {
+        let _ = session;
+    }
+}
+
+/// (vendored, divergence (30)) What the client of a new connection takes, for
+/// [`ConnectionHandler::on_client_session`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClientSession {
+    /// The client takes Server Heartbeat PDUs (MS-RDPBCGR 2.2.16.1): it set
+    /// `RNS_UD_CS_SUPPORT_HEARTBEAT_PDU` and has a message channel.
+    pub supports_heartbeat: bool,
 }
 
 #[derive(Clone)]
@@ -484,6 +502,14 @@ pub struct RdpServer {
     // when this is `Some`; byte-identical when None.
     audin_factory: Option<Rc<dyn crate::AudinServerFactory>>,
     echo_handle: EchoServerHandle,
+    /// (vendored, divergence (30)) On-demand Heartbeat PDUs.
+    heartbeat_requests: HeartbeatHandle,
+    /// (vendored, divergence (30)) Time of the last write to the client.
+    output_activity: OutputActivity,
+    /// (vendored, divergence (30)) Of the current connection: its MCS message
+    /// channel and the `earlyCapabilityFlags` of its Client Core Data.
+    message_channel_id: Option<u16>,
+    client_early_capability_flags: ironrdp_pdu::gcc::ClientEarlyCapabilityFlags,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Rc<dyn GfxServerFactory>>,
     #[cfg(feature = "egfx")]
@@ -1225,6 +1251,10 @@ impl RdpServer {
             camera_factory: camera_factory.map(Rc::from),
             audin_factory: audin_factory.map(Rc::from),
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
+            heartbeat_requests: HeartbeatHandle::default(),
+            output_activity: OutputActivity::default(),
+            message_channel_id: None,
+            client_early_capability_flags: ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::empty(),
             #[cfg(feature = "egfx")]
             gfx_factory: gfx_factory.map(Rc::from),
             #[cfg(feature = "egfx")]
@@ -1456,6 +1486,19 @@ impl RdpServer {
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
     pub fn echo_handle(&self) -> &EchoServerHandle {
         &self.echo_handle
+    }
+
+    /// (vendored, divergence (30)) A handle that sends one Server Heartbeat
+    /// PDU on demand while [`Self::run`] owns this server; see
+    /// [`HeartbeatHandle::send`].
+    pub fn heartbeat_handle(&self) -> HeartbeatHandle {
+        self.heartbeat_requests.clone()
+    }
+
+    /// (vendored, divergence (30)) The time of the last write to the client
+    /// socket (any channel, over TCP).
+    pub fn output_activity(&self) -> OutputActivity {
+        self.output_activity.clone()
     }
 
     /// Enable protocol-level auto-detect ([MS-RDPBCGR 2.2.14]).
@@ -2798,10 +2841,16 @@ impl RdpServer {
     {
         debug!("Starting client loop");
         let mut display_updates = self.display.lock().await.updates().await?;
-        let mut writer = SharedWriter::new(writer);
+        let mut writer = SharedWriter::new(writer, self.output_activity.clone());
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let mut audio_writer = writer.clone();
+        // (vendored, divergence (30)) On-demand heartbeats.
+        let mut heartbeat_writer = writer.clone();
+        let heartbeat_requests = self.heartbeat_requests.clone();
+        // A request from before this loop has no client to go to.
+        let _stale = heartbeat_requests.take();
+        let heartbeat_channel_id = self.message_channel_id.filter(|_| self.client_supports_heartbeat());
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let audio_receiver = Arc::clone(&self.audio_receiver);
         // (M5c step 3b) Take this connection's inbound-tunnel receiver before `self`
@@ -3036,12 +3085,33 @@ impl RdpServer {
             std::future::pending::<Result<RunState>>().await
         };
 
+        // (vendored, divergence (30)) One Heartbeat PDU per request. A client
+        // that did not advertise heartbeats (or has no message channel) gets
+        // none; its requests are dropped.
+        let send_heartbeats = async move {
+            loop {
+                let config = heartbeat_requests.requested().await;
+                let Some(channel_id) = heartbeat_channel_id else {
+                    trace!("Heartbeat not sent: the client did not advertise it");
+                    continue;
+                };
+                let data = match encode_heartbeat(&config, channel_id, user_channel_id) {
+                    Ok(data) => data,
+                    Err(e) => break Err::<RunState, _>(e),
+                };
+                if let Err(e) = heartbeat_writer.write_all(&data).await {
+                    break Err(anyhow::Error::from(e).context("send heartbeat"));
+                }
+            }
+        };
+
         let state = tokio::select!(
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
             state = dispatch_audio => state,
             state = dispatch_tunnel_inbound => state,
+            state = send_heartbeats => state,
         );
 
         debug!("End of client loop: {state:?}");
@@ -3454,6 +3524,19 @@ impl RdpServer {
         // the Windows Apps announce their host platform. Informational
         // fingerprinting only — a client can claim anything. Skipped on
         // reactivation (same connection, already logged).
+        // (vendored, divergence (30)) For on-demand heartbeats.
+        self.message_channel_id = result.message_channel_id;
+        self.client_early_capability_flags = result.client_early_capability_flags;
+        if !result.reactivation
+            && let Some(handler) = self.connection_handler.as_ref()
+        {
+            let session = ClientSession {
+                supports_heartbeat: self.client_supports_heartbeat(),
+            };
+            info!(?session, "client session");
+            handler.borrow_mut().on_client_session(&session);
+        }
+
         if !result.reactivation {
             let platform = result
                 .capabilities
@@ -3926,6 +4009,15 @@ impl RdpServer {
         }
     }
 
+    /// (vendored, divergence (30)) MS-RDPBCGR 2.2.16.1: heartbeats ride the
+    /// message channel, and only a client that advertised them gets them.
+    fn client_supports_heartbeat(&self) -> bool {
+        self.message_channel_id.is_some()
+            && self
+                .client_early_capability_flags
+                .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU)
+    }
+
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
         debug!(?creds, "Changing credentials");
         self.creds = creds
@@ -3987,12 +4079,15 @@ async fn deactivate_all(
 
 struct SharedWriter<'w, W: FramedWrite> {
     writer: Rc<Mutex<&'w mut W>>,
+    /// (vendored, divergence (30)) Stamped after each write.
+    activity: OutputActivity,
 }
 
 impl<W: FramedWrite> Clone for SharedWriter<'_, W> {
     fn clone(&self) -> Self {
         Self {
             writer: Rc::clone(&self.writer),
+            activity: self.activity.clone(),
         }
     }
 }
@@ -4011,15 +4106,17 @@ where
             let mut writer = self.writer.lock().await;
 
             writer.write_all(buf).await?;
+            self.activity.note_write();
             Ok(())
         })
     }
 }
 
 impl<'a, W: FramedWrite> SharedWriter<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
+    fn new(writer: &'a mut W, activity: OutputActivity) -> Self {
         Self {
             writer: Rc::new(Mutex::new(writer)),
+            activity,
         }
     }
 }

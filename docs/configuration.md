@@ -233,6 +233,15 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           flowing through a minimize (preserves "minimized
                           YouTube keeps playing on the Mac speakers") at the
                           cost of accepting that drift on refocus. See [audio.md](audio.md).
+--no-wifi-keep-awake      Do not keep the Mac's Wi-Fi radio awake during a session
+                          (default ON). While a client is connected and sent input
+                          in the last 10 minutes, the server sends a small ECHO
+                          request (MS-RDPEECO; a Heartbeat PDU to a client without
+                          the ECHO channel) when nothing else went out for 100 ms.
+                          With Wi-Fi power save, a Mac that sent nothing for a
+                          moment gets the next packet 50-200 ms late, so a key
+                          after a pause shows late. About 10 small packets per
+                          second while it runs. Config: WIFI_KEEP_AWAKE=0.
 --cert-dir PATH           Persisted self-signed TLS cert (default ~/Library/Application Support/macrdp)
 --cert PATH / --key PATH  Operator-supplied TLS cert + key (PEM) — serve a real CA / ACME /
                           Let's Encrypt cert instead of self-signed. Both required; no

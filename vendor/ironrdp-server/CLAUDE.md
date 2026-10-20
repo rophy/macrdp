@@ -2076,3 +2076,29 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     press was a left click. macrdp ignores buttons 4 and 5 (as macrdp-v1 does).
     Upstream fixed the same arms in e9c5b1c5 (#1769) with a breaking
     `MouseEvent::Button` shape; drop this divergence when the pin moves past it.
+
+(30) Wi-Fi keep-awake support: on-demand Heartbeat PDUs, ECHO channel open
+    state, time of the last write, client session hook (NOT upstreamed; added
+    2026-10-21; pairs with `vendor/ironrdp-acceptor` divergence (30)).
+    - `heartbeat.rs`: `HeartbeatConfig`, `HeartbeatHandle` (cloneable; `send`
+      merges requests until the client loop takes one) and
+      `RdpServer::heartbeat_handle()`. `client_loop` gets a `send_heartbeats`
+      arm that writes one Server Heartbeat PDU (MS-RDPBCGR 2.2.16.1, Basic
+      Security Header SEC_HEARTBEAT on the MCS message channel) per request,
+      only to a client with a message channel that set
+      `RNS_UD_CS_SUPPORT_HEARTBEAT_PDU`; a request from before the loop is
+      dropped. The PDU is encoded by hand: `ironrdp-pdu` at a5d1c682 has no
+      `HeartbeatPdu` (upstream added it later, #1814, and periodic heartbeats
+      in #1842 — drop this half on a pin bump past both).
+    - `OutputActivity` (`RdpServer::output_activity()`): `SharedWriter`
+      stamps the time after each write to the client socket (all TCP output
+      of the client loop).
+    - `EchoServerHandle::is_channel_open()` (echo.rs): true from the bridge's
+      `start` (client accepted the DVC) until `close`/drop; a bridge id keeps
+      an old connection from clearing the new one.
+    - `ConnectionHandler::on_client_session(&ClientSession)`: default no-op,
+      called once per served connection in `client_accepted` (not on a
+      reactivation) with `supports_heartbeat`.
+    Ported from macrdp-v1's IronRDP fork (rophy/IronRDP cd5ac8f4, 639fce30,
+    63b3f96d, 6864c807, f1abf7cc; relicensed by the author), reshaped for this
+    vendor copy. macrdp's `src/keep_awake.rs` uses all four.

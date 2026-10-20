@@ -473,6 +473,10 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   naming a file. AUDIT_LOG=1 (default) still gates
                           #   whether the events emit at all. Config key: AUDIT_FILE.
                           #   Schema + collector configs: docs/siem-forwarding.md.
+--no-wifi-keep-awake      # Do not send the Wi-Fi keep-awake ECHO requests / Heartbeat
+                          #   PDUs (default ON: one when nothing went out for 100 ms,
+                          #   while a client is connected and sent input in the last
+                          #   10 min). Config key: WIFI_KEEP_AWAKE=0.
 --stats-endpoint          # Expose a loopback (127.0.0.1) READ-ONLY live-telemetry
                           #   endpoint that the menu-bar controller's Status pane
                           #   reads: current H.264 bitrate + ceiling, link RTT,

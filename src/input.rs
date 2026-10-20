@@ -23,6 +23,8 @@ pub struct MacInputHandler {
     /// Records mouse-button-down timestamps so the H.264 path can lower its
     /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
+    /// Told about each keyboard and mouse event (Wi-Fi keep-awake).
+    session: crate::session::SessionInput,
     #[cfg(target_os = "macos")]
     inner: macos::Inner,
 }
@@ -57,14 +59,21 @@ impl MacInputHandler {
         Ok(Self {
             desktop_size,
             click_signal,
+            session: crate::session::SessionInput::default(),
             #[cfg(target_os = "macos")]
             inner,
         })
+    }
+
+    /// Per-session features to tell about each input (see `session`).
+    pub fn set_session_input(&mut self, session: crate::session::SessionInput) {
+        self.session = session;
     }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        self.session.note_input();
         #[cfg(target_os = "macos")]
         self.inner.keyboard(event);
         #[cfg(not(target_os = "macos"))]
@@ -72,6 +81,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        self.session.note_input();
         // A button-down is the "user intent" signal the H.264 path uses to lower
         // its keyframe threshold for a moment (a click usually precedes a UI
         // change). Record before delegating, since `inner.mouse` takes `event`.

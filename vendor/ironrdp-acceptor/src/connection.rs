@@ -34,6 +34,8 @@ pub struct Acceptor {
     desktop_size: DesktopSize,
     keyboard_layout: u32,
     multitransport_flags: gcc::MultiTransportFlags,
+    // (vendored, divergence (30)) earlyCapabilityFlags of the Client Core Data.
+    client_early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     server_capabilities: Vec<CapabilitySet>,
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
@@ -132,6 +134,11 @@ pub struct AcceptorResult {
     /// implement UDP multitransport can use it to decide whether to send a
     /// Server Initiate Multitransport Request.
     pub multitransport_flags: gcc::MultiTransportFlags,
+    /// (vendored, divergence (30)) `earlyCapabilityFlags` of the client's GCC
+    /// Client Core Data (section 2.2.1.3.2): for example whether the client
+    /// takes Heartbeat PDUs (`SUPPORT_HEART_BEAT_PDU`) and Set Error Info PDUs
+    /// (`SUPPORT_ERR_INFO_PDU`). Empty when the client sent none.
+    pub client_early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     /// (vendored) Client-fingerprint identity from the GCC Client Core Data:
     /// hostname, announced RDP version (raw u32), build number. Informational.
     pub client_name: String,
@@ -174,6 +181,7 @@ impl Acceptor {
             desktop_size,
             keyboard_layout: 0,
             multitransport_flags: gcc::MultiTransportFlags::empty(),
+            client_early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             server_capabilities: capabilities,
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
@@ -275,6 +283,7 @@ impl Acceptor {
             desktop_size,
             keyboard_layout: consumed.keyboard_layout,
             multitransport_flags: consumed.multitransport_flags,
+            client_early_capability_flags: consumed.client_early_capability_flags,
             server_capabilities: consumed.server_capabilities,
             static_channels,
             saved_for_reactivation,
@@ -374,6 +383,7 @@ impl Acceptor {
                 message_channel_id: self.message_channel_id,
                 keyboard_layout: self.keyboard_layout,
                 multitransport_flags: self.multitransport_flags,
+                client_early_capability_flags: self.client_early_capability_flags,
                 client_name: self.client_name.clone(),
                 client_version: self.client_version,
                 client_build: self.client_build,
@@ -635,6 +645,8 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                self.client_early_capability_flags =
+                    early_capability.unwrap_or_else(gcc::ClientEarlyCapabilityFlags::empty);
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.multitransport_flags = gcc_blocks
