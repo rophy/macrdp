@@ -703,8 +703,8 @@ pub fn set_ctrl_as_cmd(on: bool) {
 /// events ignored `mods`; now that clicks carry the modifier flags, a stuck Ctrl
 /// turns every left click into a secondary click, so it needs a way out. The
 /// MS-RDPBCGR Synchronize PDU sets all keys up (`Inner::synchronize` releases
-/// everything), but a client sends it on focus, not at the start of a new
-/// connection after a drop — hence this out-of-band flag. The same reset also clears button-down tracking, which fixes a
+/// the keys on a focus-in, not the buttons), but a client sends it on focus,
+/// not at the start of a new connection after a drop — hence this out-of-band flag. The same reset also clears button-down tracking, which fixes a
 /// pre-existing hazard: a connection dropped between a left-down and its up
 /// left `left_down` stuck, so every move on the next connection posted as
 /// `LeftMouseDragged`.
@@ -1281,9 +1281,9 @@ mod macos {
         /// Both triggers exist because a modifier key-up that never arrived
         /// leaves `mods` asserting a key the user is not holding, and once
         /// clicks carry the modifier flags a stuck Ctrl turns every left click
-        /// into a secondary click. A Synchronize from the client also releases
-        /// everything (`synchronize`), but only when the client sends one
-        /// (on focus). The two triggers here
+        /// into a secondary click. A focus-in Synchronize from the client also
+        /// releases the keys and modifiers (`synchronize`; not the buttons),
+        /// but only when the client sends one. The two triggers here
         /// clear DIFFERENT amounts, deliberately:
         ///
         ///  * **A new served connection** (`reset_request`, raised by the
