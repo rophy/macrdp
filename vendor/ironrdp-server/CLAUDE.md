@@ -2036,3 +2036,16 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     fires exactly once per connection that is actually served — never for a
     reactivation, never for a losing candidate. Off by default (`None`), so the
     upstream-shaped path is byte-identical unless macrdp installs the handle.
+
+(25) Connection-end input hook — `RdpServerInputHandler::connection_ended`
+    (NOT upstreamed; added 2026-10-21).
+    The input trait gains a default no-op method `connection_ended(&mut self)`.
+    The accept loop in `run` calls it once after each served connection is
+    over — after the preemption race resolves, so it runs for a clean end, an
+    error return, and a connection dropped by a takeover alike — before the
+    next connection is served. macrdp's input handler uses it to post a key-up
+    / button-up for everything the connection left pressed (a dropped link
+    sends no releases; a non-modifier key used to stay down on the Mac until it
+    was pressed again). Divergence 24 still fires at the start of the next
+    served connection and now finds nothing left. Default method, so other
+    implementors are unchanged.

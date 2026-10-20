@@ -92,6 +92,15 @@ impl RdpServerInputHandler for MacInputHandler {
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
     }
+
+    fn connection_ended(&mut self) {
+        // Release what the ended connection left pressed now, not on the
+        // first input of the next connection: a key or button still down on
+        // the Mac affects the local user too, and a key that is not a
+        // modifier stayed down even after the next connection.
+        #[cfg(target_os = "macos")]
+        self.inner.release_all("connection ended");
+    }
 }
 
 /// Map an RDP client coordinate (`x`,`y` in a `dw`×`dh` client frame) to a point
@@ -202,9 +211,61 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
     remap_on && ctrl && !cmd && !alt && !excluded
 }
 
+/// Non-modifier keys this server posted a key-down for on the Mac and no
+/// key-up yet, by macOS virtual keycode.
+///
+/// No key-up comes for a key that was down when the connection ended (an
+/// abrupt drop, a killed client, a takeover): the Mac would keep it pressed
+/// until the same key is pressed again, for the local user and the next
+/// client. `Inner::release_all` posts a key-up for each key in this set when a
+/// connection ends and when a new one starts. Modifiers are tracked apart, in
+/// `ModifierState`, because they are posted as FlagsChanged.
+///
+/// Pure (no platform deps) so it is unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct HeldKeys {
+    down: std::collections::BTreeSet<u16>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl HeldKeys {
+    /// Record a posted key-down (`down`) or key-up of `vk`.
+    fn note(&mut self, vk: u16, down: bool) {
+        if down {
+            self.down.insert(vk);
+        } else {
+            self.down.remove(&vk);
+        }
+    }
+
+    /// Forget every held key; returns them (ascending) for the caller to post
+    /// a key-up each.
+    fn take_all(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.down).into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click};
+    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click, HeldKeys};
+
+    /// A key that went down and not up is released by `take_all`; a key that
+    /// went down and up is not; auto-repeat downs count once; after
+    /// `take_all` nothing is held.
+    #[test]
+    fn held_keys_tracks_downs_without_ups() {
+        let mut h = HeldKeys::default();
+        h.note(0x28, true); // K down
+        h.note(0x28, true); // auto-repeat
+        h.note(0x00, true); // A down
+        h.note(0x00, false); // A up
+        h.note(0x31, true); // Space down
+        assert_eq!(h.take_all(), vec![0x28, 0x31]);
+        assert!(h.take_all().is_empty(), "take_all forgets the keys");
+        h.note(0x07, false); // a stray key-up (down was before a reset)
+        assert!(h.take_all().is_empty());
+    }
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
     /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
@@ -763,6 +824,9 @@ mod macos {
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
+        // Non-modifier keys posted down and not up yet; released by
+        // `release_all` when a connection ends or starts.
+        held_keys: super::HeldKeys,
         // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
         // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
         // Cmd swap + restores the real (Ctrl) modifier state.
@@ -865,6 +929,7 @@ mod macos {
                 scroll_v_accum: 0,
                 scroll_h_accum: 0,
                 consumed_keys: HashSet::new(),
+                held_keys: super::HeldKeys::default(),
                 remapped_keys: HashSet::new(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
@@ -950,8 +1015,8 @@ mod macos {
         ///    vendored server once at the top of `run_connection` /
         ///    `serve_negotiated` — never on a reactivation, never for a
         ///    preemption candidate) — clears EVERYTHING, unconditionally:
-        ///    modifiers, the click latch, outstanding remapped key-downs, and
-        ///    any button still down — which is RELEASED (a synthetic Up through
+        ///    modifiers, non-modifier keys still down, the click latch,
+        ///    outstanding remapped key-downs, and any button still down — which is RELEASED (a synthetic Up through
         ///    `button()`), not merely forgotten, since macOS itself still
         ///    believes it held. Nothing from the previous connection is live,
         ///    so none of it is worth preserving — and the button release in
@@ -988,57 +1053,104 @@ mod macos {
             let reconnected = self
                 .reset_request
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
-            if !(idled || reconnected) {
+            if reconnected {
+                self.release_all("new connection");
+                return;
+            }
+            if !idled {
                 return;
             }
 
-            if reconnected {
-                // Connection edge: release any button macOS still believes is
-                // held — we posted the Down, the connection died before the Up.
-                // Go through `button()` so the Up carries the same (latched)
-                // flags the Down did and the click bookkeeping stays paired,
-                // and do it BEFORE clearing modifiers so the pair can't
-                // disagree. This also zeroes `left_down`/`right_down`/
-                // `middle_down`, so the next move posts as MouseMoved, not a
-                // phantom `LeftMouseDragged`.
-                if self.left_down {
-                    self.button(CGMouseButton::Left, false);
-                }
-                if self.right_down {
-                    self.button(CGMouseButton::Right, false);
-                }
-                if self.middle_down {
-                    self.button(CGMouseButton::Center, false);
-                }
-            }
-
-            // Snapshot first so the log shows WHAT was stuck.
+            // Idle gap: modifiers only (see the doc). Snapshot first so the
+            // log shows WHAT was stuck. Only bother macOS when a modifier was
+            // actually released: our earlier FlagsChanged left the session
+            // state asserting it, and macOS derives press-vs-release from the
+            // flags diff, so one event carrying the now-empty set releases all
+            // of them.
             let stuck = self.mods.cg_flags().bits();
-            let had_mods = self.mods.clear_non_lock();
-
-            if reconnected {
-                // Drop the remaining per-gesture state regardless of whether a
-                // modifier was held (see the doc): an outstanding remapped
-                // key-down or a latch left by a Down whose Up never came.
-                self.remapped_keys.clear();
-                self.left_click_remapped = false;
-            }
-
-            // Only bother macOS when a modifier was actually released: our
-            // earlier FlagsChanged left the session state asserting it, and
-            // macOS derives press-vs-release from the flags diff, so one event
-            // carrying the now-empty set releases all of them.
-            if had_mods {
+            if self.mods.clear_non_lock() {
                 debug!(
-                    reason = if reconnected {
-                        "new connection"
-                    } else {
-                        "idle gap"
-                    },
+                    reason = "idle gap",
                     stuck_flags = format!("0x{stuck:08X}"),
                     "clearing stale held modifiers"
                 );
                 self.post_flags_changed(VK_LCMD);
+            }
+        }
+
+        /// Release everything a connection may have left pressed on the Mac:
+        /// mouse buttons, non-modifier keys, remapped Ctrl->Cmd keys and held
+        /// modifiers (Caps Lock, a toggle, stays). Runs when a connection ends
+        /// (`MacInputHandler::connection_ended`, called by the vendored server
+        /// after each served connection, divergence 25) and again on the first
+        /// input of a new connection (`reset_request`), which then finds
+        /// nothing left unless input came in between. Nothing from the
+        /// previous connection is live, so none of it is worth keeping.
+        ///
+        /// Order is the order of a user letting go: buttons, then keys with
+        /// the modifier flags still set, then the modifiers.
+        pub fn release_all(&mut self, why: &'static str) {
+            // A button macOS still believes is held: we posted the Down, the
+            // connection died before the Up. Go through `button()` so the Up
+            // carries the same (latched) flags the Down did and the click
+            // bookkeeping stays paired. This also zeroes `left_down` etc., so
+            // the next move posts as MouseMoved, not a phantom
+            // `LeftMouseDragged`. An interrupted drag completes as a drop at
+            // the last cursor position (docs/known-quirks.md).
+            let buttons = [
+                (self.left_down, CGMouseButton::Left),
+                (self.right_down, CGMouseButton::Right),
+                (self.middle_down, CGMouseButton::Center),
+            ];
+            let mut released_buttons = 0;
+            for (held, button) in buttons {
+                if held {
+                    self.button(button, false);
+                    released_buttons += 1;
+                }
+            }
+
+            // Keys whose key-up never came. Posted with the current modifier
+            // flags, before the modifiers go up, as a real keyboard would.
+            let keys = self.held_keys.take_all();
+            let flags = self.mods.cg_flags();
+            for &vk in &keys {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, false) {
+                    let mut f = flags;
+                    if is_numeric_pad_vk(vk) {
+                        f |= CGEventFlags::CGEventFlagNumericPad;
+                    }
+                    ev.set_flags(f);
+                    ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!(vk, "CGEvent::new_keyboard_event failed (release)");
+                }
+            }
+            // Remapped Ctrl->Cmd keys: the down went out as Cmd+key, so the
+            // up does too (`post_ctrl_as_cmd` also restores the real flags).
+            let remapped: Vec<u16> = self.remapped_keys.drain().collect();
+            for &vk in &remapped {
+                self.post_ctrl_as_cmd(vk, false);
+            }
+            // Swallowed hotkey downs: nothing was posted, so nothing to release.
+            self.consumed_keys.clear();
+            self.left_click_remapped = false;
+
+            let stuck = self.mods.cg_flags().bits();
+            let had_mods = self.mods.clear_non_lock();
+            if had_mods {
+                self.post_flags_changed(VK_LCMD);
+            }
+
+            if released_buttons > 0 || !keys.is_empty() || !remapped.is_empty() || had_mods {
+                tracing::info!(
+                    why,
+                    keycodes = ?keys,
+                    remapped = ?remapped,
+                    modifier_flags = format!("0x{stuck:08X}"),
+                    buttons = released_buttons,
+                    "released held input"
+                );
             }
         }
 
@@ -1239,6 +1351,7 @@ mod macos {
             }
             ev.set_flags(flags);
             ev.post(CGEventTapLocation::HID);
+            self.held_keys.note(vk, down);
         }
 
         /// Emit a FlagsChanged event for `vk` from both sources. We send
