@@ -11,7 +11,7 @@ use ironrdp_pdu::nego::SecurityProtocol;
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, SvcServerProcessor};
 use pdu::rdp::capability_sets::CapabilitySet;
-use pdu::rdp::client_info::{ClientAutoReconnect, Credentials};
+use pdu::rdp::client_info::{ClientAutoReconnect, ClientInfoFlags, Credentials};
 use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
@@ -42,6 +42,8 @@ pub struct Acceptor {
     pub(crate) creds: Option<Credentials>,
     received_credentials: Option<Credentials>,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    // (vendored, divergence (31)) Flags of the Client Info PDU.
+    client_info_flags: ClientInfoFlags,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
     // (vendored) Client-fingerprint identity from the GCC Client Core Data
@@ -163,6 +165,10 @@ pub struct AcceptorResult {
     /// validation, but the server must still verify its security verifier
     /// against the reconnect random for the target session.
     pub auto_reconnect: Option<ClientAutoReconnect>,
+    /// (vendored, divergence (31)) Flags from the Client Info PDU (MS-RDPBCGR
+    /// 2.2.1.11.1.1), such as the client's audio playback mode. Empty until
+    /// the Client Info PDU is received.
+    pub client_info_flags: ClientInfoFlags,
 }
 
 impl Acceptor {
@@ -188,6 +194,7 @@ impl Acceptor {
             creds,
             received_credentials: None,
             received_auto_reconnect: None,
+            client_info_flags: ClientInfoFlags::empty(),
             reactivation: false,
             honor_client_desktop_size: None,
             client_name: String::new(),
@@ -290,6 +297,7 @@ impl Acceptor {
             creds: consumed.creds,
             received_credentials: consumed.received_credentials,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            client_info_flags: consumed.client_info_flags,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             client_name: consumed.client_name,
@@ -391,6 +399,7 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
                 auto_reconnect: self.received_auto_reconnect.take(),
+                client_info_flags: self.client_info_flags,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -869,6 +878,7 @@ impl Sequence for Acceptor {
                     "Received Client Info PDU"
                 );
                 self.received_auto_reconnect = auto_reconnect;
+                self.client_info_flags = client_info.client_info.flags;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;

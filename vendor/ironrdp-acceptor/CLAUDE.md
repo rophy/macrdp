@@ -200,3 +200,10 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     server uses `SUPPORT_HEART_BEAT_PDU` to decide whether the client gets
     Heartbeat PDUs (server divergence (30)). Upstream has the same field
     (`client_early_capability_flags`) after a5d1c682; drop on a pin bump.
+
+(31) Client Info PDU flags on `AcceptorResult` (NOT upstreamed; added
+    2026-10-21). `Acceptor` keeps `client_info_flags` (from the Client Info PDU
+    in `SecureSettingsExchange`, carried across `new_deactivation_reactivation`)
+    and `AcceptorResult` exposes it. The server uses the audio-mode flags
+    (server divergence (31)). Ported from macrdp-v1's IronRDP fork
+    (rophy/IronRDP 6ead8214), relicensed by the author.

@@ -2102,3 +2102,14 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     Ported from macrdp-v1's IronRDP fork (rophy/IronRDP cd5ac8f4, 639fce30,
     63b3f96d, 6864c807, f1abf7cc; relicensed by the author), reshaped for this
     vendor copy. macrdp's `src/keep_awake.rs` uses all four.
+
+(31) Audio only for a client that wants it (NOT upstreamed; added 2026-10-21;
+    pairs with `vendor/ironrdp-acceptor` divergence (31)). `client_accepted`
+    does not start the rdpsnd static channel when the Client Info PDU says
+    "do not play" (INFO_NOAUDIOPLAYBACK) or "play on the remote computer"
+    (INFO_REMOTECONSOLEAUDIO), MS-RDPBCGR 2.2.1.11.1.1: without the Server
+    Audio Formats PDU the client never answers, so macrdp's rdpsnd backend
+    never starts its ScreenCaptureKit audio capture. `audio_playback_wanted`
+    (pub) decides; `ClientSession::audio_playback` carries it. The lossy-UDP
+    audio DVC (multitransport, opt-in) is not gated. Ported from macrdp-v1's
+    IronRDP fork (rophy/IronRDP 6ead8214), relicensed by the author.

@@ -69,7 +69,7 @@ pub use rdpeusb::{
 };
 pub use server::{
     ClientSession, ConnectionHandler, Credentials, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
-    ServerEventSender, tcp_srtt_ms,
+    ServerEventSender, audio_playback_wanted, tcp_srtt_ms,
 };
 pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 

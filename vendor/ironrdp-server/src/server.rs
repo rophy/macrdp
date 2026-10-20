@@ -189,6 +189,17 @@ pub struct ClientSession {
     /// The client takes Server Heartbeat PDUs (MS-RDPBCGR 2.2.16.1): it set
     /// `RNS_UD_CS_SUPPORT_HEARTBEAT_PDU` and has a message channel.
     pub supports_heartbeat: bool,
+    /// (vendored, divergence (31)) The client wants the audio played on its
+    /// side; see [`audio_playback_wanted`].
+    pub audio_playback: bool,
+}
+
+/// (vendored, divergence (31)) The client asks for audio on its side unless it
+/// set "do not play" or "play on the remote computer" in the Client Info PDU
+/// (MS-RDPBCGR 2.2.1.11.1.1 INFO_NOAUDIOPLAYBACK / INFO_REMOTECONSOLEAUDIO).
+pub fn audio_playback_wanted(flags: ironrdp_pdu::rdp::client_info::ClientInfoFlags) -> bool {
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+    !flags.intersects(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO)
 }
 
 #[derive(Clone)]
@@ -3532,6 +3543,7 @@ impl RdpServer {
         {
             let session = ClientSession {
                 supports_heartbeat: self.client_supports_heartbeat(),
+                audio_playback: audio_playback_wanted(result.client_info_flags),
             };
             info!(?session, "client session");
             handler.borrow_mut().on_client_session(&session);
@@ -3581,11 +3593,22 @@ impl RdpServer {
 
         self.static_channels = result.static_channels;
         if !result.reactivation {
-            for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
+            // (vendored, divergence (31)) rdpsnd only for a client that wants
+            // the audio played on its side: without the Server Audio Formats
+            // PDU the client never answers, so the backend never starts its
+            // capture.
+            let audio_playback = audio_playback_wanted(result.client_info_flags);
+            if !audio_playback && self.get_channel_id_by_type::<RdpsndServer>().is_some() {
+                info!(flags = ?result.client_info_flags, "Client asked for no audio playback, rdpsnd not started");
+            }
+            for (type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
                     continue;
                 };
+                if !audio_playback && type_id == core::any::TypeId::of::<RdpsndServer>() {
+                    continue;
+                }
                 let svc_responses = channel.start()?;
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
@@ -4118,5 +4141,22 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
             writer: Rc::new(Mutex::new(writer)),
             activity,
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+
+    use super::audio_playback_wanted;
+
+    /// (divergence (31)) mstsc "Remote audio": play on this computer / do not
+    /// play / play on the remote computer.
+    #[test]
+    fn audio_playback_follows_the_client_info_flags() {
+        assert!(audio_playback_wanted(ClientInfoFlags::empty()));
+        assert!(audio_playback_wanted(ClientInfoFlags::UNICODE | ClientInfoFlags::MOUSE));
+        assert!(!audio_playback_wanted(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert!(!audio_playback_wanted(ClientInfoFlags::REMOTE_CONSOLE_AUDIO));
     }
 }
