@@ -783,9 +783,6 @@ mod macos {
 
     pub struct Inner {
         source: CGEventSource,
-        // Secondary source used *only* to mirror modifier FlagsChanged
-        // events. See `Inner::new` for why one source isn't enough.
-        source_hid: CGEventSource,
         last_x: f64,
         last_y: f64,
         left_down: bool,
@@ -866,28 +863,21 @@ mod macos {
             keyboard_layout: Option<&str>,
             klid_handle: Option<super::SharedKeyboardLayout>,
         ) -> Result<Self> {
-            // Two sources because macOS has two independent modifier-state
-            // machines and different consumers read from different ones:
-            //
-            //   CombinedSessionState backs `[NSEvent modifierFlags]` — the
-            //   query Cocoa apps use to decide "is Cmd held right now?" for
-            //   app-level shortcuts (Cmd+C, Cmd+Q, Cmd+~).
-            //
-            //   HIDSystemState backs the HID-level modifier view that the
-            //   WindowServer's *symbolic hotkey* dispatcher (Dock, Spotlight,
-            //   screenshot, Mission Control, Show Desktop) checks before
-            //   firing. Cmd+Tab is the canonical case.
-            //
-            // A flagsChanged event posted from one source does NOT update the
-            // other. So we maintain both: the session source is the canonical
-            // one used for every event, and `source_hid` exists solely to
-            // mirror modifier flagsChanged so symbolic hotkeys also see Cmd
-            // as held. Without the mirror, Cmd+Tab is a no-op; with it, both
-            // classes of shortcut work.
+            // One source for every event, modifier FlagsChanged included.
+            // An earlier design also mirrored each FlagsChanged through a
+            // second, HIDSystemState source, on the belief that a FlagsChanged
+            // from one source does not update the other state table. Measured
+            // on macOS 15.7 (2026-10-21): one FlagsChanged posted at the HID
+            // tap from either source sets BOTH `flagsState(.hidSystemState)`
+            // and `flagsState(.combinedSessionState)`, and a WindowServer
+            // symbolic hotkey (Ctrl+Up, Mission Control) fires with the
+            // session source alone. The mirror only made every app receive
+            // each modifier change twice (Chrome: two keydown / two keyup
+            // events per modifier press). Cmd+Tab, Cmd+Space and the
+            // screenshot combos are handled in `try_symbolic_hotkey` from our
+            // own `mods`, not from the macOS state.
             let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
                 .map_err(|_| anyhow!("CGEventSource::new(CombinedSessionState) failed"))?;
-            let source_hid = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                .map_err(|_| anyhow!("CGEventSource::new(HIDSystemState) failed"))?;
             // Start the workspace-frontmost poller so the global MRU
             // tracks ALL focus changes (Dock clicks, app launches, etc.),
             // not just our Cmd+Tab commits. Idempotent — only one thread
@@ -913,7 +903,6 @@ mod macos {
             }
             Ok(Self {
                 source,
-                source_hid,
                 last_x: 0.0,
                 last_y: 0.0,
                 left_down: false,
@@ -1198,8 +1187,7 @@ mod macos {
             };
             self.refresh_auto_layout();
 
-            // Modifier path: update per-side state and emit FlagsChanged
-            // mirrored to both sources. We do this BEFORE any of the
+            // Modifier path: update per-side state and emit one FlagsChanged. We do this BEFORE any of the
             // symbolic-hotkey logic so the held-modifier check in
             // try_symbolic_hotkey sees the just-pressed modifier.
             if ModifierState::is_modifier_vk(vk) {
@@ -1354,33 +1342,22 @@ mod macos {
             self.held_keys.note(vk, down);
         }
 
-        /// Emit a FlagsChanged event for `vk` from both sources. We send
-        /// the same event twice so two different parts of macOS see the
-        /// modifier as held:
-        ///   - CombinedSessionState backs `[NSEvent modifierFlags]` —
-        ///     what Cocoa apps query for Cmd+C / Cmd+Q / Cmd+~.
-        ///   - HIDSystemState backs the modifier view that WindowServer's
-        ///     symbolic-hotkey dispatcher (Dock, Spotlight, screencapture,
-        ///     Mission Control, Show Desktop) checks before firing.
-        ///
-        /// A FlagsChanged posted from one source does NOT update the other,
-        /// so without the mirror you get either app shortcuts or symbolic
-        /// hotkeys but not both.
+        /// Emit one FlagsChanged event for `vk` carrying the current
+        /// modifier state. One event updates both the session and the HID
+        /// modifier state (see `Inner::new`); a second, mirrored event reached
+        /// apps as a second keydown/keyup of the modifier.
         fn post_flags_changed(&self, vk: u16) {
-            let flags = self.mods.cg_flags();
-            for source in [&self.source, &self.source_hid] {
-                // `down` parameter is ignored for FlagsChanged: macOS
-                // derives press-vs-release purely from the diff between
-                // the prior flags state and the new flags carried on the
-                // event. We pass `true` for shape only.
-                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), vk, true) else {
-                    warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
-                    continue;
-                };
-                ev.set_flags(flags);
-                ev.set_type(CGEventType::FlagsChanged);
-                ev.post(CGEventTapLocation::HID);
-            }
+            // `down` parameter is ignored for FlagsChanged: macOS derives
+            // press-vs-release purely from the diff between the prior flags
+            // state and the new flags carried on the event. We pass `true`
+            // for shape only.
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, true) else {
+                warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
+                return;
+            };
+            ev.set_flags(self.mods.cg_flags());
+            ev.set_type(CGEventType::FlagsChanged);
+            ev.post(CGEventTapLocation::HID);
         }
 
         /// Swap Control→Command in both the public CGEventFlag bits and the
@@ -1442,14 +1419,12 @@ mod macos {
             let swapped = self.ctrl_to_cmd_flags();
 
             if down {
-                for source in [&self.source, &self.source_hid] {
-                    let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
-                        warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
-                        continue;
-                    };
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), VK_LCMD, true) {
                     ev.set_flags(swapped);
                     ev.set_type(CGEventType::FlagsChanged);
                     ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
                 }
             }
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
