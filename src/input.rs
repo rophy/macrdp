@@ -246,9 +246,110 @@ impl HeldKeys {
     }
 }
 
+// Wheel scaling: ported from macrdp-v1 f31d4c8 (crates/macrdp-input/src/mouse.rs,
+// `WheelAccumulator`), relicensed to MIT OR Apache-2.0 by the author; adapted to
+// fixed-point input for the ainput path.
+
+/// RDP wheel rotation units for one notch (WHEEL_DELTA).
+const WHEEL_DELTA: i64 = 120;
+
+/// Lines scrolled per notch: the Windows default (SPI_GETWHEELSCROLLLINES = 3).
+const LINES_PER_NOTCH: i64 = 3;
+
+/// Fixed-point scale of wheel values from the ainput channel
+/// (`MouseEvent::Scroll`): FreeRDP sends rotation units as 16.16 fixed point,
+/// so one 120-unit notch arrives as `120 << 16` (FreeRDP 3.x
+/// `freerdp_client_send_wheel_event`, "scale this so we can also support high
+/// resolution wheels"). Fast-path wheel PDUs (`MouseEvent::VerticalScroll`,
+/// mstsc) carry plain rotation units and are scaled up to this unit.
+const WHEEL_FIXED_ONE: i64 = 1 << 16;
+
+/// Turns wheel rotation units (120 per notch, less for high-resolution
+/// wheels and touchpads) into whole lines. The rest is kept for the next
+/// event in the same direction, so small deltas add up like on Windows.
+///
+/// Pure (no platform deps) so it is unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct WheelAccumulator {
+    /// Rest in units of 1/(WHEEL_DELTA * WHEEL_FIXED_ONE) line.
+    rest: i64,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl WheelAccumulator {
+    /// `value`: rotation units in 16.16 fixed point (`WHEEL_FIXED_ONE` = one
+    /// unit), in the caller's axis sign convention. Returns the lines to
+    /// scroll (same sign).
+    fn lines(&mut self, value: i64) -> i32 {
+        let units = value.saturating_mul(LINES_PER_NOTCH);
+        if units.signum() * self.rest.signum() < 0 {
+            self.rest = 0;
+        }
+        self.rest = self.rest.saturating_add(units);
+        let lines = self.rest / (WHEEL_DELTA * WHEEL_FIXED_ONE);
+        self.rest -= lines * WHEEL_DELTA * WHEEL_FIXED_ONE;
+        i32::try_from(lines).unwrap_or(if lines < 0 { i32::MIN } else { i32::MAX })
+    }
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click, HeldKeys};
+    use super::{
+        is_remappable_shortcut, map_client_to_display, should_remap_click, HeldKeys,
+        WheelAccumulator, WHEEL_FIXED_ONE,
+    };
+
+    /// Plain RDP rotation units (fast-path wheel PDU) in the accumulator's unit.
+    fn units(u: i64) -> i64 {
+        u * WHEEL_FIXED_ONE
+    }
+
+    #[test]
+    fn one_notch_is_three_lines() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(units(120)), 3);
+        assert_eq!(w.lines(units(-120)), -3);
+        assert_eq!(w.lines(units(240)), 6);
+    }
+
+    /// FreeRDP's ainput channel sends one notch as 120 << 16.
+    #[test]
+    fn ainput_fixed_point_notch_is_three_lines() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(-7_864_320), -3);
+        assert_eq!(w.lines(7_864_320), 3);
+        // Half a notch (high-resolution wheel) twice = one notch.
+        assert_eq!(w.lines(60 << 16), 1);
+        assert_eq!(w.lines(60 << 16), 2);
+    }
+
+    #[test]
+    fn partial_deltas_add_up() {
+        let mut w = WheelAccumulator::default();
+        // 40 units = 1 line
+        assert_eq!(w.lines(units(40)), 1);
+        // 15 units = 3/8 line each: lines come at the 3rd and 6th event
+        let mut w = WheelAccumulator::default();
+        let got: Vec<i32> = (0..8).map(|_| w.lines(units(15))).collect();
+        assert_eq!(got, vec![0, 0, 1, 0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn rest_is_dropped_when_the_direction_changes() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(units(30)), 0); // rest 3/4 line up
+        assert_eq!(w.lines(units(-20)), 0); // rest dropped, 1/2 line down
+        assert_eq!(w.lines(units(-20)), -1);
+    }
+
+    #[test]
+    fn extreme_values_do_not_overflow() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(units(i64::from(i16::MAX))), 819);
+        assert_eq!(w.lines(i64::from(i32::MIN)), -819);
+        assert_eq!(w.lines(i64::MAX), i32::MAX);
+    }
 
     /// A key that went down and not up is released by `take_all`; a key that
     /// went down and up is not; auto-repeat downs count once; after
@@ -814,8 +915,8 @@ mod macos {
         // client that slices a gesture into many small per-event deltas
         // (observed: magnitude ~2-40, not one 120-per-notch value) has
         // nearly every event truncated to zero and the scroll never moves.
-        scroll_v_accum: i32,
-        scroll_h_accum: i32,
+        scroll_v: super::WheelAccumulator,
+        scroll_h: super::WheelAccumulator,
         // Virtual keycodes whose key-down we intercepted as a symbolic
         // hotkey (Cmd+Tab, Cmd+Space, screencapture combos). The matching
         // key-up gets swallowed too so the focused app doesn't see a bare
@@ -915,8 +1016,8 @@ mod macos {
                 click_left: None,
                 click_right: None,
                 click_middle: None,
-                scroll_v_accum: 0,
-                scroll_h_accum: 0,
+                scroll_v: super::WheelAccumulator::default(),
+                scroll_h: super::WheelAccumulator::default(),
                 consumed_keys: HashSet::new(),
                 held_keys: super::HeldKeys::default(),
                 remapped_keys: HashSet::new(),
@@ -1628,8 +1729,12 @@ mod macos {
                 MouseEvent::RightReleased => self.button(CGMouseButton::Right, false),
                 MouseEvent::MiddlePressed => self.button(CGMouseButton::Center, true),
                 MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
-                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
-                MouseEvent::Scroll { x, y } => self.scroll(y, x),
+                // Fast-path wheel PDU: plain rotation units (mstsc: 120 per notch).
+                MouseEvent::VerticalScroll { value } => {
+                    self.scroll(i64::from(value) * super::WHEEL_FIXED_ONE, 0)
+                }
+                // ainput channel (FreeRDP): 16.16 fixed-point rotation units.
+                MouseEvent::Scroll { x, y } => self.scroll(i64::from(y), i64::from(x)),
                 MouseEvent::Button4Pressed
                 | MouseEvent::Button4Released
                 | MouseEvent::Button5Pressed
@@ -1805,22 +1910,17 @@ mod macos {
             }
         }
 
-        fn scroll(&mut self, vertical: i32, horizontal: i32) {
-            // RDP wheel rotation units are 120 per "tick", but this client
-            // slices a single gesture into many small legacy MOUSE PDU
-            // events (observed raw magnitude ~2-40 per event, not one
-            // 120-per-notch value). A flat `delta / SCALE` per event
-            // truncates almost every one of those to zero — scroll never
-            // moves at all. Accumulate the raw delta across calls instead,
-            // and only emit whole lines once the running total crosses
-            // SCALE, carrying the remainder forward so no motion is lost.
-            const SCALE: i32 = 60;
-            self.scroll_v_accum += vertical;
-            self.scroll_h_accum += horizontal;
-            let v = (self.scroll_v_accum / SCALE).clamp(-5, 5);
-            let h = (self.scroll_h_accum / SCALE).clamp(-5, 5);
-            self.scroll_v_accum -= v * SCALE;
-            self.scroll_h_accum -= h * SCALE;
+        /// `vertical` / `horizontal`: wheel rotation units in 16.16 fixed
+        /// point (see `WHEEL_FIXED_ONE`).
+        fn scroll(&mut self, vertical: i64, horizontal: i64) {
+            // RDP wheel rotation units are 120 per notch (WHEEL_DELTA); one
+            // notch scrolls 3 lines, as on Windows. Clients with a
+            // high-resolution wheel or a touchpad send smaller deltas (seen:
+            // ~2-40 per event); `WheelAccumulator` keeps the rest per axis so
+            // they add up instead of being truncated to zero.
+            let v = self.scroll_v.lines(vertical);
+            let h = self.scroll_h.lines(horizontal);
+            trace!(vertical, horizontal, v, h, "wheel");
             if v == 0 && h == 0 {
                 return;
             }
