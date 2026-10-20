@@ -56,7 +56,9 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   is the Cmd combo, in terminals too (Ctrl+C copies,
                           #   Win+C is SIGINT); Ctrl+click is Cmd+click. Alt+Tab
                           #   switches apps with --alt-tab-switch. Not with
-                          #   --map-ctrl-to-cmd. macOS-only.
+                          #   --map-ctrl-to-cmd (in config.env, CTRL_AS_CMD
+                          #   wins and MAP_CTRL_TO_CMD is ignored with a
+                          #   warning). macOS-only.
 --no-remap-apps LIST      # Comma-separated bundle ids where --map-ctrl-to-cmd is
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be

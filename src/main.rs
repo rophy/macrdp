@@ -783,9 +783,14 @@ struct Args {
     /// Ctrl+click are the Cmd combos in every app, terminals included (there
     /// Ctrl+C copies; Win+C sends SIGINT). Alt+Tab switches apps only with
     /// --alt-tab-switch. Cannot be combined with --map-ctrl-to-cmd (the curated,
-    /// terminal-aware remap). macOS-only.
+    /// terminal-aware remap) on the command line; in the config file
+    /// CTRL_AS_CMD wins and MAP_CTRL_TO_CMD is ignored with a warning. macOS-only.
     #[arg(long = "ctrl-as-cmd")]
     ctrl_as_cmd: bool,
+
+    /// Warnings from `args_from_config`, logged once the logger is up.
+    #[arg(skip)]
+    config_warnings: Vec<String>,
 
     /// Bundle ids (comma-separated) where --map-ctrl-to-cmd is suppressed, in
     /// addition to the built-in terminal list. Use this for apps with an embedded
@@ -2588,10 +2593,24 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(bitrate.clone());
     }
 
+    // Both keyboard layouts set (e.g. MAP_CTRL_TO_CMD=1 left from an older
+    // config or the GUI, CTRL_AS_CMD=1 added by hand): clap rejects the pair,
+    // and a launchd job would then not start at all. CTRL_AS_CMD wins (the
+    // whole layout includes what the curated remap does); warn once.
+    let mut config_warnings = Vec::new();
+    if argv.iter().any(|a| a == "--ctrl-as-cmd") && argv.iter().any(|a| a == "--map-ctrl-to-cmd") {
+        argv.retain(|a| a != "--map-ctrl-to-cmd");
+        config_warnings.push(
+            "MAP_CTRL_TO_CMD and CTRL_AS_CMD are both set; using CTRL_AS_CMD (Ctrl = Cmd for every key), ignoring MAP_CTRL_TO_CMD".to_string(),
+        );
+    }
+
     // Re-parse through clap so every value is validated exactly as a CLI arg
     // would be (SocketAddr, numeric ranges, mutually-exclusive checks).
-    Args::try_parse_from(&argv)
-        .with_context(|| format!("config file {} produced invalid settings", path.display()))
+    let mut args = Args::try_parse_from(&argv)
+        .with_context(|| format!("config file {} produced invalid settings", path.display()))?;
+    args.config_warnings = config_warnings;
+    Ok(args)
 }
 
 async fn async_main() -> Result<()> {
@@ -2649,6 +2668,9 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+    for w in &args.config_warnings {
+        warn!("{w}");
+    }
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
@@ -3970,6 +3992,32 @@ mod config_tests {
         assert!(!args.enable_h264);
         assert!(!args.enable_udp_multitransport);
         assert!(!args.udp_migrate_egfx);
+    }
+
+    /// Both keyboard layouts in config.env: the server still starts, with
+    /// CTRL_AS_CMD (the whole layout); MAP_CTRL_TO_CMD is dropped with a
+    /// warning. Also when the flag comes from EXTRA_FLAGS.
+    #[test]
+    fn ctrl_as_cmd_wins_over_map_ctrl_to_cmd_in_config() {
+        for (name, body) in [
+            ("cac-both", "MAP_CTRL_TO_CMD=1\nCTRL_AS_CMD=1\n"),
+            (
+                "cac-extra",
+                "MAP_CTRL_TO_CMD=1\nEXTRA_FLAGS=\"--ctrl-as-cmd\"\n",
+            ),
+        ] {
+            let path = write_temp(name, body);
+            let args = args_from_config(&path).unwrap();
+            fs::remove_file(&path).ok();
+            assert!(args.ctrl_as_cmd, "{name}");
+            assert!(!args.map_ctrl_to_cmd, "{name}");
+            assert_eq!(args.config_warnings.len(), 1, "{name}");
+        }
+        let path = write_temp("cac-one", "MAP_CTRL_TO_CMD=1\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.map_ctrl_to_cmd);
+        assert!(args.config_warnings.is_empty());
     }
 
     #[test]

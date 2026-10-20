@@ -84,7 +84,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           copies; Win+C sends SIGINT. Alt+Tab switches apps with
                           --alt-tab-switch. The Ctrl+Alt+G and Ctrl+Alt+Shift+R
                           hotkeys become Win+Alt+G / Win+Alt+Shift+R. Cannot be
-                          combined with --map-ctrl-to-cmd. macOS-only.
+                          combined with --map-ctrl-to-cmd on the command line; in
+                          config.env CTRL_AS_CMD=1 wins over MAP_CTRL_TO_CMD=1
+                          (that one is ignored, with a warning). macOS-only.
 --no-remap-apps LIST      Comma-separated bundle ids where --map-ctrl-to-cmd is
                           suppressed, on top of the built-in terminal list. For
                           apps with an embedded terminal that can't be auto-detected
