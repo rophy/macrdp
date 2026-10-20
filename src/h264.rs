@@ -349,10 +349,9 @@ struct ConnectionContext {
     /// `on_close` clears `is_ready` but not this, so the legacy hold (see
     /// [`hold_legacy_for_egfx`]) applies only before the first ready.
     egfx_ever_ready: bool,
-    /// When capture first asked for the legacy path on this connection while
-    /// EGFX was not ready yet: the start of the legacy hold.
-    legacy_hold_since: Option<Instant>,
-    /// One-shot guard for the "legacy hold expired" log line.
+    /// One-shot guards for the "holding back" and "legacy hold expired" log
+    /// lines.
+    legacy_hold_logged: bool,
     legacy_hold_expired_logged: bool,
 }
 
@@ -975,6 +974,14 @@ fn should_blank_recover(
     // `acked_since_attempt` keeps an idle session out (no frames shipped ⇒
     // nothing to conclude), and `nonzero_max_since_reset < min_render_reports`
     // implies `!presenting_now` below, so the arms can't fight.
+    // This arm still needs a RUN of `min_render_reports` nonzero reports,
+    // unlike the connect-time latch (`should_latch_presented_clean`), which
+    // counts them in total: after a reactivation, Windows App for macOS emits
+    // phantom nonzero reports interleaved with zeros while it is black (the
+    // incident above), and a total count would take that as a heal. A healed
+    // mstsc with interleaved zeros usually has a run of 3 within the deadline
+    // (all 4 heals in the R36 runs did); a missed one costs a drop and an
+    // auto-reconnect, not a black session.
     let post_attempt_unconfirmed = attempts >= 1
         && !p.heal_confirm_deadline.is_zero()
         && since_last_attempt >= p.heal_confirm_deadline
@@ -1720,37 +1727,43 @@ impl Gfx {
     /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
     /// Called by capture when [`Self::submit_bgra`] returned `Ok(false)`:
-    /// true means "drop this frame, do not send it as a legacy bitmap update"
-    /// because the connection is still negotiating EGFX (see
-    /// [`hold_legacy_for_egfx`]).
-    pub fn hold_legacy(&self) -> bool {
+    /// true means "do not send this frame as a legacy bitmap update" because
+    /// the connection is still negotiating EGFX (see [`hold_legacy_for_egfx`]).
+    /// Capture keeps the frame and submits it again when EGFX is ready, or
+    /// sends it as legacy when this returns false later.
+    ///
+    /// `capture_started` is when this connection's capture stream started:
+    /// the hold is measured from it, not from state on the shared ctx, which a
+    /// takeover candidate can replace while the live session still captures.
+    pub fn hold_legacy(&self, capture_started: Instant) -> bool {
+        if self.legacy_hold.is_zero() {
+            return false;
+        }
         let mut guard = self.ctx.lock().unwrap();
         let Some(ctx) = guard.as_mut() else {
             return false;
         };
         if ctx.is_ready {
-            return false;
+            // EGFX became ready after `submit_bgra` returned `Ok(false)` for
+            // this frame: do not send a legacy picture now; capture submits
+            // its held frame to EGFX on the next loop.
+            return true;
         }
-        let now = Instant::now();
-        let since = *ctx.legacy_hold_since.get_or_insert_with(|| {
+        let held_for = capture_started.elapsed();
+        let declined = ctx.egfx_declined.load(Ordering::Relaxed);
+        let hold = hold_legacy_for_egfx(ctx.egfx_ever_ready, declined, held_for, self.legacy_hold);
+        if hold && !ctx.legacy_hold_logged {
+            ctx.legacy_hold_logged = true;
             debug!(
                 limit_ms = self.legacy_hold.as_millis() as u64,
                 "EGFX not ready yet — holding back legacy bitmap updates"
             );
-            now
-        });
-        let hold = hold_legacy_for_egfx(
-            ctx.egfx_ever_ready,
-            ctx.egfx_declined.load(Ordering::Relaxed),
-            now.saturating_duration_since(since),
-            self.legacy_hold,
-        );
+        }
         if !hold && !ctx.egfx_ever_ready && !ctx.legacy_hold_expired_logged {
             ctx.legacy_hold_expired_logged = true;
             info!(
-                held_ms = now.saturating_duration_since(since).as_millis() as u64,
-                declined = ctx.egfx_declined.load(Ordering::Relaxed),
-                "EGFX did not become ready — sending legacy bitmap updates"
+                held_ms = held_for.as_millis() as u64,
+                declined, "EGFX did not become ready — sending legacy bitmap updates"
             );
         }
         hold
@@ -3034,7 +3047,7 @@ impl GfxServerFactory for Gfx {
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
             egfx_ever_ready: false,
-            legacy_hold_since: None,
+            legacy_hold_logged: false,
             legacy_hold_expired_logged: false,
         });
         Some((
@@ -5181,6 +5194,42 @@ mod tests {
 
         let guard = gfx.ctx.lock().unwrap();
         assert_eq!(clocks(guard.as_ref().unwrap()), [started; 11]);
+    }
+
+    /// `Gfx::hold_legacy` across the connection states (R36 review 2, 3, 10).
+    #[test]
+    fn hold_legacy_follows_the_connection_state() {
+        let gfx = gfx_with_context();
+        assert_eq!(gfx.legacy_hold, Duration::from_millis(3000));
+        let now = Instant::now();
+        // Negotiating: hold. A capture that started long ago (the live session
+        // during a takeover candidate's negotiation) is past the limit: no hold.
+        assert!(gfx.hold_legacy(now));
+        assert!(!gfx.hold_legacy(now - Duration::from_secs(4)));
+        // Ready (also the race where it became ready after submit_bgra said
+        // no): keep the frame away from the legacy path.
+        gfx.ctx
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .client_supports_avc = true;
+        let handler = || GfxHandler {
+            ctx: gfx.ctx.clone(),
+        };
+        handler().on_ready(&avc_ready());
+        assert!(gfx.hold_legacy(now));
+        // EGFX closed after it was ready: legacy as before.
+        handler().on_close();
+        assert!(!gfx.hold_legacy(now));
+        // A new connection whose client declines EGFX (no AVC): legacy at once.
+        assert!(gfx.build_server_with_handle().is_some());
+        assert!(gfx.hold_legacy(now));
+        handler().on_ready(&avc_ready());
+        assert!(!gfx.hold_legacy(now));
+        // No connection context: nothing to hold for.
+        *gfx.ctx.lock().unwrap() = None;
+        assert!(!gfx.hold_legacy(now));
     }
 
     /// A declined (no-AVC) client never goes ready, so its clocks are left alone.
