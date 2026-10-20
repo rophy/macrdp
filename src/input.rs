@@ -1241,10 +1241,15 @@ mod macos {
         /// sends it when its window gets the focus back; a key released while
         /// another window had the focus never sends its key-up, and stayed
         /// down on the Mac (mstsc re-sends ups for the modifiers only). So
-        /// release everything first, as at a connection end. Ported from
+        /// release the keys first, as at a connection end. Ported from
         /// macrdp-v1 f708d80 / d7a9e68, relicensed by the author.
+        ///
+        /// Mouse buttons stay: when a click gives mstsc the focus, it sends
+        /// the button-down BEFORE the Synchronize (measured on Windows 10
+        /// mstsc, 2026-10-21), so releasing buttons here turned that click
+        /// into a click-and-release at once, and its real up into a stray up.
         fn synchronize(&mut self, sync: SynchronizeFlags) {
-            self.release_all("synchronize");
+            self.release_held("synchronize", false);
             let want_num = sync.contains(SynchronizeFlags::NUM_LOCK);
             if want_num != self.num_lock.is_on() {
                 debug!(want = want_num, "syncing Num Lock to client state");
@@ -1342,8 +1347,8 @@ mod macos {
             }
         }
 
-        /// Release everything a connection (or a lost window focus, see
-        /// `synchronize`) may have left pressed on the Mac:
+        /// Release everything a connection may have left pressed on the Mac
+        /// (`synchronize` uses the same path for the keys only):
         /// mouse buttons, non-modifier keys, remapped Ctrl->Cmd keys and held
         /// modifiers (Caps Lock, a toggle, stays). Runs when a connection ends
         /// (`MacInputHandler::connection_ended`, called by the vendored server
@@ -1355,6 +1360,12 @@ mod macos {
         /// Order is the order of a user letting go: buttons, then keys with
         /// the modifier flags still set, then the modifiers.
         pub fn release_all(&mut self, why: &'static str) {
+            self.release_held(why, true);
+        }
+
+        /// `release_all`, with the mouse buttons only when `buttons` (see
+        /// `synchronize` for why it keeps them).
+        fn release_held(&mut self, why: &'static str, buttons: bool) {
             // A button macOS still believes is held: we posted the Down, the
             // connection died before the Up. Go through `button()` so the Up
             // carries the same (latched) flags the Down did and the click
@@ -1362,14 +1373,14 @@ mod macos {
             // the next move posts as MouseMoved, not a phantom
             // `LeftMouseDragged`. An interrupted drag completes as a drop at
             // the last cursor position (docs/known-quirks.md).
-            let buttons = [
+            let held_buttons = [
                 (self.left_down, CGMouseButton::Left),
                 (self.right_down, CGMouseButton::Right),
                 (self.middle_down, CGMouseButton::Center),
             ];
             let mut released_buttons = 0;
-            for (held, button) in buttons {
-                if held {
+            for (held, button) in held_buttons {
+                if held && buttons {
                     self.button(button, false);
                     released_buttons += 1;
                 }
@@ -1410,7 +1421,10 @@ mod macos {
             // A posted Num Lock press was in `keys`; the state stays.
             self.num_lock.forget_key();
             self.posted.clear();
-            self.left_click_remapped = false;
+            if buttons {
+                // The latch belongs to a held left button.
+                self.left_click_remapped = false;
+            }
 
             let stuck = self.mods.cg_flags().bits();
             let had_mods = self.mods.clear_non_lock();
