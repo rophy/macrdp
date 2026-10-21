@@ -33,7 +33,9 @@ mod frame_window;
 mod h264;
 mod h264_sps;
 mod health;
+mod idle;
 mod input;
+mod keep_awake;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
@@ -42,6 +44,7 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+mod session;
 mod shield;
 mod stats;
 mod switcher_hud;
@@ -579,6 +582,21 @@ struct Args {
     #[arg(long = "no-mute-on-minimize", action = clap::ArgAction::SetTrue)]
     no_mute_on_minimize: bool,
 
+    /// Do not keep the Mac's Wi-Fi radio awake during a session. By default,
+    /// while a client is connected and sent input in the last 10 minutes, the
+    /// server sends a small ECHO request (or a Heartbeat PDU to a client
+    /// without the ECHO channel) when nothing else went out for 100 ms.
+    /// Without it, Wi-Fi power save delays input that comes after a quiet
+    /// moment by 50-150 ms. Costs about 10 small packets per second.
+    #[arg(long = "no-wifi-keep-awake", action = clap::ArgAction::SetTrue)]
+    no_wifi_keep_awake: bool,
+
+    /// Disconnect the client after this many seconds without keyboard or
+    /// mouse input (0 = off, the default). The client is told why
+    /// (ERRINFO_IDLE_TIMEOUT: mstsc shows the idle-time message).
+    #[arg(long = "idle-timeout", value_name = "SECS", default_value_t = 0)]
+    idle_timeout: u64,
+
     /// Compress forwarded audio as AAC-LC over RDPSND (MS-RDPEA
     /// WAVE_FORMAT_AAC_MS) instead of raw 16-bit PCM — ~11x less audio
     /// bandwidth (~128 kbps vs ~1.4 Mbps). Off by default: AAC adds ~40–50 ms
@@ -812,8 +830,23 @@ struct Args {
     /// macOS shortcuts need Cmd, i.e. the client's Windows/Super key). Cmd+Q is
     /// deliberately NOT produced (Q is excluded); nav keys are untouched. Always
     /// suppressed when a terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
-    #[arg(long = "map-ctrl-to-cmd")]
+    #[arg(long = "map-ctrl-to-cmd", conflicts_with = "ctrl_as_cmd")]
     map_ctrl_to_cmd: bool,
+
+    /// Windows modifier layout for every key: the client's Ctrl is Cmd, Alt is
+    /// Option and the Windows key is Control (the default layout is Ctrl =
+    /// Control, Alt = Option, Win = Cmd). So Ctrl+C/V/Z/S/Q/Tab/arrows and
+    /// Ctrl+click are the Cmd combos in every app, terminals included (there
+    /// Ctrl+C copies; Win+C sends SIGINT). Alt+Tab switches apps only with
+    /// --alt-tab-switch. Cannot be combined with --map-ctrl-to-cmd (the curated,
+    /// terminal-aware remap) on the command line; in the config file
+    /// CTRL_AS_CMD wins and MAP_CTRL_TO_CMD is ignored with a warning. macOS-only.
+    #[arg(long = "ctrl-as-cmd")]
+    ctrl_as_cmd: bool,
+
+    /// Warnings from `args_from_config`, logged once the logger is up.
+    #[arg(skip)]
+    config_warnings: Vec<String>,
 
     /// Bundle ids (comma-separated) where --map-ctrl-to-cmd is suppressed, in
     /// addition to the built-in terminal list. Use this for apps with an embedded
@@ -1683,7 +1716,7 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
         warn!("auto-unlock: CGEventSource::new failed");
         return AutoUnlockOutcome::SkippedUnsafe;
     };
-    // Modifier state has to be posted on both sources — see `post_flags` below.
+    // Second source for the doubled modifier post — see `post_flags` below.
     let Ok(source_hid) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
         warn!("auto-unlock: CGEventSource::new (HID) failed");
         return AutoUnlockOutcome::SkippedUnsafe;
@@ -1718,10 +1751,14 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // consumed waking/focusing the lock screen instead of entering text.
     // Round 1's mistake was using RETURN as that wake (it submitted an empty
     // password); a bare SHIFT tap cannot insert text and cannot submit, so
-    // it wakes the field harmlessly. Posted as FlagsChanged on BOTH event
-    // sources, the pattern `input.rs::post_flags_changed` established —
-    // `[NSEvent modifierFlags]` and the HID-level state are backed by
-    // different sources and both need to see it.
+    // it wakes the field harmlessly. Posted as FlagsChanged from BOTH event
+    // sources, the pattern `input.rs::post_flags_changed` had when this was
+    // live-tested. `input.rs` has since dropped the second post: on macOS
+    // 15.7.9 one FlagsChanged from either source updates both the session
+    // and the HID modifier state (see `Inner::new`), so here the second post
+    // is most likely redundant (an app would see each Shift change twice;
+    // nothing at the lock screen acts on that). It is kept because this
+    // path has not been re-tested with one post.
     const VK_SHIFT: u16 = 0x38;
     let post_flags = |flags: CGEventFlags| {
         for src in [&source, &source_hid] {
@@ -1760,7 +1797,7 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // keystrokes; no amount of settle delay or Return-retry fixes a bulk
     // fill. Modifiers are held across runs via real FlagsChanged events (not
     // just per-event flags) so a shifted character can't come out unshifted
-    // — same reasoning as `input.rs::post_flags_changed`.
+    // (posted from both sources, see the wake above).
     let mut shift_held = false;
     let mut option_held = false;
     let flags_for = |shift: bool, option: bool| {
@@ -2480,11 +2517,23 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if !on("RICH_CLIPBOARD", true) {
         argv.push("--no-rich-clipboard".into());
     }
+    if !on("WIFI_KEEP_AWAKE", true) {
+        argv.push("--no-wifi-keep-awake".into());
+    }
+    if let Some(secs) = cfg.get("IDLE_TIMEOUT_SECS") {
+        if !secs.is_empty() {
+            argv.push("--idle-timeout".into());
+            argv.push(secs.clone());
+        }
+    }
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
+    }
+    if on("CTRL_AS_CMD", false) {
+        argv.push("--ctrl-as-cmd".into());
     }
     if let Some(list) = cfg.get("NO_REMAP_APPS") {
         if !list.is_empty() {
@@ -2718,10 +2767,24 @@ fn args_from_config(path: &Path) -> Result<Args> {
         argv.push(bitrate.clone());
     }
 
+    // Both keyboard layouts set (e.g. MAP_CTRL_TO_CMD=1 left from an older
+    // config or the GUI, CTRL_AS_CMD=1 added by hand): clap rejects the pair,
+    // and a launchd job would then not start at all. CTRL_AS_CMD wins (the
+    // whole layout includes what the curated remap does); warn once.
+    let mut config_warnings = Vec::new();
+    if argv.iter().any(|a| a == "--ctrl-as-cmd") && argv.iter().any(|a| a == "--map-ctrl-to-cmd") {
+        argv.retain(|a| a != "--map-ctrl-to-cmd");
+        config_warnings.push(
+            "MAP_CTRL_TO_CMD and CTRL_AS_CMD are both set; using CTRL_AS_CMD (Ctrl = Cmd for every key), ignoring MAP_CTRL_TO_CMD".to_string(),
+        );
+    }
+
     // Re-parse through clap so every value is validated exactly as a CLI arg
     // would be (SocketAddr, numeric ranges, mutually-exclusive checks).
-    Args::try_parse_from(&argv)
-        .with_context(|| format!("config file {} produced invalid settings", path.display()))
+    let mut args = Args::try_parse_from(&argv)
+        .with_context(|| format!("config file {} produced invalid settings", path.display()))?;
+    args.config_warnings = config_warnings;
+    Ok(args)
 }
 
 /// Upper bound of the automatic ceiling: 240 Mbps, the H.264 level 5.2 MaxBR
@@ -2799,6 +2862,9 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+    for w in &args.config_warnings {
+        warn!("{w}");
+    }
 
     // Sweep leftovers from a PRIOR macrdp that died uncleanly (SIGKILL / panic /
     // power-loss skip Drop AND the signal handler, stranding NFS mounts + paste
@@ -3359,6 +3425,10 @@ async fn async_main() -> Result<()> {
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
+    crate::input::set_ctrl_as_cmd(args.ctrl_as_cmd);
+    if args.ctrl_as_cmd {
+        info!("Windows modifier layout enabled (--ctrl-as-cmd): Ctrl=Cmd, Alt=Option, Win=Control");
+    }
     crate::input::set_no_remap_apps(args.no_remap_apps.clone());
     if args.map_ctrl_to_cmd {
         info!(
@@ -3522,13 +3592,22 @@ async fn async_main() -> Result<()> {
     // id, for auto-detecting a non-US layout when --keyboard-layout isn't given.
     let keyboard_layout_klid: crate::input::SharedKeyboardLayout =
         std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let input_handler = MacInputHandler::new(
+    let mut input_handler = MacInputHandler::new(
         desktop_size.clone(),
         capture_display_id,
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),
     )?;
+    // Wi-Fi keep-awake: input marks the session as used (see keep_awake).
+    let keep_awake = (!args.no_wifi_keep_awake).then(keep_awake::KeepAwake::new);
+    // Idle timeout: input restarts it (--idle-timeout, 0 = off).
+    let idle = idle::IdleTimeout::new(args.idle_timeout);
+    let session_input = session::SessionInput {
+        keep_awake: keep_awake.clone(),
+        idle: idle.clone(),
+    };
+    input_handler.set_session_input(session_input.clone());
     let cliprdr: Box<dyn ironrdp_server::CliprdrServerFactory> = {
         #[cfg(target_os = "macos")]
         {
@@ -3620,6 +3699,8 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
+    // Connection edges for the session features (keep-awake, idle timeout).
+    let conn_handler = Some(session::SessionHandler::wrap(conn_handler, session_input));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
@@ -3651,6 +3732,18 @@ async fn async_main() -> Result<()> {
     // `input::modifier_reset_handle` for why the display `updates()` path and
     // `on_accept` were both the wrong seam.
     server.set_input_reset_handle(input::modifier_reset_handle());
+
+    // Wi-Fi keep-awake: ECHO requests and Heartbeat PDUs on a quiet link.
+    if let Some(k) = &keep_awake {
+        k.set_echo(server.echo_handle().clone());
+        k.set_heartbeat(server.heartbeat_handle());
+        tokio::spawn(k.clone().run(server.output_activity()));
+        info!("Wi-Fi keep-awake on (--no-wifi-keep-awake to turn it off)");
+    }
+    if let Some(idle) = idle {
+        info!(secs = args.idle_timeout, "idle timeout on");
+        tokio::spawn(idle.run(server.event_sender().clone()));
+    }
 
     // The acceptor records the client's announced keyboard-layout id (KLID) in
     // its Client Core Data; the server publishes it here so the input handler
@@ -4318,6 +4411,58 @@ mod config_tests {
         assert!(!args.no_adaptive_bitrate);
         assert!(!args.enable_udp_multitransport);
         assert!(!args.udp_migrate_egfx);
+    }
+
+    /// Both keyboard layouts in config.env: the server still starts, with
+    /// CTRL_AS_CMD (the whole layout); MAP_CTRL_TO_CMD is dropped with a
+    /// warning. Also when the flag comes from EXTRA_FLAGS.
+    #[test]
+    fn ctrl_as_cmd_wins_over_map_ctrl_to_cmd_in_config() {
+        for (name, body) in [
+            ("cac-both", "MAP_CTRL_TO_CMD=1\nCTRL_AS_CMD=1\n"),
+            (
+                "cac-extra",
+                "MAP_CTRL_TO_CMD=1\nEXTRA_FLAGS=\"--ctrl-as-cmd\"\n",
+            ),
+        ] {
+            let path = write_temp(name, body);
+            let args = args_from_config(&path).unwrap();
+            fs::remove_file(&path).ok();
+            assert!(args.ctrl_as_cmd, "{name}");
+            assert!(!args.map_ctrl_to_cmd, "{name}");
+            assert_eq!(args.config_warnings.len(), 1, "{name}");
+        }
+        let path = write_temp("cac-one", "MAP_CTRL_TO_CMD=1\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.map_ctrl_to_cmd);
+        assert!(args.config_warnings.is_empty());
+    }
+
+    /// Wi-Fi keep-awake is on unless WIFI_KEEP_AWAKE=0.
+    #[test]
+    fn wifi_keep_awake_config_key() {
+        let path = write_temp("wka-default", "USE_KEYCHAIN=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(!args.no_wifi_keep_awake);
+        let path = write_temp("wka-off", "WIFI_KEEP_AWAKE=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.no_wifi_keep_awake);
+    }
+
+    /// IDLE_TIMEOUT_SECS sets --idle-timeout; off by default.
+    #[test]
+    fn idle_timeout_config_key() {
+        let path = write_temp("idle-default", "USE_KEYCHAIN=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert_eq!(args.idle_timeout, 0);
+        let path = write_temp("idle-on", "IDLE_TIMEOUT_SECS=1800\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert_eq!(args.idle_timeout, 1800);
     }
 
     #[test]

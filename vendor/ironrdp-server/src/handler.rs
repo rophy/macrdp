@@ -37,6 +37,10 @@ pub enum MouseEvent {
     Button5Pressed,
     Button5Released,
     VerticalScroll { value: i16 },
+    /// (vendored, divergence 28) Fast-path / slow-path horizontal wheel
+    /// (PTRFLAGS_HWHEEL, MS-RDPBCGR 2.2.8.1.1.3.1.1.3): rotation units,
+    /// positive = tilt right (Windows WM_MOUSEHWHEEL convention).
+    HorizontalScroll { value: i16 },
     Scroll { x: i32, y: i32 },
     RelMove { x: i32, y: i32 },
 }
@@ -73,6 +77,13 @@ pub enum MouseEvent {
 pub trait RdpServerInputHandler: Send {
     fn keyboard(&mut self, event: KeyboardEvent);
     fn mouse(&mut self, event: MouseEvent);
+
+    /// (vendored, divergence 27) Called once after a served connection ends,
+    /// cleanly or not (client disconnect, dropped link, takeover by another
+    /// client). No key-up or button-up comes for input that was down at that
+    /// moment, so a handler that injects input into a shared desktop can
+    /// release it here. Default: no-op.
+    fn connection_ended(&mut self) {}
 }
 
 impl From<(u8, fast_path::KeyboardFlags)> for KeyboardEvent {
@@ -160,6 +171,16 @@ impl From<MousePdu> for MouseEvent {
             } else {
                 MouseEvent::RightReleased
             }
+        } else if value.flags.contains(PointerFlags::MIDDLE_BUTTON_OR_WHEEL) {
+            // (vendored, divergence 29) PTRFLAGS_BUTTON3 (MS-RDPBCGR
+            // 2.2.8.1.1.3.1.1.3), the middle button. Without this arm mstsc's
+            // middle click fell through to `Move`. The flag name is upstream's;
+            // the wheel has its own flags (VERTICAL_WHEEL, HORIZONTAL_WHEEL).
+            if value.flags.contains(PointerFlags::DOWN) {
+                MouseEvent::MiddlePressed
+            } else {
+                MouseEvent::MiddleReleased
+            }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
             // NO correction here — see the retired divergence (17). ironrdp-pdu
             // used to decode the 9-bit WheelRotationMask as sign-magnitude
@@ -172,6 +193,13 @@ impl From<MousePdu> for MouseEvent {
             // future pin regresses upstream's decode, fix it in ironrdp-pdu
             // rather than compensating here.
             MouseEvent::VerticalScroll {
+                value: value.number_of_wheel_rotation_units,
+            }
+        } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
+            // (vendored, divergence 28) Without this arm a horizontal wheel
+            // PDU fell through to `Move` with the PDU's x/y (which the spec
+            // says to ignore on wheel events).
+            MouseEvent::HorizontalScroll {
                 value: value.number_of_wheel_rotation_units,
             }
         } else {
@@ -197,11 +225,15 @@ impl From<MousePdu> for MouseEvent {
 /// however, sends a tap as a SINGLE button PDU with no preceding move — so
 /// without this its taps register at the previous cursor position (clicks
 /// "not working" / aim off). Plain move and wheel PDUs are unchanged.
-pub(crate) fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> {
-    let lead = if pdu
-        .flags
-        .intersects(PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON)
-    {
+///
+/// (divergence 29) `pub` and re-exported `#[doc(hidden)]` so macrdp's own
+/// tests can drive the exact path the server uses (the root `cargo test` does
+/// not run tests inside this vendored crate). Not part of the public API.
+pub fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = MouseEvent> {
+    // (divergence 29) The middle button too: its PDU also carries the position.
+    let lead = if pdu.flags.intersects(
+        PointerFlags::LEFT_BUTTON | PointerFlags::RIGHT_BUTTON | PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
+    ) {
         Some(MouseEvent::Move {
             x: pdu.x_position,
             y: pdu.y_position,
@@ -214,17 +246,21 @@ pub(crate) fn mouse_events_from_pdu(pdu: MousePdu) -> impl Iterator<Item = Mouse
 
 impl From<MouseXPdu> for MouseEvent {
     fn from(value: MouseXPdu) -> Self {
+        // (vendored, divergence 29) PTRXFLAGS_BUTTON1/2 are the extended
+        // buttons 4 and 5 (X1/X2, back/forward; MS-RDPBCGR 2.2.8.1.1.3.1.1.4),
+        // not left and right. Mapped to Left/Right before, so a back-button
+        // press from mstsc was a left click on the server.
         if value.flags.contains(PointerXFlags::BUTTON1) {
             if value.flags.contains(PointerXFlags::DOWN) {
-                MouseEvent::LeftPressed
+                MouseEvent::Button4Pressed
             } else {
-                MouseEvent::LeftReleased
+                MouseEvent::Button4Released
             }
         } else if value.flags.contains(PointerXFlags::BUTTON2) {
             if value.flags.contains(PointerXFlags::DOWN) {
-                MouseEvent::RightPressed
+                MouseEvent::Button5Pressed
             } else {
-                MouseEvent::RightReleased
+                MouseEvent::Button5Released
             }
         } else {
             MouseEvent::Move {

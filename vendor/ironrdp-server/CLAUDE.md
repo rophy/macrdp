@@ -2062,3 +2062,109 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     `encoder::surface_command_tests` (run by CI: `cargo test --manifest-path
     vendor/ironrdp-server/Cargo.toml --lib`, test-linux job; the root
     `cargo test` does not reach this crate).
+
+(27) Connection-end input hook — `RdpServerInputHandler::connection_ended`
+    (NOT upstreamed; added 2026-10-21; first written as a second (25); renumbered to (27) because (26) is taken on branch fix/win10-mstsc-black).
+    The input trait gains a default no-op method `connection_ended(&mut self)`.
+    The accept loop in `run` calls it once after each served connection is
+    over — after the preemption race resolves, so it runs for a clean end, an
+    error return, and a connection dropped by a takeover alike — before the
+    next connection is served. macrdp's input handler uses it to post a key-up
+    / button-up for everything the connection left pressed (a dropped link
+    sends no releases; a non-modifier key used to stay down on the Mac until it
+    was pressed again). Divergence 24 still fires at the start of the next
+    served connection and now finds nothing left. Default method, so other
+    implementors are unchanged.
+
+(28) Horizontal mouse wheel (NOT upstreamed; added 2026-10-21).
+    `capabilities.rs` advertises `InputFlags::TS_MOUSE_HWHEEL` (MS-RDPBCGR
+    2.2.7.1.6); without it mstsc sends no horizontal wheel at all and FreeRDP
+    drops it on the fast path (it still sends it on ainput). `handler.rs`
+    gains `MouseEvent::HorizontalScroll { value: i16 }` and maps
+    `PointerFlags::HORIZONTAL_WHEEL` (PTRFLAGS_HWHEEL, 2.2.8.1.1.3.1.1.3) to
+    it; before, such a PDU fell through to `Move` with the PDU's x/y. Value is
+    the signed rotation units, positive = tilt right. Adding an enum variant
+    breaks exhaustive matches in other implementors; the ones in this repo use
+    a wildcard arm or match every variant. Same shape as macrdp-v1's IronRDP
+    fork (commit f080dca6 for the capability).
+
+(29) Middle mouse button on the fast/slow path (NOT upstreamed; added 2026-10-21).
+    `From<MousePdu>` maps `PointerFlags::MIDDLE_BUTTON_OR_WHEEL` (0x4000,
+    PTRFLAGS_BUTTON3, MS-RDPBCGR 2.2.8.1.1.3.1.1.3) to
+    `MouseEvent::MiddlePressed` / `MiddleReleased`; before, an mstsc middle
+    click fell through to `Move`. `mouse_events_from_pdu` puts the PDU's
+    position before a middle button event too, as (21) does for left and
+    right. The function is now `pub` and re-exported `#[doc(hidden)]` so that
+    macrdp's `src/conn_test.rs` tests the path the server dispatches through.
+    Same divergence: `From<MouseXPdu>` maps PTRXFLAGS_BUTTON1/2 (the extended
+    buttons 4 and 5, back/forward, 2.2.8.1.1.3.1.1.4) to `Button4*` /
+    `Button5*`; it mapped them to Left/Right before, so an mstsc back-button
+    press was a left click. macrdp ignores buttons 4 and 5 (as macrdp-v1 does).
+    Upstream fixed the same arms in e9c5b1c5 (#1769) with a breaking
+    `MouseEvent::Button` shape; drop this divergence when the pin moves past it.
+
+(30) Wi-Fi keep-awake support: on-demand Heartbeat PDUs, ECHO channel open
+    state, time of the last write, client session hook (NOT upstreamed; added
+    2026-10-21; pairs with `vendor/ironrdp-acceptor` divergence (30)).
+    - `heartbeat.rs`: `HeartbeatConfig`, `HeartbeatHandle` (cloneable; `send`
+      merges requests until the client loop takes one) and
+      `RdpServer::heartbeat_handle()`. `client_loop` gets a `send_heartbeats`
+      arm that writes one Server Heartbeat PDU (MS-RDPBCGR 2.2.16.1, Basic
+      Security Header SEC_HEARTBEAT on the MCS message channel) per request,
+      only to a client with a message channel that set
+      `RNS_UD_CS_SUPPORT_HEARTBEAT_PDU`; a request from before the loop is
+      dropped. The PDU is encoded by hand: `ironrdp-pdu` at a5d1c682 has no
+      `HeartbeatPdu` (upstream added it later, #1814, and periodic heartbeats
+      in #1842 — drop this half on a pin bump past both).
+    - `OutputActivity` (`RdpServer::output_activity()`): `SharedWriter`
+      stamps the time after each write to the client socket (all TCP output
+      of the client loop).
+    - `EchoServerHandle::is_channel_open()` (echo.rs): true from the bridge's
+      `start` (client accepted the DVC) until `close`/drop; a bridge id keeps
+      an old connection from clearing the new one.
+    - `ConnectionHandler::on_client_session(&ClientSession)`: default no-op,
+      called once per served connection in `client_accepted` (not on a
+      reactivation) with `supports_heartbeat`.
+    Ported from macrdp-v1's IronRDP fork (rophy/IronRDP cd5ac8f4, 639fce30,
+    63b3f96d, 6864c807, f1abf7cc; relicensed by the author), reshaped for this
+    vendor copy. macrdp's `src/keep_awake.rs` uses all four.
+
+(31) Audio only for a client that wants it (NOT upstreamed; added 2026-10-21;
+    pairs with `vendor/ironrdp-acceptor` divergence (31)). `client_accepted`
+    does not start the rdpsnd static channel when the Client Info PDU says
+    "do not play" (INFO_NOAUDIOPLAYBACK) or "play on the remote computer"
+    (INFO_REMOTECONSOLEAUDIO), MS-RDPBCGR 2.2.1.11.1.1: without the Server
+    Audio Formats PDU the client never answers, so macrdp's rdpsnd backend
+    never starts its ScreenCaptureKit audio capture. `audio_playback_wanted`
+    (pub) decides; `ClientSession::audio_playback` carries it. The lossy-UDP
+    audio DVC (multitransport, opt-in) is not gated. Ported from macrdp-v1's
+    IronRDP fork (rophy/IronRDP 6ead8214), relicensed by the author.
+
+(32) `ServerEvent::Disconnect(ErrorInfo)` (NOT upstreamed in this shape;
+    added 2026-10-21). Ends the connection after a Server Set Error Info PDU
+    with the given code (MS-RDPBCGR 2.2.5.1.1), sent only to a client that set
+    `RNS_UD_CS_SUPPORT_ERRINFO_PDU` (3.3.5.7.1; flags from acceptor divergence
+    (30)). macrdp's idle timeout sends it with ERRINFO_IDLE_TIMEOUT.
+    `discard_stale_eviction_events` now also drops queued `Disconnect` events
+    and runs at the top of `run_connection` too, so an event meant for a
+    connection that ended cannot end the next one. Upstream has a similar
+    graceful disconnect (f7253861, #1798, `ServerEvent::Disconnect`); drop
+    on a pin bump past it.
+
+(34) AUDIO_INPUT only for a client that asks for it (NOT upstreamed; added
+    2026-10-21; uses `vendor/ironrdp-dvc` divergence (34)). `client_accepted`
+    removes the (opt-in) microphone DVC from the drdynvc channel list before
+    the channel starts when the Client Info PDU has no INFO_AUDIOCAPTURE
+    (MS-RDPBCGR 2.2.1.11.1.1; `audio_capture_wanted`), so the client never
+    gets its Create Request. mstsc sets the flag with "Record from this
+    computer" (checked 2026-10-21, Windows 10 22H2) and opened the channel
+    only then anyway.
+
+(35) Audio-lag model: the client queue is never below zero (NOT upstreamed;
+    added 2026-10-21). `dispatch_audio`'s model is now `AudioLagModel`. It
+    raises the shipped total to the real time at every wave when the queue
+    ran empty, not only after a deficit over 300 ms (that size is now only
+    logged as a writer stall). macrdp skips digital silence, so gaps under
+    300 ms are normal; before, each one raised the drop limit by its length
+    for the rest of the sound. Tests: `a_short_gap_does_not_raise_the_queue_limit`
+    and two more in `session_tests`.

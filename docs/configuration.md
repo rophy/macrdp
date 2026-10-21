@@ -80,6 +80,17 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           need the client's Win/Super key). Cmd+Q is never produced
                           (Q excluded); nav keys untouched. Always suppressed when a
                           terminal is frontmost so Ctrl+C stays SIGINT. macOS-only.
+--ctrl-as-cmd             Windows modifier layout for every key: the client's
+                          Ctrl is Cmd, Alt is Option, Win is Control (default:
+                          Ctrl = Control, Alt = Option, Win = Cmd). Every Ctrl
+                          combo is the Cmd combo in every app: Ctrl+C/V/Z/S/Q,
+                          Ctrl+Tab, Ctrl+arrows, Ctrl+click. In a terminal Ctrl+C
+                          copies; Win+C sends SIGINT. Alt+Tab switches apps with
+                          --alt-tab-switch. The Ctrl+Alt+G and Ctrl+Alt+Shift+R
+                          hotkeys become Win+Alt+G / Win+Alt+Shift+R. Cannot be
+                          combined with --map-ctrl-to-cmd on the command line; in
+                          config.env CTRL_AS_CMD=1 wins over MAP_CTRL_TO_CMD=1
+                          (that one is ignored, with a warning). macOS-only.
 --no-remap-apps LIST      Comma-separated bundle ids where --map-ctrl-to-cmd is
                           suppressed, on top of the built-in terminal list. For
                           apps with an embedded terminal that can't be auto-detected
@@ -232,6 +243,19 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           flowing through a minimize (preserves "minimized
                           YouTube keeps playing on the Mac speakers") at the
                           cost of accepting that drift on refocus. See [audio.md](audio.md).
+--no-wifi-keep-awake      Do not keep the Mac's Wi-Fi radio awake during a session
+                          (default ON). While a client is connected and sent input
+                          in the last 10 minutes, the server sends a small ECHO
+                          request (MS-RDPEECO; a Heartbeat PDU to a client without
+                          the ECHO channel) when nothing else went out for 100 ms.
+                          With Wi-Fi power save, a Mac that sent nothing for a
+                          moment gets the next packet 50-150 ms late, so a key
+                          after a pause shows late. About 10 small packets per
+                          second while it runs. Config: WIFI_KEEP_AWAKE=0.
+--idle-timeout SECS       Disconnect the client after SECS seconds without keyboard
+                          or mouse input (default 0 = off). The client gets a Set
+                          Error Info PDU with ERRINFO_IDLE_TIMEOUT, so mstsc shows
+                          why the session ended. Config: IDLE_TIMEOUT_SECS.
 --cert-dir PATH           Persisted self-signed TLS cert (default ~/Library/Application Support/macrdp)
 --cert PATH / --key PATH  Operator-supplied TLS cert + key (PEM) — serve a real CA / ACME /
                           Let's Encrypt cert instead of self-signed. Both required; no
@@ -404,6 +428,39 @@ QoE-less clients (FreeRDP) and high-RTT links are never touched. A deeper
 ESTABLISHED_MIN_QOE, ESTABLISHED_MAX_WAIT_MS, ESTABLISHED_WALL_REPORTS}` — tolerates the
 brief zero-EDR windows a healthy client produces mid-session; see the blank-recovery
 notes in `docs/known-quirks.md` for the full story and the tuning history.
+
+## Moving from macrdp-v1 (`config.toml`)
+
+macrdp-v1 read a `config.toml`; this server has no TOML file. It takes CLI flags, and the
+LaunchAgent passes `--config config.env` (plain `KEY=value`, see
+`packaging/config.env.example`); flags without a key go into `EXTRA_FLAGS`. One difference
+first: v1 checked the RDP login against its own `username`/`password`, this server checks it
+against a macOS account (PAM), so the client logs in with that account's password.
+
+| v1 `config.toml` key | Flag | `config.env` key | Note |
+|---|---|---|---|
+| `port` (3389) | `--bind 0.0.0.0:<port>` | `BIND` | Default `127.0.0.1:3390` (loopback only) |
+| `username` | `--username` | `USERNAME` | A macOS account name; default the login user |
+| `password` | `--password-file`, `--keychain` or the prompt | `USE_KEYCHAIN=1` | The macOS password of that account, not an RDP-only password (`--skip-auth --password` only for tests) |
+| `width`, `height` | `--width`, `--height` | `EXTRA_FLAGS` | Default: the client's requested size |
+| `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with `--enable-h264`, else 15 |
+| `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default 6; `--adaptive-bitrate` (`ADAPTIVE_BITRATE`) adapts below it |
+| `resolution` / `hidpi_scale` | `--hidpi` | `HIDPI` | Backing (Retina) pixels of the primary display |
+| `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default; `--stretch` fills instead of letterboxing |
+| `encoder` | `--enable-h264` | `ENABLE_H264` | H.264 is VideoToolbox (hardware); without it legacy bitmaps / RemoteFX |
+| `quality` | none | | Use `--bitrate` |
+| `chroma_mode` | none | | AVC420 only (no AVC444) |
+| `lossless_text` | none | | No ClearCodec pass |
+| `ctrl_as_cmd` | `--ctrl-as-cmd` | `CTRL_AS_CMD` | `--map-ctrl-to-cmd` remaps only editing shortcuts |
+| `wifi_keep_awake` | `--no-wifi-keep-awake` to turn off | `WIFI_KEEP_AWAKE=0` | Default on |
+| `idle_timeout_secs` | `--idle-timeout` | `IDLE_TIMEOUT_SECS` | Default 0 (off) |
+| `cert_path`, `key_path` | `--cert`, `--key` | `TLS_CERT`, `TLS_KEY` | Default: self-signed in `--cert-dir` |
+| `log_level` | `RUST_LOG` (env), `-v` | `RUST_LOG` in the plist `EnvironmentVariables` | Log file: `--log-dir` (`LOG_DIR`) |
+| `show_cursor`, `cursor_channel` | none | | The capture leaves the pointer out; it goes as pointer updates (`--cursor-scale` sets its size) |
+| `skip_unchanged` | none | | No key; on a static screen H.264 still sends `--keyframe-interval` keyframes and `--flush-frames` |
+| `[audio] enabled` | none | | Audio goes to a client that asks for it (play here); `--enable-aac` for AAC |
+| `[clipboard]` | `--no-rich-clipboard`, `--no-lazy-paste` | `RICH_CLIPBOARD=0` | Clipboard and file copy are always on; no file size limit (up to 10 000 files per copy) |
+| `--perf` (CLI) | `--stats-endpoint` | `STATS_ENDPOINT` | Live JSON on 127.0.0.1 (`MACRDP_STATS_PORT`) instead of a log summary |
 
 ## Headless mode
 

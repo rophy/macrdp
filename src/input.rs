@@ -23,6 +23,8 @@ pub struct MacInputHandler {
     /// Records mouse-button-down timestamps so the H.264 path can lower its
     /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
+    /// Told about each keyboard and mouse event (Wi-Fi keep-awake).
+    session: crate::session::SessionInput,
     #[cfg(target_os = "macos")]
     inner: macos::Inner,
 }
@@ -57,14 +59,21 @@ impl MacInputHandler {
         Ok(Self {
             desktop_size,
             click_signal,
+            session: crate::session::SessionInput::default(),
             #[cfg(target_os = "macos")]
             inner,
         })
+    }
+
+    /// Per-session features to tell about each input (see `session`).
+    pub fn set_session_input(&mut self, session: crate::session::SessionInput) {
+        self.session = session;
     }
 }
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        self.session.note_input();
         #[cfg(target_os = "macos")]
         self.inner.keyboard(event);
         #[cfg(not(target_os = "macos"))]
@@ -72,6 +81,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        self.session.note_input();
         // A button-down is the "user intent" signal the H.264 path uses to lower
         // its keyframe threshold for a moment (a click usually precedes a UI
         // change). Record before delegating, since `inner.mouse` takes `event`.
@@ -91,6 +101,15 @@ impl RdpServerInputHandler for MacInputHandler {
         }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
+    }
+
+    fn connection_ended(&mut self) {
+        // Release what the ended connection left pressed now, not on the
+        // first input of the next connection: a key or button still down on
+        // the Mac affects the local user too, and a key that is not a
+        // modifier stayed down even after the next connection.
+        #[cfg(target_os = "macos")]
+        self.inner.release_all("connection ended");
     }
 }
 
@@ -202,9 +221,291 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
     remap_on && ctrl && !cmd && !alt && !excluded
 }
 
+/// Non-modifier keys this server posted a key-down for on the Mac and no
+/// key-up yet, by macOS virtual keycode.
+///
+/// No key-up comes for a key that was down when the connection ended (an
+/// abrupt drop, a killed client, a takeover): the Mac would keep it pressed
+/// until the same key is pressed again, for the local user and the next
+/// client. `Inner::release_all` posts a key-up for each key in this set when a
+/// connection ends and when a new one starts. Modifiers are tracked apart, in
+/// `ModifierState`, because they are posted as FlagsChanged.
+///
+/// Pure (no platform deps) so it is unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct HeldKeys {
+    down: std::collections::BTreeSet<u16>,
+    /// Keys held whose key-down went out remapped Ctrl→Cmd
+    /// (--map-ctrl-to-cmd): their key-up goes out the same way.
+    remapped: std::collections::BTreeSet<u16>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl HeldKeys {
+    /// Record a posted key-down (`down`) or key-up of `vk`.
+    fn note(&mut self, vk: u16, down: bool) {
+        if down {
+            self.down.insert(vk);
+        } else {
+            self.down.remove(&vk);
+        }
+    }
+
+    /// Forget every held key; returns them (ascending) for the caller to post
+    /// a key-up each.
+    fn take_all(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.down).into_iter().collect()
+    }
+
+    /// Record a key-down of `vk` posted remapped Ctrl→Cmd.
+    fn note_remapped_down(&mut self, vk: u16) {
+        self.remapped.insert(vk);
+    }
+
+    /// A key-up of `vk`: true if its down went out remapped, so the up must
+    /// go out remapped too. That up also releases a down of the same key that
+    /// went out on the plain path before Ctrl was pressed (a held key, then
+    /// auto-repeat under Ctrl), so the key is no longer held either: no second
+    /// key-up at the connection end.
+    fn remapped_up(&mut self, vk: u16) -> bool {
+        if !self.remapped.remove(&vk) {
+            return false;
+        }
+        self.down.remove(&vk);
+        true
+    }
+
+    /// Forget every remapped key; returns them (ascending) for the caller to
+    /// post a remapped key-up each.
+    fn take_remapped(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.remapped).into_iter().collect()
+    }
+}
+
+// Wheel scaling: ported from macrdp-v1 f31d4c8 (crates/macrdp-input/src/mouse.rs,
+// `WheelAccumulator`), relicensed to MIT OR Apache-2.0 by the author; adapted to
+// fixed-point input for the ainput path.
+
+/// RDP wheel rotation units for one notch (WHEEL_DELTA).
+const WHEEL_DELTA: i64 = 120;
+
+/// Lines scrolled per notch: the Windows default (SPI_GETWHEELSCROLLLINES = 3).
+const LINES_PER_NOTCH: i64 = 3;
+
+/// Fixed-point scale of wheel values from the ainput channel
+/// (`MouseEvent::Scroll`): FreeRDP sends rotation units as 16.16 fixed point,
+/// so one 120-unit notch arrives as `120 << 16` (FreeRDP 3.x
+/// `freerdp_client_send_wheel_event`, "scale this so we can also support high
+/// resolution wheels"). Fast-path wheel PDUs (`MouseEvent::VerticalScroll`,
+/// mstsc) carry plain rotation units and are scaled up to this unit.
+const WHEEL_FIXED_ONE: i64 = 1 << 16;
+
+/// Turns wheel rotation units (120 per notch, less for high-resolution
+/// wheels and touchpads) into whole lines. The rest is kept for the next
+/// event in the same direction, so small deltas add up like on Windows.
+///
+/// Pure (no platform deps) so it is unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct WheelAccumulator {
+    /// Rest in units of 1/(WHEEL_DELTA * WHEEL_FIXED_ONE) line.
+    rest: i64,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl WheelAccumulator {
+    /// `value`: rotation units in 16.16 fixed point (`WHEEL_FIXED_ONE` = one
+    /// unit), in the caller's axis sign convention. Returns the lines to
+    /// scroll (same sign).
+    fn lines(&mut self, value: i64) -> i32 {
+        let units = value.saturating_mul(LINES_PER_NOTCH);
+        if units.signum() * self.rest.signum() < 0 {
+            self.rest = 0;
+        }
+        self.rest = self.rest.saturating_add(units);
+        let lines = self.rest / (WHEEL_DELTA * WHEEL_FIXED_ONE);
+        self.rest -= lines * WHEEL_DELTA * WHEEL_FIXED_ONE;
+        i32::try_from(lines).unwrap_or(if lines < 0 { i32::MIN } else { i32::MAX })
+    }
+}
+
+/// Wheel rotation of a mouse event, routed to its axis: `(vertical,
+/// horizontal)` in 16.16 fixed point (`WHEEL_FIXED_ONE` = one RDP rotation
+/// unit), RDP sign convention. `None` for events that are not a wheel.
+/// Fast-path / slow-path wheel PDUs (mstsc) carry plain rotation units and are
+/// scaled up; the ainput channel (FreeRDP, `Scroll`) is already 16.16.
+///
+/// Pure (no platform deps) so it is unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn wheel_units(event: &MouseEvent) -> Option<(i64, i64)> {
+    match *event {
+        MouseEvent::VerticalScroll { value } => Some((i64::from(value) * WHEEL_FIXED_ONE, 0)),
+        // mstsc tilt: positive = right.
+        MouseEvent::HorizontalScroll { value } => Some((0, i64::from(value) * WHEEL_FIXED_ONE)),
+        MouseEvent::Scroll { x, y } => Some((i64::from(y), i64::from(x))),
+        _ => None,
+    }
+}
+
+/// CGEvent scroll wheel counts for `v` / `h` lines in RDP's sign convention
+/// (vertical: positive = wheel forward / up; horizontal: positive = tilt
+/// right, as Windows WM_MOUSEHWHEEL and FreeRDP's ainput `x`). macOS: wheel1
+/// positive scrolls up, wheel2 positive scrolls LEFT, so horizontal flips.
+/// Measured 2026-10-21 in Chrome: RDP +120 horizontal posted as wheel2 = +3
+/// gave `deltaX` -120 (scroll left); macrdp-v1 (wheel2 = -lines) gives +120.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn wheel_counts(v: i32, h: i32) -> (i32, i32) {
+    (v, h.saturating_neg())
+}
+
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click};
+    use super::{
+        is_remappable_shortcut, map_client_to_display, should_remap_click, wheel_counts,
+        wheel_units, HeldKeys, WheelAccumulator, WHEEL_FIXED_ONE,
+    };
+    use ironrdp_server::MouseEvent;
+
+    /// Plain RDP rotation units (fast-path wheel PDU) in the accumulator's unit.
+    fn units(u: i64) -> i64 {
+        u * WHEEL_FIXED_ONE
+    }
+
+    #[test]
+    fn one_notch_is_three_lines() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(units(120)), 3);
+        assert_eq!(w.lines(units(-120)), -3);
+        assert_eq!(w.lines(units(240)), 6);
+    }
+
+    /// FreeRDP's ainput channel sends one notch as 120 << 16.
+    #[test]
+    fn ainput_fixed_point_notch_is_three_lines() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(-7_864_320), -3);
+        assert_eq!(w.lines(7_864_320), 3);
+        // Half a notch (high-resolution wheel) twice = one notch.
+        assert_eq!(w.lines(60 << 16), 1);
+        assert_eq!(w.lines(60 << 16), 2);
+    }
+
+    /// Each wheel event reaches its own axis: the fast-path horizontal wheel
+    /// (mstsc tilt) and the ainput `x` (FreeRDP) go to the horizontal axis,
+    /// vertical ones to the vertical axis. Fast-path units are scaled to
+    /// 16.16; ainput values are already 16.16.
+    #[test]
+    fn wheel_events_route_to_their_axis() {
+        assert_eq!(
+            wheel_units(&MouseEvent::HorizontalScroll { value: 120 }),
+            Some((0, units(120)))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::HorizontalScroll { value: -1 }),
+            Some((0, units(-1)))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::VerticalScroll { value: -120 }),
+            Some((units(-120), 0))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::Scroll { x: 7_864_320, y: 0 }),
+            Some((0, 7_864_320))
+        );
+        assert_eq!(
+            wheel_units(&MouseEvent::Scroll {
+                x: 0,
+                y: -7_864_320
+            }),
+            Some((-7_864_320, 0))
+        );
+        assert_eq!(wheel_units(&MouseEvent::Move { x: 1, y: 2 }), None);
+        assert_eq!(wheel_units(&MouseEvent::MiddlePressed), None);
+    }
+
+    /// RDP tilt right (+) must scroll right: CG wheel2 is positive = left.
+    #[test]
+    fn horizontal_sign_flips_for_cg_vertical_does_not() {
+        assert_eq!(wheel_counts(3, 0), (3, 0));
+        assert_eq!(wheel_counts(-3, 0), (-3, 0));
+        assert_eq!(wheel_counts(0, 3), (0, -3));
+        assert_eq!(wheel_counts(0, -3), (0, 3));
+        assert_eq!(wheel_counts(0, i32::MIN), (0, i32::MAX));
+    }
+
+    #[test]
+    fn partial_deltas_add_up() {
+        let mut w = WheelAccumulator::default();
+        // 40 units = 1 line
+        assert_eq!(w.lines(units(40)), 1);
+        // 15 units = 3/8 line each: lines come at the 3rd and 6th event
+        let mut w = WheelAccumulator::default();
+        let got: Vec<i32> = (0..8).map(|_| w.lines(units(15))).collect();
+        assert_eq!(got, vec![0, 0, 1, 0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn rest_is_dropped_when_the_direction_changes() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(units(30)), 0); // rest 3/4 line up
+        assert_eq!(w.lines(units(-20)), 0); // rest dropped, 1/2 line down
+        assert_eq!(w.lines(units(-20)), -1);
+    }
+
+    #[test]
+    fn extreme_values_do_not_overflow() {
+        let mut w = WheelAccumulator::default();
+        assert_eq!(w.lines(units(i64::from(i16::MAX))), 819);
+        assert_eq!(w.lines(i64::from(i32::MIN)), -819);
+        assert_eq!(w.lines(i64::MAX), i32::MAX);
+    }
+
+    /// A key that went down and not up is released by `take_all`; a key that
+    /// went down and up is not; auto-repeat downs count once; after
+    /// `take_all` nothing is held.
+    #[test]
+    fn held_keys_tracks_downs_without_ups() {
+        let mut h = HeldKeys::default();
+        h.note(0x28, true); // K down
+        h.note(0x28, true); // auto-repeat
+        h.note(0x00, true); // A down
+        h.note(0x00, false); // A up
+        h.note(0x31, true); // Space down
+        assert_eq!(h.take_all(), vec![0x28, 0x31]);
+        assert!(h.take_all().is_empty(), "take_all forgets the keys");
+        h.note(0x07, false); // a stray key-up (down was before a reset)
+        assert!(h.take_all().is_empty());
+    }
+
+    /// `Inner::key` call sequence for --map-ctrl-to-cmd: C goes down on the
+    /// plain path (noted), Ctrl goes down, the auto-repeat of C goes out as
+    /// Cmd+C (remap path), then the up goes out on the remap path. Nothing is
+    /// left for `release_all`: no stray plain C up at the connection end.
+    #[test]
+    fn remapped_key_up_clears_a_plain_held_key() {
+        let mut h = HeldKeys::default();
+        h.note(0x08, true); // C down, plain path
+        h.note_remapped_down(0x08); // auto-repeat under Ctrl: Cmd+C
+        assert!(h.remapped_up(0x08), "the up goes out remapped");
+        assert!(h.take_all().is_empty(), "no stray C up at connection end");
+        assert!(h.take_remapped().is_empty());
+        // An up of a key that did not go down remapped takes the plain path.
+        h.note(0x09, true);
+        assert!(!h.remapped_up(0x09));
+        assert_eq!(h.take_all(), vec![0x09]);
+    }
+
+    /// A remapped key still down at the connection end gets one remapped up.
+    #[test]
+    fn take_remapped_returns_the_keys_still_down() {
+        let mut h = HeldKeys::default();
+        h.note_remapped_down(0x08);
+        h.note_remapped_down(0x09);
+        assert!(h.remapped_up(0x09));
+        assert_eq!(h.take_remapped(), vec![0x08]);
+        assert!(h.take_remapped().is_empty());
+    }
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
     /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
@@ -392,6 +693,17 @@ pub fn set_map_ctrl_to_cmd(on: bool) {
     MAP_CTRL_TO_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, post the client's modifiers in the Windows layout for every key
+/// (`--ctrl-as-cmd`): Ctrl as Command, Alt as Option, Win as Control. Unlike
+/// `MAP_CTRL_TO_CMD` (a curated key set, suppressed in terminals) this swaps
+/// the modifier keys themselves, so every Ctrl combo is the Cmd combo
+/// (`scancodes::ctrl_as_cmd_vk`). Off by default.
+static CTRL_AS_CMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ctrl_as_cmd(on: bool) {
+    CTRL_AS_CMD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Shared per-SERVED-connection reset flag for held-modifier + button state.
 ///
 /// Modifier state lives in `Inner`, which is constructed ONCE for the process,
@@ -400,9 +712,9 @@ pub fn set_map_ctrl_to_cmd(on: bool) {
 /// reconnect, clearing only on a server restart. That was survivable while mouse
 /// events ignored `mods`; now that clicks carry the modifier flags, a stuck Ctrl
 /// turns every left click into a secondary click, so it needs a way out. The
-/// MS-RDPBCGR Synchronize PDU can't provide one — it carries only lock keys
-/// (Caps/Num/Scroll/Kana), never Ctrl/Shift/Alt/Cmd — hence this out-of-band
-/// flag. The same reset also clears button-down tracking, which fixes a
+/// MS-RDPBCGR Synchronize PDU sets all keys up (`Inner::synchronize` releases
+/// the keys on a focus-in, not the buttons), but a client sends it on focus,
+/// not at the start of a new connection after a drop — hence this out-of-band flag. The same reset also clears button-down tracking, which fixes a
 /// pre-existing hazard: a connection dropped between a left-down and its up
 /// left `left_down` stuck, so every move on the next connection posted as
 /// `LeftMouseDragged`.
@@ -454,6 +766,9 @@ pub fn init_focus_observer() {}
 #[cfg(target_os = "macos")]
 mod scancodes;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod keystate;
+
 // Re-export the gather-windows sweep so the capture path can trigger it
 // automatically after a live virtual-display re-mode (see
 // `capture.rs::sync_virtual_display`), the same routine the Ctrl+Alt+G hotkey
@@ -468,7 +783,12 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
-    use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
+    use super::keystate::{
+        FocusIn, NumLock, PostedKeys, Release, UnicodeAction, UnicodeKeys, SCANCODE_NUM_LOCK,
+    };
+    use super::scancodes::{
+        ctrl_as_cmd_vk, is_numeric_pad_vk, keypad_navigation_vk, scancode_to_cgkeycode,
+    };
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -722,9 +1042,6 @@ mod macos {
 
     pub struct Inner {
         source: CGEventSource,
-        // Secondary source used *only* to mirror modifier FlagsChanged
-        // events. See `Inner::new` for why one source isn't enough.
-        source_hid: CGEventSource,
         last_x: f64,
         last_y: f64,
         left_down: bool,
@@ -756,17 +1073,30 @@ mod macos {
         // client that slices a gesture into many small per-event deltas
         // (observed: magnitude ~2-40, not one 120-per-notch value) has
         // nearly every event truncated to zero and the scroll never moves.
-        scroll_v_accum: i32,
-        scroll_h_accum: i32,
+        scroll_v: super::WheelAccumulator,
+        scroll_h: super::WheelAccumulator,
         // Virtual keycodes whose key-down we intercepted as a symbolic
         // hotkey (Cmd+Tab, Cmd+Space, screencapture combos). The matching
         // key-up gets swallowed too so the focused app doesn't see a bare
         // release with no preceding press.
         consumed_keys: HashSet<u16>,
-        // Virtual keycodes currently held that we remapped Ctrl→Cmd on the way
-        // down (--map-ctrl-to-cmd). The matching key-up is posted with the same
-        // Cmd swap + restores the real (Ctrl) modifier state.
-        remapped_keys: HashSet<u16>,
+        // Non-modifier keys posted down and not up yet; released by
+        // `release_all` when a connection ends or starts.
+        held_keys: super::HeldKeys,
+        // (`held_keys` also has the keys held that we remapped Ctrl→Cmd on
+        // the way down, --map-ctrl-to-cmd: the matching key-up is posted with
+        // the same Cmd swap + restores the real (Ctrl) modifier state.)
+        // The client's Num Lock (macOS has none): with it off the keypad
+        // keys post navigation keys, as on Windows.
+        num_lock: NumLock,
+        // Keycode each held client key went down with; its key-up posts the
+        // same one (Num Lock may change in between).
+        posted: PostedKeys,
+        // RDP Unicode key events: surrogate pairs joined, downs counted.
+        unicode: UnicodeKeys,
+        // Tells a focus-in Synchronize (release the keys) from a lock-only
+        // one (keep them).
+        focus_in: FocusIn,
         // Whether the Ctrl→Cmd swap was applied to the CURRENTLY-HELD left
         // button, latched at button-down and reused for the drag and the up.
         // The verdict must not be recomputed per event: the down itself fires
@@ -802,28 +1132,21 @@ mod macos {
             keyboard_layout: Option<&str>,
             klid_handle: Option<super::SharedKeyboardLayout>,
         ) -> Result<Self> {
-            // Two sources because macOS has two independent modifier-state
-            // machines and different consumers read from different ones:
-            //
-            //   CombinedSessionState backs `[NSEvent modifierFlags]` — the
-            //   query Cocoa apps use to decide "is Cmd held right now?" for
-            //   app-level shortcuts (Cmd+C, Cmd+Q, Cmd+~).
-            //
-            //   HIDSystemState backs the HID-level modifier view that the
-            //   WindowServer's *symbolic hotkey* dispatcher (Dock, Spotlight,
-            //   screenshot, Mission Control, Show Desktop) checks before
-            //   firing. Cmd+Tab is the canonical case.
-            //
-            // A flagsChanged event posted from one source does NOT update the
-            // other. So we maintain both: the session source is the canonical
-            // one used for every event, and `source_hid` exists solely to
-            // mirror modifier flagsChanged so symbolic hotkeys also see Cmd
-            // as held. Without the mirror, Cmd+Tab is a no-op; with it, both
-            // classes of shortcut work.
+            // One source for every event, modifier FlagsChanged included.
+            // An earlier design also mirrored each FlagsChanged through a
+            // second, HIDSystemState source, on the belief that a FlagsChanged
+            // from one source does not update the other state table. Measured
+            // on macOS 15.7 (2026-10-21): one FlagsChanged posted at the HID
+            // tap from either source sets BOTH `flagsState(.hidSystemState)`
+            // and `flagsState(.combinedSessionState)`, and a WindowServer
+            // symbolic hotkey (Ctrl+Up, Mission Control) fires with the
+            // session source alone. The mirror only made every app receive
+            // each modifier change twice (Chrome: two keydown / two keyup
+            // events per modifier press). Cmd+Tab, Cmd+Space and the
+            // screenshot combos are handled in `try_symbolic_hotkey` from our
+            // own `mods`, not from the macOS state.
             let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
                 .map_err(|_| anyhow!("CGEventSource::new(CombinedSessionState) failed"))?;
-            let source_hid = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                .map_err(|_| anyhow!("CGEventSource::new(HIDSystemState) failed"))?;
             // Start the workspace-frontmost poller so the global MRU
             // tracks ALL focus changes (Dock clicks, app launches, etc.),
             // not just our Cmd+Tab commits. Idempotent — only one thread
@@ -849,7 +1172,6 @@ mod macos {
             }
             Ok(Self {
                 source,
-                source_hid,
                 last_x: 0.0,
                 last_y: 0.0,
                 left_down: false,
@@ -862,10 +1184,14 @@ mod macos {
                 click_left: None,
                 click_right: None,
                 click_middle: None,
-                scroll_v_accum: 0,
-                scroll_h_accum: 0,
+                scroll_v: super::WheelAccumulator::default(),
+                scroll_h: super::WheelAccumulator::default(),
                 consumed_keys: HashSet::new(),
-                remapped_keys: HashSet::new(),
+                held_keys: super::HeldKeys::default(),
+                num_lock: NumLock::default(),
+                posted: PostedKeys::default(),
+                unicode: UnicodeKeys::default(),
+                focus_in: FocusIn::default(),
                 left_click_remapped: false,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
@@ -922,9 +1248,32 @@ mod macos {
         /// CGEventFlag equivalent on macOS, so we reconcile that one: if our
         /// internal toggle disagrees with the client, flip ours and emit a
         /// FlagsChanged so any focused app's AlphaShift query is correct
-        /// from the first keystroke. (Num/Scroll/Kana Lock are kernel-side
-        /// concepts on Windows that macOS doesn't model.)
+        /// from the first keystroke. Num Lock is kept here (`num_lock`): it
+        /// decides what the keypad keys post. (Scroll/Kana Lock are
+        /// kernel-side concepts on Windows that macOS doesn't model.)
+        ///
+        /// Synchronize also sets every key up (MS-RDPBCGR 2.2.8.1.1.3.1.1.5:
+        /// the client sends key-downs for the keys still down after it). mstsc
+        /// sends it when its window gets the focus back; a key released while
+        /// another window had the focus never sends its key-up, and stayed
+        /// down on the Mac. So on a focus-in the held keys are released, as at
+        /// a connection end. Ported from macrdp-v1 f708d80 / d7a9e68,
+        /// relicensed by the author. guacd also sends Synchronize in the
+        /// middle of typing to change a lock, and does not send the held keys
+        /// again: there the keys stay (`FocusIn` tells the two apart).
+        ///
+        /// Mouse buttons always stay (`Release::buttons`).
         fn synchronize(&mut self, sync: SynchronizeFlags) {
+            let release = self.focus_in.synchronize(monotonic_ms());
+            debug!(flags = ?sync, ?release, "client Synchronize");
+            if release.keys() {
+                self.release_held("synchronize", release);
+            }
+            let want_num = sync.contains(SynchronizeFlags::NUM_LOCK);
+            if want_num != self.num_lock.is_on() {
+                debug!(want = want_num, "syncing Num Lock to client state");
+                self.num_lock.synchronize(want_num);
+            }
             let want_caps = sync.contains(SynchronizeFlags::CAPS_LOCK);
             if want_caps != self.mods.caps_lock {
                 debug!(
@@ -942,18 +1291,22 @@ mod macos {
         /// Both triggers exist because a modifier key-up that never arrived
         /// leaves `mods` asserting a key the user is not holding, and once
         /// clicks carry the modifier flags a stuck Ctrl turns every left click
-        /// into a secondary click. Nothing in the protocol reconciles a held
-        /// modifier (Synchronize carries lock keys only). But the two triggers
+        /// into a secondary click. A focus-in Synchronize from the client also
+        /// releases the keys and modifiers (`synchronize`; not the buttons),
+        /// but only when the client sends one. The two triggers here
         /// clear DIFFERENT amounts, deliberately:
         ///
         ///  * **A new served connection** (`reset_request`, raised by the
         ///    vendored server once at the top of `run_connection` /
         ///    `serve_negotiated` — never on a reactivation, never for a
-        ///    preemption candidate) — clears EVERYTHING, unconditionally:
-        ///    modifiers, the click latch, outstanding remapped key-downs, and
-        ///    any button still down — which is RELEASED (a synthetic Up through
+        ///    preemption candidate) — clears EVERYTHING, unconditionally,
+        ///    through `release_all`: modifiers, non-modifier keys still down,
+        ///    the click latch, outstanding remapped key-downs, and any button
+        ///    still down — which is RELEASED (a synthetic Up through
         ///    `button()`), not merely forgotten, since macOS itself still
-        ///    believes it held. Nothing from the previous connection is live,
+        ///    believes it held. `release_all` normally already ran when the
+        ///    previous connection ended (`connection_ended`), so this second
+        ///    call usually finds nothing. Nothing from the previous connection is live,
         ///    so none of it is worth preserving — and the button release in
         ///    particular fixes a pre-existing hazard: a drop between a left-down
         ///    and its up left `left_down` stuck, so every move on the next
@@ -988,57 +1341,137 @@ mod macos {
             let reconnected = self
                 .reset_request
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
-            if !(idled || reconnected) {
+            if reconnected {
+                self.release_all("new connection");
+                return;
+            }
+            if !idled {
                 return;
             }
 
-            if reconnected {
-                // Connection edge: release any button macOS still believes is
-                // held — we posted the Down, the connection died before the Up.
-                // Go through `button()` so the Up carries the same (latched)
-                // flags the Down did and the click bookkeeping stays paired,
-                // and do it BEFORE clearing modifiers so the pair can't
-                // disagree. This also zeroes `left_down`/`right_down`/
-                // `middle_down`, so the next move posts as MouseMoved, not a
-                // phantom `LeftMouseDragged`.
-                if self.left_down {
-                    self.button(CGMouseButton::Left, false);
-                }
-                if self.right_down {
-                    self.button(CGMouseButton::Right, false);
-                }
-                if self.middle_down {
-                    self.button(CGMouseButton::Center, false);
-                }
-            }
-
-            // Snapshot first so the log shows WHAT was stuck.
+            // Idle gap: modifiers only (see the doc). Snapshot first so the
+            // log shows WHAT was stuck. Only bother macOS when a modifier was
+            // actually released: our earlier FlagsChanged left the session
+            // state asserting it, and macOS derives press-vs-release from the
+            // flags diff, so one event carrying the now-empty set releases all
+            // of them.
             let stuck = self.mods.cg_flags().bits();
-            let had_mods = self.mods.clear_non_lock();
-
-            if reconnected {
-                // Drop the remaining per-gesture state regardless of whether a
-                // modifier was held (see the doc): an outstanding remapped
-                // key-down or a latch left by a Down whose Up never came.
-                self.remapped_keys.clear();
-                self.left_click_remapped = false;
-            }
-
-            // Only bother macOS when a modifier was actually released: our
-            // earlier FlagsChanged left the session state asserting it, and
-            // macOS derives press-vs-release from the flags diff, so one event
-            // carrying the now-empty set releases all of them.
-            if had_mods {
+            if self.mods.clear_non_lock() {
                 debug!(
-                    reason = if reconnected {
-                        "new connection"
-                    } else {
-                        "idle gap"
-                    },
+                    reason = "idle gap",
                     stuck_flags = format!("0x{stuck:08X}"),
                     "clearing stale held modifiers"
                 );
                 self.post_flags_changed(VK_LCMD);
+            }
+        }
+
+        /// Release everything a connection may have left pressed on the Mac
+        /// (`synchronize` uses the same path for the keys only):
+        /// mouse buttons, non-modifier keys, remapped Ctrl->Cmd keys and held
+        /// modifiers (Caps Lock, a toggle, stays). Runs when a connection ends
+        /// (`MacInputHandler::connection_ended`, called by the vendored server
+        /// after each served connection, divergence 27) and again on the first
+        /// input of a new connection (`reset_request`), which then finds
+        /// nothing left unless input came in between. Nothing from the
+        /// previous connection is live, so none of it is worth keeping.
+        ///
+        /// Order is the order of a user letting go: buttons, then keys with
+        /// the modifier flags still set, then the modifiers.
+        pub fn release_all(&mut self, why: &'static str) {
+            self.release_held(why, Release::All);
+        }
+
+        /// `release_all`, with the mouse buttons only when `release` says so
+        /// (see `synchronize` for why it keeps them).
+        fn release_held(&mut self, why: &'static str, release: Release) {
+            let buttons = release.buttons();
+            // A button macOS still believes is held: we posted the Down, the
+            // connection died before the Up. Go through `button()` so the Up
+            // carries the same (latched) flags the Down did and the click
+            // bookkeeping stays paired. This also zeroes `left_down` etc., so
+            // the next move posts as MouseMoved, not a phantom
+            // `LeftMouseDragged`. An interrupted drag completes as a drop at
+            // the last cursor position (docs/known-quirks.md).
+            // Also forgets the focus-in state at a connection edge: a Tab up of
+            // the old connection must not make the first Synchronize of the
+            // next one a focus-in.
+            let to_release = release.apply(
+                &mut self.focus_in,
+                [self.left_down, self.right_down, self.middle_down],
+            );
+            let mut released_buttons = 0;
+            for (go, button) in to_release.into_iter().zip([
+                CGMouseButton::Left,
+                CGMouseButton::Right,
+                CGMouseButton::Center,
+            ]) {
+                if go {
+                    self.button(button, false);
+                    released_buttons += 1;
+                }
+            }
+            // Keys whose key-up never came. Posted with the current modifier
+            // flags, before the modifiers go up, as a real keyboard would.
+            let keys = self.held_keys.take_all();
+            let flags = self.mods.cg_flags();
+            for &vk in &keys {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, false) {
+                    let mut f = flags;
+                    if is_numeric_pad_vk(vk) {
+                        f |= CGEventFlags::CGEventFlagNumericPad;
+                    }
+                    ev.set_flags(f);
+                    ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!(vk, "CGEvent::new_keyboard_event failed (release)");
+                }
+            }
+            // A Unicode key-down (keycode 0) whose up never came.
+            let unicode_down = self.unicode.take_down();
+            if unicode_down {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, false) {
+                    ev.set_flags(flags);
+                    ev.post(CGEventTapLocation::HID);
+                }
+            }
+            // Remapped Ctrl->Cmd keys: the down went out as Cmd+key, so the
+            // up does too (`post_ctrl_as_cmd` also restores the real flags).
+            let remapped = self.held_keys.take_remapped();
+            for &vk in &remapped {
+                self.post_ctrl_as_cmd(vk, false);
+            }
+            // Swallowed hotkey downs: nothing was posted, so nothing to release.
+            self.consumed_keys.clear();
+            // A posted Num Lock press was in `keys`; the state stays.
+            self.num_lock.forget_key();
+            self.posted.clear();
+            if buttons {
+                // The latch belongs to a held left button.
+                self.left_click_remapped = false;
+            }
+
+            let stuck = self.mods.cg_flags().bits();
+            let had_mods = self.mods.clear_non_lock();
+            if had_mods {
+                self.post_flags_changed(VK_LCMD);
+            }
+
+            if released_buttons > 0
+                || !keys.is_empty()
+                || !remapped.is_empty()
+                || had_mods
+                || unicode_down
+            {
+                tracing::info!(
+                    why,
+                    keycodes = ?keys,
+                    unicode_down,
+                    remapped = ?remapped,
+                    modifier_flags = format!("0x{stuck:08X}"),
+                    buttons = released_buttons,
+                    "released held input"
+                );
             }
         }
 
@@ -1080,14 +1513,36 @@ mod macos {
         }
 
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
-            let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
+            self.focus_in
+                .note_key(scancode, extended, down, monotonic_ms());
+            self.num_lock.note_scancode(scancode, extended, down);
+            if scancode == SCANCODE_NUM_LOCK && !extended && !self.num_lock.key(down) {
+                trace!(
+                    down,
+                    "scancode 0x45 not posted (Pause, or a release without a posted press)"
+                );
+                return;
+            }
+            // With Num Lock off the keypad keys move the cursor, as on
+            // Windows (the client sends the same scancode either way).
+            let keypad_nav = if !extended && !self.num_lock.is_on() {
+                keypad_navigation_vk(scancode)
+            } else {
+                None
+            };
+            let Some(vk) = keypad_nav.or_else(|| scancode_to_cgkeycode(scancode, extended)) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };
+            let vk = if super::CTRL_AS_CMD.load(std::sync::atomic::Ordering::Relaxed) {
+                ctrl_as_cmd_vk(vk)
+            } else {
+                vk
+            };
+            let vk = self.posted.vk_for((scancode, extended), down, vk);
             self.refresh_auto_layout();
 
-            // Modifier path: update per-side state and emit FlagsChanged
-            // mirrored to both sources. We do this BEFORE any of the
+            // Modifier path: update per-side state and emit one FlagsChanged. We do this BEFORE any of the
             // symbolic-hotkey logic so the held-modifier check in
             // try_symbolic_hotkey sees the just-pressed modifier.
             if ModifierState::is_modifier_vk(vk) {
@@ -1146,13 +1601,14 @@ mod macos {
                 "key post"
             );
 
-            // Symbolic-hotkey interception: WindowServer's internal hotkey
-            // dispatcher (which fires Cmd+Tab, Cmd+Space, Cmd+Shift+3/4/5,
-            // Mission Control, etc.) only triggers on kernel-injected HID
-            // events — user-space CGEventPost cannot wake it, regardless of
-            // source state or tap location. For the common combos we
-            // re-implement the action in user space and swallow the
-            // keystroke. Triggers on key-down; the matching key-up is
+            // Symbolic-hotkey interception. The commit that added it
+            // (1648380) found that WindowServer's hotkey dispatcher does not
+            // fire Cmd+Tab, Cmd+Space or the screenshot combos from a
+            // CGEventPost keystroke (not re-tested since). Not every symbolic
+            // hotkey is like that: Ctrl+Up (Mission Control) fired from one
+            // session-source post on macOS 15.7.9 (2026-10-21, see
+            // `Inner::new`). For the combos below we re-implement the action
+            // in user space and swallow the keystroke. Triggers on key-down; the matching key-up is
             // tracked in `consumed_keys` so the bare key-up doesn't reach
             // the focused app either.
             if down && self.try_symbolic_hotkey(vk) {
@@ -1171,7 +1627,7 @@ mod macos {
             // when a terminal / excluded app is frontmost so Ctrl+C stays SIGINT.
             // Checked before the layout branch so a remapped key-up isn't swallowed
             // there.
-            if !down && self.remapped_keys.remove(&vk) {
+            if !down && self.held_keys.remapped_up(vk) {
                 self.post_ctrl_as_cmd(vk, false);
                 return;
             }
@@ -1184,7 +1640,7 @@ mod macos {
                 && !frontmost_is_excluded()
             {
                 self.post_ctrl_as_cmd(vk, true);
-                self.remapped_keys.insert(vk);
+                self.held_keys.note_remapped_down(vk);
                 return;
             }
 
@@ -1239,35 +1695,25 @@ mod macos {
             }
             ev.set_flags(flags);
             ev.post(CGEventTapLocation::HID);
+            self.held_keys.note(vk, down);
         }
 
-        /// Emit a FlagsChanged event for `vk` from both sources. We send
-        /// the same event twice so two different parts of macOS see the
-        /// modifier as held:
-        ///   - CombinedSessionState backs `[NSEvent modifierFlags]` —
-        ///     what Cocoa apps query for Cmd+C / Cmd+Q / Cmd+~.
-        ///   - HIDSystemState backs the modifier view that WindowServer's
-        ///     symbolic-hotkey dispatcher (Dock, Spotlight, screencapture,
-        ///     Mission Control, Show Desktop) checks before firing.
-        ///
-        /// A FlagsChanged posted from one source does NOT update the other,
-        /// so without the mirror you get either app shortcuts or symbolic
-        /// hotkeys but not both.
+        /// Emit one FlagsChanged event for `vk` carrying the current
+        /// modifier state. One event updates both the session and the HID
+        /// modifier state (see `Inner::new`); a second, mirrored event reached
+        /// apps as a second keydown/keyup of the modifier.
         fn post_flags_changed(&self, vk: u16) {
-            let flags = self.mods.cg_flags();
-            for source in [&self.source, &self.source_hid] {
-                // `down` parameter is ignored for FlagsChanged: macOS
-                // derives press-vs-release purely from the diff between
-                // the prior flags state and the new flags carried on the
-                // event. We pass `true` for shape only.
-                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), vk, true) else {
-                    warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
-                    continue;
-                };
-                ev.set_flags(flags);
-                ev.set_type(CGEventType::FlagsChanged);
-                ev.post(CGEventTapLocation::HID);
-            }
+            // `down` parameter is ignored for FlagsChanged: macOS derives
+            // press-vs-release purely from the diff between the prior flags
+            // state and the new flags carried on the event. We pass `true`
+            // for shape only.
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, true) else {
+                warn!(vk, "CGEvent::new_keyboard_event failed (modifier)");
+                return;
+            };
+            ev.set_flags(self.mods.cg_flags());
+            ev.set_type(CGEventType::FlagsChanged);
+            ev.post(CGEventTapLocation::HID);
         }
 
         /// Swap Control→Command in both the public CGEventFlag bits and the
@@ -1329,14 +1775,12 @@ mod macos {
             let swapped = self.ctrl_to_cmd_flags();
 
             if down {
-                for source in [&self.source, &self.source_hid] {
-                    let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), VK_LCMD, true) else {
-                        warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
-                        continue;
-                    };
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), VK_LCMD, true) {
                     ev.set_flags(swapped);
                     ev.set_type(CGEventType::FlagsChanged);
                     ev.post(CGEventTapLocation::HID);
+                } else {
+                    warn!("CGEvent::new_keyboard_event failed (ctrl→cmd flags)");
                 }
             }
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), vk, down) {
@@ -1509,17 +1953,22 @@ mod macos {
             }
         }
 
-        fn unicode(&self, c: u16, down: bool) {
-            // For unicode, send a "null" keycode and set the string. Only fire
-            // on key-down — Mac doesn't have a release-side for typed text.
-            if !down {
-                return;
-            }
-            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, true) else {
+        /// RDP Unicode key event (one UTF-16 unit): a key-down and a key-up
+        /// with keycode 0 carrying the character. A surrogate pair (emoji)
+        /// is joined into one character; a lone unit of a pair was not valid
+        /// text and got lost. The key-up pairs the down, as a real key does.
+        fn unicode(&mut self, c: u16, down: bool) {
+            self.focus_in.note_unicode(down);
+            let (down, text) = match self.unicode.feed(c, down) {
+                UnicodeAction::Down(text) => (true, text),
+                UnicodeAction::Up(text) => (false, text),
+                UnicodeAction::None => return,
+            };
+            let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), 0, down) else {
                 warn!("unicode CGEvent create failed");
                 return;
             };
-            ev.set_string_from_utf16_unchecked(&[c]);
+            ev.set_string_from_utf16_unchecked(&text);
             ev.post(CGEventTapLocation::HID);
         }
 
@@ -1540,8 +1989,14 @@ mod macos {
                 MouseEvent::RightReleased => self.button(CGMouseButton::Right, false),
                 MouseEvent::MiddlePressed => self.button(CGMouseButton::Center, true),
                 MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
-                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
-                MouseEvent::Scroll { x, y } => self.scroll(y, x),
+                // Wheel: routed to its axis and scaled by `wheel_units`.
+                MouseEvent::VerticalScroll { .. }
+                | MouseEvent::HorizontalScroll { .. }
+                | MouseEvent::Scroll { .. } => {
+                    if let Some((v, h)) = super::wheel_units(&event) {
+                        self.scroll(v, h);
+                    }
+                }
                 MouseEvent::Button4Pressed
                 | MouseEvent::Button4Released
                 | MouseEvent::Button5Pressed
@@ -1717,28 +2172,29 @@ mod macos {
             }
         }
 
-        fn scroll(&mut self, vertical: i32, horizontal: i32) {
-            // RDP wheel rotation units are 120 per "tick", but this client
-            // slices a single gesture into many small legacy MOUSE PDU
-            // events (observed raw magnitude ~2-40 per event, not one
-            // 120-per-notch value). A flat `delta / SCALE` per event
-            // truncates almost every one of those to zero — scroll never
-            // moves at all. Accumulate the raw delta across calls instead,
-            // and only emit whole lines once the running total crosses
-            // SCALE, carrying the remainder forward so no motion is lost.
-            const SCALE: i32 = 60;
-            self.scroll_v_accum += vertical;
-            self.scroll_h_accum += horizontal;
-            let v = (self.scroll_v_accum / SCALE).clamp(-5, 5);
-            let h = (self.scroll_h_accum / SCALE).clamp(-5, 5);
-            self.scroll_v_accum -= v * SCALE;
-            self.scroll_h_accum -= h * SCALE;
+        /// `vertical` / `horizontal`: wheel rotation units in 16.16 fixed
+        /// point (see `WHEEL_FIXED_ONE`).
+        fn scroll(&mut self, vertical: i64, horizontal: i64) {
+            // RDP wheel rotation units are 120 per notch (WHEEL_DELTA); one
+            // notch scrolls 3 lines, as on Windows. Clients with a
+            // high-resolution wheel or a touchpad send smaller deltas (seen:
+            // ~2-40 per event); `WheelAccumulator` keeps the rest per axis so
+            // they add up instead of being truncated to zero.
+            let v = self.scroll_v.lines(vertical);
+            let h = self.scroll_h.lines(horizontal);
+            trace!(vertical, horizontal, v, h, "wheel");
             if v == 0 && h == 0 {
                 return;
             }
-            let Ok(ev) =
-                CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::LINE, 2, v, h, 0)
-            else {
+            let (wheel1, wheel2) = super::wheel_counts(v, h);
+            let Ok(ev) = CGEvent::new_scroll_event(
+                self.source.clone(),
+                ScrollEventUnit::LINE,
+                2,
+                wheel1,
+                wheel2,
+                0,
+            ) else {
                 return;
             };
             // Carry the held modifiers so Shift+scroll (horizontal in most apps)

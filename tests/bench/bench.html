@@ -1,0 +1,121 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bench</title>
+<style>
+html,body{margin:0;padding:0;overflow:hidden;background:#444;cursor:none}
+canvas{display:block}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Modes (location.hash): latency | motion | scroll | static
+const mode = (location.hash || '#static').slice(1);
+const W = 1280, H = 720;
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const g = cv.getContext('2d');
+
+// Gray-code counter strip: 12 blocks of 40x40 at top-right, y=40..80
+const BITS = 12, BS = 40, CX = W - BITS * BS - 20, CY = 40;
+function drawCounter(n) {
+  const gray = n ^ (n >> 1);
+  g.fillStyle = '#808080';
+  g.fillRect(CX - 10, CY - 10, BITS * BS + 20, BS + 20);
+  for (let i = 0; i < BITS; i++) {
+    g.fillStyle = (gray >> (BITS - 1 - i)) & 1 ? '#fff' : '#000';
+    g.fillRect(CX + i * BS, CY, BS, BS);
+  }
+}
+
+// Deterministic PRNG
+let seed = 12345;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+// Pre-rendered "photo-like" texture: smooth gradients + noise
+function makeTexture(w, h) {
+  const t = document.createElement('canvas'); t.width = w; t.height = h;
+  const tg = t.getContext('2d');
+  const grd = tg.createLinearGradient(0, 0, w, h);
+  grd.addColorStop(0, '#1d4e89'); grd.addColorStop(0.5, '#e07a5f'); grd.addColorStop(1, '#3d9970');
+  tg.fillStyle = grd; tg.fillRect(0, 0, w, h);
+  for (let i = 0; i < 300; i++) {
+    const x = rnd() * w, y = rnd() * h, r = 5 + rnd() * 60;
+    const rg = tg.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, `hsla(${rnd() * 360},70%,60%,0.8)`); rg.addColorStop(1, 'hsla(0,0%,0%,0)');
+    tg.fillStyle = rg; tg.fillRect(x - r, y - r, 2 * r, 2 * r);
+  }
+  const id = tg.getImageData(0, 0, w, h);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const n = (rnd() - 0.5) * 24;
+    id.data[i] += n; id.data[i + 1] += n; id.data[i + 2] += n;
+  }
+  tg.putImageData(id, 0, 0);
+  return t;
+}
+
+const LOREM = 'The quick brown fox jumps over the lazy dog. 0123456789 Pack my box with five dozen liquor jugs. ';
+function drawText(y0, size, color, bg) {
+  g.fillStyle = bg; g.fillRect(0, y0, W, size * 1.6);
+  g.fillStyle = color; g.font = `${size}px -apple-system, Helvetica, sans-serif`;
+  g.fillText(LOREM + LOREM, 10, y0 + size * 1.2);
+}
+
+let n = 0;
+if (mode === 'latency' || mode === 'latencysmall') {
+  // Patch toggles black/white on each keydown / mousedown.
+  // latency: 200x200 at (100,200). latencysmall: 12x18 (one typed char) at (194,291).
+  let on = false;
+  g.fillStyle = '#444'; g.fillRect(0, 0, W, H);
+  const pr = mode === 'latency' ? [100, 200, 200, 200] : [194, 291, 12, 18];
+  const paint = () => { g.fillStyle = on ? '#fff' : '#000'; g.fillRect(...pr); };
+  paint();
+  const flip = (e) => { e.preventDefault(); on = !on; paint(); };
+  addEventListener('keydown', flip);
+  addEventListener('mousedown', flip);
+} else if (mode === 'motion') {
+  // Full-screen "video-like" content: panning photo texture + moving blobs
+  const tex = makeTexture(W * 2, H);
+  const balls = Array.from({length: 40}, () => ({x: rnd() * W, y: rnd() * H, vx: (rnd() - .5) * 12, vy: (rnd() - .5) * 12, r: 20 + rnd() * 50, c: `hsl(${rnd() * 360},80%,55%)`}));
+  function frame() {
+    const off = (n * 4) % W;
+    g.drawImage(tex, off, 0, W, H, 0, 0, W, H);
+    for (const b of balls) {
+      b.x += b.vx; b.y += b.vy;
+      if (b.x < 0 || b.x > W) b.vx = -b.vx;
+      if (b.y < 0 || b.y > H) b.vy = -b.vy;
+      g.fillStyle = b.c; g.beginPath(); g.arc(b.x, b.y, b.r, 0, 7); g.fill();
+    }
+    drawCounter(n++);
+    requestAnimationFrame(frame);
+  }
+  frame();
+} else if (mode === 'scroll') {
+  // Office-like: text document scrolling up 3 px per frame
+  const doc = document.createElement('canvas'); doc.width = W; doc.height = H * 4;
+  const dg = doc.getContext('2d');
+  dg.fillStyle = '#fff'; dg.fillRect(0, 0, W, doc.height);
+  dg.fillStyle = '#222'; dg.font = '15px -apple-system, Helvetica, sans-serif';
+  for (let y = 20, i = 0; y < doc.height; y += 22, i++) {
+    if (i % 12 === 0) { dg.font = 'bold 20px -apple-system, Helvetica'; dg.fillText('Section ' + (i / 12 + 1), 40, y); dg.font = '15px -apple-system, Helvetica, sans-serif'; continue; }
+    dg.fillText(LOREM.slice(i % 20) + LOREM, 40, y);
+  }
+  function frame() {
+    const off = (n * 3) % (doc.height - H);
+    g.drawImage(doc, 0, off, W, H, 0, 0, W, H);
+    drawCounter(n++);
+    requestAnimationFrame(frame);
+  }
+  frame();
+} else {
+  // static: quality reference
+  const tex = makeTexture(W, 360);
+  g.drawImage(tex, 0, 0);
+  const rows = [[11, '#000', '#fff'], [13, '#333', '#fff'], [15, '#fff', '#000'], [12, '#d00', '#fff'], [14, '#00c', '#ff0'],
+                [16, '#0a0', '#fff'], [12, '#fff', '#2050c0'], [18, '#000', '#eee'], [10, '#555', '#fff'], [13, '#f0f', '#0f0']];
+  let y = 360;
+  for (const [s, c, b] of rows) { drawText(y, s, c, b); y += s * 1.6; }
+  g.fillStyle = '#fff'; g.fillRect(0, y, W, H - y);
+  for (let i = 0; i < 64; i++) { g.fillStyle = `hsl(${i * 360 / 64},100%,50%)`; g.fillRect(i * 20, y + 5, 20, 30); }
+  for (let i = 0; i < 64; i++) { g.fillStyle = (i % 2) ? '#000' : '#fff'; g.fillRect(i * 20, y + 40, 1 + (i % 4), 30); }
+}
+</script>
+</body></html>

@@ -191,3 +191,33 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     upstreamable later. Heuristics: mstsc sends the real Windows build (e.g.
     22621) + its hostname; FreeRDP hardcodes build 2600. Informational
     fingerprinting only — a client can claim anything.
+
+(30) `earlyCapabilityFlags` of the Client Core Data on `AcceptorResult`
+    (NOT upstreamed; added 2026-10-21; numbered (30) to match the server
+    divergence it serves). `Acceptor` keeps `client_early_capability_flags`
+    (empty until the MCS Connect Initial, carried across
+    `new_deactivation_reactivation`) and `AcceptorResult` exposes it. The
+    server uses `SUPPORT_HEART_BEAT_PDU` to decide whether the client gets
+    Heartbeat PDUs (server divergence (30)). Upstream has the same field
+    (`client_early_capability_flags`) after a5d1c682; drop on a pin bump.
+
+(31) Client Info PDU flags on `AcceptorResult` (NOT upstreamed; added
+    2026-10-21). `Acceptor` keeps `client_info_flags` (from the Client Info PDU
+    in `SecureSettingsExchange`, carried across `new_deactivation_reactivation`)
+    and `AcceptorResult` exposes it. The server uses the audio-mode flags
+    (server divergence (31)). Ported from macrdp-v1's IronRDP fork
+    (rophy/IronRDP 6ead8214), relicensed by the author.
+
+(There is no acceptor (32): server divergence (32), `ServerEvent::Disconnect`,
+    needs no acceptor change.)
+
+(33) STATUS_LOGON_FAILURE for a failed NLA logon (UPSTREAMED as
+    Devolutions/IronRDP#2138, commit cddbe5f7, after the a5d1c682 pin; added
+    here 2026-10-21, same code). `CredsspSequence::handle_process_result` sets
+    `TsRequest.errorCode` to STATUS_LOGON_FAILURE (0xC000006D) when sspi
+    reports `LogonDenied` (wrong password or unknown user; sspi 0.21.3 gives
+    that kind: `ntlm/messages/server/complete_authenticate.rs` "no candidate
+    credential matched", `credssp/mod.rs` user lookup). Before, the client got
+    the code sspi builds from the SSPI error (not an NTSTATUS value), and mstsc
+    showed error 0x904 instead of asking for the password again. Other errors
+    keep the sspi code. Drop on a pin bump past cddbe5f7.

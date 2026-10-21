@@ -485,6 +485,10 @@ async fn capture_loop(
     // roughly `--aac-bitrate` (~128). The clearest in-log proof `--enable-aac`
     // is doing what it claims.
     let mut bytes_emitted: u64 = 0;
+    // Resampled chunks not sent because they were digital silence (see
+    // `SilenceGate`), per rate-log window.
+    let mut silent_skipped: u64 = 0;
+    let mut silence_gate = SilenceGate::default();
 
     'reconnect: loop {
         if generation.load(Ordering::SeqCst) != my_gen {
@@ -635,6 +639,7 @@ async fn capture_loop(
                     avg_wave_samples,
                     avg_wave_ms,
                     wire_kbps,
+                    silent_skipped,
                     codec = if use_aac { "aac" } else { "pcm" },
                     model_wave_ms = 1024.0 / 48.0,
                     "audio capture rates"
@@ -643,6 +648,7 @@ async fn capture_loop(
                 output_samples = 0;
                 waves_emitted = 0;
                 bytes_emitted = 0;
+                silent_skipped = 0;
                 last_rate_log = std::time::Instant::now();
             }
 
@@ -695,6 +701,29 @@ async fn capture_loop(
                 let pcm = planar_f32_to_interleaved_i16(&resampled);
                 if pcm.is_empty() {
                     continue;
+                }
+
+                // SCK delivers buffers even when nothing plays. Sending digital
+                // silence as PCM costs ~1.4 Mbps and keeps the link busy (the
+                // Wi-Fi keep-awake then never runs), so skip it. The resampler
+                // still sees every input chunk, so the sound that follows has no
+                // seam; its timestamp is wall-clock time, and the client plays
+                // it as soon as it arrives (its queue ran empty in the gap).
+                // Ported from macrdp-v1 2e842a7, relicensed by the author.
+                // The first `SILENCE_TAIL_CHUNKS` silent chunks after a sound
+                // still go out (see there).
+                match silence_gate.decide(is_silent(&pcm)) {
+                    GateDecision::Send => {}
+                    GateDecision::Resume => debug!("audio: sound again, waves resumed"),
+                    GateDecision::Pause => {
+                        debug!("audio: digital silence, waves paused");
+                        silent_skipped += 1;
+                        continue;
+                    }
+                    GateDecision::Skip => {
+                        silent_skipped += 1;
+                        continue;
+                    }
                 }
 
                 // The wave(s) to ship for this resampled chunk. PCM emits exactly
@@ -862,6 +891,81 @@ fn planar_f32_to_interleaved_i16(planar: &[Vec<f32>]) -> Vec<u8> {
     out
 }
 
+/// Silent chunks (21.3 ms each: 1024 frames in at 48 kHz) still sent after a
+/// sound ends, before the waves pause (~171 ms). Without them the client's
+/// queue runs empty right after the last sound: FreeRDP 3.30 (ALSA) then cut
+/// the end of the sound at a non-zero sample, a click, in 6 of 20 tries (0 of
+/// 12 with 8 chunks; 2026-10-21, 3 s tone recorded at the client). Costs
+/// ~30 KB per sound end.
+#[cfg(any(target_os = "macos", test))]
+const SILENCE_TAIL_CHUNKS: u32 = 8;
+
+/// What `SilenceGate::decide` does with one resampled chunk.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateDecision {
+    /// Send it.
+    Send,
+    /// Send it: the first sound after a pause.
+    Resume,
+    /// Do not send it: the first chunk of a pause.
+    Pause,
+    /// Do not send it: the pause goes on.
+    Skip,
+}
+
+/// Decides which resampled chunks go to the client: digital silence is not
+/// sent, except the first `SILENCE_TAIL_CHUNKS` silent chunks after a sound.
+/// No tail at the stream start (the run starts as "long silent").
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct SilenceGate {
+    /// Silent chunks in a row.
+    run: u32,
+    /// The last chunk was not sent.
+    paused: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Default for SilenceGate {
+    fn default() -> Self {
+        Self {
+            run: SILENCE_TAIL_CHUNKS,
+            paused: false,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl SilenceGate {
+    fn decide(&mut self, silent: bool) -> GateDecision {
+        if !silent {
+            self.run = 0;
+            return if std::mem::replace(&mut self.paused, false) {
+                GateDecision::Resume
+            } else {
+                GateDecision::Send
+            };
+        }
+        self.run = self.run.saturating_add(1);
+        if self.run <= SILENCE_TAIL_CHUNKS {
+            return GateDecision::Send;
+        }
+        if std::mem::replace(&mut self.paused, true) {
+            GateDecision::Skip
+        } else {
+            GateDecision::Pause
+        }
+    }
+}
+
+/// True when every S16LE sample in the chunk is zero.
+/// Ported from macrdp-v1 2e842a7, relicensed by the author.
+#[cfg(any(target_os = "macos", test))]
+fn is_silent(wave_data: &[u8]) -> bool {
+    wave_data.iter().all(|&b| b == 0)
+}
+
 #[cfg(target_os = "macos")]
 fn float_to_i16(v: f32) -> i16 {
     let clamped = v.clamp(-1.0, 1.0);
@@ -871,6 +975,65 @@ fn float_to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_chunk_detected() {
+        assert!(is_silent(&[0u8; 8]));
+        assert!(!is_silent(&[0, 0, 1, 0]));
+        // One non-zero sample at the very end.
+        let mut last = vec![0u8; 4096];
+        *last.last_mut().unwrap() = 0x80;
+        assert!(!is_silent(&last));
+        // +1 / -1 LSB (dither level) is sound, not silence.
+        assert!(!is_silent(&[1, 0, 0xFF, 0xFF]));
+    }
+
+    fn sends(d: GateDecision) -> bool {
+        matches!(d, GateDecision::Send | GateDecision::Resume)
+    }
+
+    /// Silence before any sound sends nothing (no tail at the stream start).
+    #[test]
+    fn silence_gate_sends_nothing_before_the_first_sound() {
+        let mut g = SilenceGate::default();
+        assert_eq!(g.decide(true), GateDecision::Pause);
+        for _ in 0..100 {
+            assert_eq!(g.decide(true), GateDecision::Skip);
+        }
+        assert_eq!(g.decide(false), GateDecision::Resume);
+    }
+
+    /// Sound, then silence: exactly `SILENCE_TAIL_CHUNKS` silent chunks go
+    /// out, then none, also after a long silence; sound again resumes.
+    #[test]
+    fn silence_gate_sends_the_tail_then_stops() {
+        let mut g = SilenceGate::default();
+        assert_eq!(g.decide(false), GateDecision::Send);
+        assert_eq!(g.decide(false), GateDecision::Send);
+        let tail: Vec<_> = (0..SILENCE_TAIL_CHUNKS).map(|_| g.decide(true)).collect();
+        assert_eq!(tail, vec![GateDecision::Send; SILENCE_TAIL_CHUNKS as usize]);
+        assert_eq!(g.decide(true), GateDecision::Pause);
+        let sent = (0..10_000).filter(|_| sends(g.decide(true))).count();
+        assert_eq!(sent, 0, "a long silence after the tail stays at zero");
+        assert_eq!(g.decide(false), GateDecision::Resume);
+        assert_eq!(g.decide(false), GateDecision::Send);
+    }
+
+    /// Sound during the tail starts a new full tail after it.
+    #[test]
+    fn silence_gate_sound_during_the_tail_resets_it() {
+        let mut g = SilenceGate::default();
+        assert_eq!(g.decide(false), GateDecision::Send);
+        for _ in 0..SILENCE_TAIL_CHUNKS - 1 {
+            assert_eq!(g.decide(true), GateDecision::Send);
+        }
+        assert_eq!(g.decide(false), GateDecision::Send, "no pause happened");
+        let sent = (0..SILENCE_TAIL_CHUNKS * 3)
+            .map(|_| g.decide(true))
+            .take_while(|d| sends(*d))
+            .count();
+        assert_eq!(sent, SILENCE_TAIL_CHUNKS as usize);
+    }
 
     #[test]
     fn server_formats_prefer_aac_ahead_of_pcm() {

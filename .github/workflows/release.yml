@@ -122,43 +122,89 @@ jobs:
           set -euo pipefail
           cargo build --release --locked --target "${{ matrix.target }}"
 
-      - name: Ad-hoc codesign
-        # Without any signature the OS treats every rebuilt binary as a new
-        # identity and the user has to re-grant Screen Recording / Accessibility
-        # on every download. Ad-hoc (-s -) at least gives it a stable hash.
-        # For production: replace with Developer ID + notarytool.
+      - name: Signing mode
+        # Developer ID signing needs the certificate secrets; notarization also needs the App
+        # Store Connect API key secrets (same secret names as macrdp-v1). Without them the
+        # build stays ad-hoc signed, as before. The secrets go to steps only through env.
         shell: bash
+        env:
+          MACOS_P12_BASE64: ${{ secrets.MACOS_P12_BASE64 }}
+          MACOS_P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          devid=false notarize=false
+          if [[ -n "$MACOS_P12_BASE64" && -n "$MACOS_P12_PASSWORD" && -n "$MACOS_CODESIGN_IDENTITY" ]]; then
+            devid=true
+            if [[ -n "$MACOS_NOTARY_KEY_P8" && -n "$MACOS_NOTARY_KEY_ID" && -n "$MACOS_NOTARY_ISSUER_ID" ]]; then
+              notarize=true
+            else
+              echo "::warning::MACOS_NOTARY_* secrets not set: Developer ID signed, not notarized"
+            fi
+          else
+            echo "::notice::MACOS_P12_* / MACOS_CODESIGN_IDENTITY secrets not set: ad-hoc signing"
+          fi
+          echo "DEVID=$devid" >> "$GITHUB_ENV"
+          echo "NOTARIZE=$notarize" >> "$GITHUB_ENV"
+
+      - name: Import signing certificate
+        if: env.DEVID == 'true'
+        shell: bash
+        env:
+          MACOS_P12_BASE64: ${{ secrets.MACOS_P12_BASE64 }}
+          MACOS_P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass=$(openssl rand -hex 16)
+          base64 --decode <<<"$MACOS_P12_BASE64" > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$kc_pass" "$keychain" >/dev/null
+          existing=()
+          while IFS= read -r k; do existing+=("$k"); done \
+            < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Codesign
+        # Without any signature the OS treats every rebuilt binary as a new identity and the
+        # user has to re-grant Screen Recording / Accessibility on every download. A Developer
+        # ID signature (fixed identifier + team) keeps the grants across upgrades; ad-hoc
+        # (-s -) at least gives a stable hash for one build.
+        shell: bash
+        env:
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release/macrdp"
-          codesign -s - --force --options runtime --timestamp=none "$BIN"
-          codesign -dv "$BIN"
-
-      - name: Stage artifact
-        id: stage
-        shell: bash
-        # VERSION comes from a tag name / dispatch input; pass it via env (never
-        # inline in the script) so a maliciously-named tag can't inject shell.
-        env:
-          VERSION: ${{ inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          NAME="macrdp-${VERSION}-${{ matrix.target }}"
-          mkdir -p "dist/${NAME}"
-          cp "target/${{ matrix.target }}/release/macrdp" "dist/${NAME}/"
-          cp LICENSE* README.md "dist/${NAME}/" 2>/dev/null || true
-          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
-          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
-          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          if [[ "$DEVID" == true ]]; then
+            codesign --force --options runtime --timestamp \
+              --identifier com.clintcan.macrdp \
+              --keychain "$KEYCHAIN" --sign "$MACOS_CODESIGN_IDENTITY" "$BIN"
+            codesign --verify --strict --verbose=2 "$BIN"
+            info=$(codesign -dvv "$BIN" 2>&1)
+            echo "$info"
+            grep -q '^Identifier=com.clintcan.macrdp$' <<<"$info"
+            grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<<"$info"
+            grep -q 'flags=.*runtime' <<<"$info"
+          else
+            codesign -s - --force --options runtime --timestamp=none "$BIN"
+            codesign -dv "$BIN"
+          fi
 
       # The .app bundle: the bare binary plus the embedded smart-card IFD handler
       # (ifd-macrdp.bundle) and its installer — i.e. the only release artifact that
-      # carries everything --enable-smartcard-redirection needs. Ad-hoc signed (no
-      # Developer ID / notarization in CI), so end users get a Gatekeeper "can't
-      # verify developer" prompt and open it via right-click -> Open; a notarized
-      # build needs a local `make-app.sh` with a Developer ID. See README.
+      # carries everything --enable-smartcard-redirection needs. Signed with the same
+      # identity as the binary: Developer ID (and notarized + stapled below) when the
+      # signing secrets are set, else ad-hoc, so end users get a Gatekeeper "can't verify
+      # developer" prompt and open it via right-click -> Open. See README.
       - name: Build smart-card IFD handler (cdylib, for the .app)
         shell: bash
         run: |
@@ -177,19 +223,23 @@ jobs:
           set -euo pipefail
           ( cd gui && swift build -c release --product macrdpshield )
 
-      - name: Assemble macrdp.app (ad-hoc signed)
+      - name: Assemble macrdp.app
         # SKIP_BUILD reuses the binary already built + signed above (so the app
         # ships the identical Mach-O) and the IFD dylib from the step above.
-        # make-app.sh embeds the IFD bundle + installer and ad-hoc signs
-        # (CODESIGN_IDENTITY unset). APP_DIR is a throwaway dir so its final
+        # make-app.sh embeds the IFD bundle + installer and signs with
+        # CODESIGN_IDENTITY ("-" = ad-hoc). APP_DIR is a throwaway dir so its final
         # "install" copy lands somewhere writable; the canonical staged bundle is
         # target/macrdp.app, which is what we package.
         shell: bash
+        env:
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         run: |
           set -euo pipefail
+          identity="-"
+          [[ "$DEVID" == true ]] && identity="$MACOS_CODESIGN_IDENTITY"
           mkdir -p target/release
           cp "target/${{ matrix.target }}/release/macrdp" target/release/macrdp
-          SKIP_BUILD=1 APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
+          CODESIGN_IDENTITY="$identity" SKIP_BUILD=1 APP_DIR="$RUNNER_TEMP/appout" packaging/make-app.sh
           test -f "target/macrdp.app/Contents/Resources/ifd-macrdp.bundle/Contents/MacOS/libifd_macrdp.dylib" \
             || { echo "IFD handler not embedded in the app"; exit 1; }
           test -f "target/macrdp.app/Contents/Resources/macrdphud" \
@@ -197,6 +247,62 @@ jobs:
           test -f "target/macrdp.app/Contents/Resources/macrdpshield" \
             || { echo "shield-window helper not embedded in the app"; exit 1; }
           codesign --verify --deep --strict target/macrdp.app
+
+      - name: Notarize
+        # The bare binary cannot carry a stapled ticket (stapler works on .app/.dmg/.pkg):
+        # Gatekeeper looks its ticket up online. The .app gets the ticket stapled.
+        if: env.NOTARIZE == 'true'
+        shell: bash
+        env:
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$MACOS_NOTARY_KEY_P8" > "$key"
+          auth=(--key "$key" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID")
+          notarize() { # <path> <name>: zip, submit, wait, fail unless Accepted
+            local zip="$RUNNER_TEMP/notarize-$2.zip" json="$RUNNER_TEMP/notary-$2.json" id status
+            ditto -c -k --keepParent "$1" "$zip"
+            xcrun notarytool submit "$zip" "${auth[@]}" \
+              --wait --timeout 30m --output-format json > "$json" || true
+            cat "$json"
+            id=$(jq -r '.id // empty' "$json")
+            status=$(jq -r '.status // empty' "$json")
+            if [[ "$status" != Accepted ]]; then
+              [[ -n "$id" ]] && xcrun notarytool log "$id" "${auth[@]}"
+              echo "::error::notarization of $2: ${status:-none}"
+              exit 1
+            fi
+          }
+          notarize "target/${{ matrix.target }}/release/macrdp" binary
+          notarize target/macrdp.app app
+          xcrun stapler staple target/macrdp.app
+          xcrun stapler validate target/macrdp.app
+          spctl -a -vvv --type exec target/macrdp.app
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        # VERSION comes from a tag name / dispatch input; pass it via env (never
+        # inline in the script) so a maliciously-named tag can't inject shell.
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          NAME="macrdp-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/macrdp" "dist/${NAME}/"
+          cp packaging/release/install.sh packaging/release/uninstall.sh \
+            packaging/release/launchagent.plist.template packaging/config.env.example "dist/${NAME}/"
+          chmod 755 "dist/${NAME}/macrdp" "dist/${NAME}/install.sh" "dist/${NAME}/uninstall.sh"
+          cp LICENSE* README.md "dist/${NAME}/" 2>/dev/null || true
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Stage app artifact
         id: stageapp
@@ -232,6 +338,13 @@ jobs:
             ${{ steps.stageapp.outputs.checksum }}
           if-no-files-found: error
           retention-days: 7
+
+      - name: Clean up signing material
+        if: always()
+        shell: bash
+        run: |
+          [[ -n "${KEYCHAIN:-}" ]] && security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
 
   release:
     name: publish release

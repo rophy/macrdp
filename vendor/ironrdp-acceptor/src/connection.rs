@@ -11,7 +11,7 @@ use ironrdp_pdu::nego::SecurityProtocol;
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, SvcServerProcessor};
 use pdu::rdp::capability_sets::CapabilitySet;
-use pdu::rdp::client_info::{ClientAutoReconnect, Credentials};
+use pdu::rdp::client_info::{ClientAutoReconnect, ClientInfoFlags, Credentials};
 use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
@@ -34,12 +34,16 @@ pub struct Acceptor {
     desktop_size: DesktopSize,
     keyboard_layout: u32,
     multitransport_flags: gcc::MultiTransportFlags,
+    // (vendored, divergence (30)) earlyCapabilityFlags of the Client Core Data.
+    client_early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     server_capabilities: Vec<CapabilitySet>,
     static_channels: StaticChannelSet,
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     received_credentials: Option<Credentials>,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    // (vendored, divergence (31)) Flags of the Client Info PDU.
+    client_info_flags: ClientInfoFlags,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
     // (vendored) Client-fingerprint identity from the GCC Client Core Data
@@ -132,6 +136,11 @@ pub struct AcceptorResult {
     /// implement UDP multitransport can use it to decide whether to send a
     /// Server Initiate Multitransport Request.
     pub multitransport_flags: gcc::MultiTransportFlags,
+    /// (vendored, divergence (30)) `earlyCapabilityFlags` of the client's GCC
+    /// Client Core Data (section 2.2.1.3.2): for example whether the client
+    /// takes Heartbeat PDUs (`SUPPORT_HEART_BEAT_PDU`) and Set Error Info PDUs
+    /// (`SUPPORT_ERR_INFO_PDU`). Empty when the client sent none.
+    pub client_early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     /// (vendored) Client-fingerprint identity from the GCC Client Core Data:
     /// hostname, announced RDP version (raw u32), build number. Informational.
     pub client_name: String,
@@ -156,6 +165,10 @@ pub struct AcceptorResult {
     /// validation, but the server must still verify its security verifier
     /// against the reconnect random for the target session.
     pub auto_reconnect: Option<ClientAutoReconnect>,
+    /// (vendored, divergence (31)) Flags from the Client Info PDU (MS-RDPBCGR
+    /// 2.2.1.11.1.1), such as the client's audio playback mode. Empty until
+    /// the Client Info PDU is received.
+    pub client_info_flags: ClientInfoFlags,
 }
 
 impl Acceptor {
@@ -174,12 +187,14 @@ impl Acceptor {
             desktop_size,
             keyboard_layout: 0,
             multitransport_flags: gcc::MultiTransportFlags::empty(),
+            client_early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             server_capabilities: capabilities,
             static_channels: StaticChannelSet::new(),
             saved_for_reactivation: Default::default(),
             creds,
             received_credentials: None,
             received_auto_reconnect: None,
+            client_info_flags: ClientInfoFlags::empty(),
             reactivation: false,
             honor_client_desktop_size: None,
             client_name: String::new(),
@@ -275,12 +290,14 @@ impl Acceptor {
             desktop_size,
             keyboard_layout: consumed.keyboard_layout,
             multitransport_flags: consumed.multitransport_flags,
+            client_early_capability_flags: consumed.client_early_capability_flags,
             server_capabilities: consumed.server_capabilities,
             static_channels,
             saved_for_reactivation,
             creds: consumed.creds,
             received_credentials: consumed.received_credentials,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            client_info_flags: consumed.client_info_flags,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             client_name: consumed.client_name,
@@ -374,6 +391,7 @@ impl Acceptor {
                 message_channel_id: self.message_channel_id,
                 keyboard_layout: self.keyboard_layout,
                 multitransport_flags: self.multitransport_flags,
+                client_early_capability_flags: self.client_early_capability_flags,
                 client_name: self.client_name.clone(),
                 client_version: self.client_version,
                 client_build: self.client_build,
@@ -381,6 +399,7 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
                 auto_reconnect: self.received_auto_reconnect.take(),
+                client_info_flags: self.client_info_flags,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -635,6 +654,8 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                self.client_early_capability_flags =
+                    early_capability.unwrap_or_else(gcc::ClientEarlyCapabilityFlags::empty);
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.multitransport_flags = gcc_blocks
@@ -857,6 +878,7 @@ impl Sequence for Acceptor {
                     "Received Client Info PDU"
                 );
                 self.received_auto_reconnect = auto_reconnect;
+                self.client_info_flags = client_info.client_info.flags;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;

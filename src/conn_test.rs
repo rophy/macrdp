@@ -349,11 +349,35 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    let (result, framed) = connect_client_with(client_io, client_w, client_h, false).await?;
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        framed,
+    ))
+}
+
+/// [`connect_client`], returning the whole `ConnectionResult`; with `drdynvc`
+/// the client also joins the drdynvc static channel.
+async fn connect_client_with<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+    drdynvc: bool,
+) -> anyhow::Result<(
+    ironrdp_connector::ConnectionResult,
+    TokioFramed<tokio_rustls::client::TlsStream<S>>,
+)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     );
+    if drdynvc {
+        connector = connector.with_static_channel(ironrdp_dvc::DrdynvcClient::new());
+    }
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -384,10 +408,7 @@ where
         None,
     )
     .await?;
-    Ok((
-        (result.desktop_size.width, result.desktop_size.height),
-        tls_framed,
-    ))
+    Ok((result, tls_framed))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -1138,4 +1159,490 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
             other => panic!("expected VerticalScroll for {units}, got {other:?}"),
         }
     }
+}
+
+/// (vendored divergence 28) A horizontal wheel PDU (PTRFLAGS_HWHEEL) must
+/// arrive as exactly one `HorizontalScroll` with its signed rotation units,
+/// through the function the server's fast-path and slow-path dispatch use:
+/// not a `Move` to the PDU's (meaningless) x/y, and no lead `Move` either.
+#[test]
+fn horizontal_wheel_pdu_is_a_horizontal_scroll() {
+    use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
+    use ironrdp_server::{mouse_events_from_pdu, MouseEvent};
+
+    for units in [-120_i16, -1, 1, 120] {
+        let mut flags = PointerFlags::HORIZONTAL_WHEEL;
+        if units < 0 {
+            flags |= PointerFlags::WHEEL_NEGATIVE;
+        }
+        let pdu = MousePdu {
+            flags,
+            number_of_wheel_rotation_units: units,
+            x_position: 7,
+            y_position: 9,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
+        let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
+        let events: Vec<MouseEvent> = mouse_events_from_pdu(decoded).collect();
+        match events.as_slice() {
+            [MouseEvent::HorizontalScroll { value }] => assert_eq!(*value, units),
+            other => panic!("expected one HorizontalScroll for {units}, got {other:?}"),
+        }
+    }
+}
+
+/// (vendored divergence 29) An mstsc middle click is a MousePdu with
+/// PTRFLAGS_BUTTON3 (0x4000). It must arrive as a Move to the PDU's position,
+/// then MiddlePressed / MiddleReleased, through the same function the server's
+/// fast-path and slow-path dispatch use. Before, it fell through to a `Move`.
+#[test]
+fn middle_button_pdu_is_a_middle_click_at_its_position() {
+    use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
+    use ironrdp_server::{mouse_events_from_pdu, MouseEvent};
+
+    for down in [true, false] {
+        let mut flags = PointerFlags::MIDDLE_BUTTON_OR_WHEEL;
+        if down {
+            flags |= PointerFlags::DOWN;
+        }
+        let pdu = MousePdu {
+            flags,
+            number_of_wheel_rotation_units: 0,
+            x_position: 300,
+            y_position: 400,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
+        let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
+        let events: Vec<MouseEvent> = mouse_events_from_pdu(decoded).collect();
+        match events.as_slice() {
+            [MouseEvent::Move { x: 300, y: 400 }, MouseEvent::MiddlePressed] if down => {}
+            [MouseEvent::Move { x: 300, y: 400 }, MouseEvent::MiddleReleased] if !down => {}
+            other => panic!("middle down={down}: unexpected events {other:?}"),
+        }
+    }
+}
+
+/// (vendored divergence 29) PTRXFLAGS_BUTTON1/2 (TS_POINTERX_EVENT) are the
+/// extended buttons 4 and 5 (back / forward), not left and right: an mstsc
+/// back-button press must not become a left click.
+#[test]
+fn extended_button_pdu_is_button_4_or_5_not_left_or_right() {
+    use ironrdp_pdu::input::mouse_x::{MouseXPdu, PointerXFlags};
+    use ironrdp_server::MouseEvent;
+
+    for (button, down) in [(1, true), (1, false), (2, true), (2, false)] {
+        let mut flags = if button == 1 {
+            PointerXFlags::BUTTON1
+        } else {
+            PointerXFlags::BUTTON2
+        };
+        if down {
+            flags |= PointerXFlags::DOWN;
+        }
+        let pdu = MouseXPdu {
+            flags,
+            x_position: 300,
+            y_position: 400,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse x pdu");
+        let decoded: MouseXPdu = ironrdp_core::decode(&encoded).expect("decode mouse x pdu");
+        match (button, down, MouseEvent::from(decoded)) {
+            (1, true, MouseEvent::Button4Pressed)
+            | (1, false, MouseEvent::Button4Released)
+            | (2, true, MouseEvent::Button5Pressed)
+            | (2, false, MouseEvent::Button5Released) => {}
+            (b, d, other) => panic!("X button {b} down={d}: got {other:?}"),
+        }
+    }
+}
+
+// ---- idle-timeout disconnect (vendored divergence (32)) --------------------
+
+/// Is this raw server PDU a Server Set Error Info carrying `ERRINFO_IDLE_TIMEOUT`
+/// (MS-RDPBCGR 2.2.5.1.1)? The twin of [`is_disconnected_by_other_connection`].
+fn is_idle_timeout_error_info(bytes: &[u8]) -> bool {
+    use ironrdp_core::decode;
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::rdp::headers::{ShareControlPdu, ShareDataPdu};
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_pdu::x224::X224;
+
+    let Ok(x224) = decode::<X224<McsMessage<'_>>>(bytes) else {
+        return false;
+    };
+    let McsMessage::SendDataIndication(data) = x224.0 else {
+        return false;
+    };
+    let Ok(ctrl) = decode::<ironrdp_pdu::rdp::headers::ShareControlHeader>(&data.user_data) else {
+        return false;
+    };
+    let ShareControlPdu::Data(share_data) = ctrl.share_control_pdu else {
+        return false;
+    };
+    matches!(
+        share_data.share_data_pdu,
+        ShareDataPdu::ServerSetErrorInfo(pdu)
+            if pdu.0 == ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::IdleTimeout)
+    )
+}
+
+/// Read one TPKT-framed PDU (version 3, big-endian length in bytes 2..4).
+async fn read_tpkt<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut pdu = vec![0u8; 4];
+    r.read_exact(&mut pdu).await?;
+    anyhow::ensure!(pdu[0] == 3, "not a TPKT header: {:#04x}", pdu[0]);
+    let len = usize::from(u16::from_be_bytes([pdu[2], pdu[3]]));
+    anyhow::ensure!(len >= 4, "TPKT length {len}");
+    pdu.resize(len, 0);
+    r.read_exact(&mut pdu[4..]).await?;
+    Ok(pdu)
+}
+
+/// The client's MCS Connect Initial with `RNS_UD_CS_SUPPORT_ERRINFO_PDU` cleared
+/// in its Client Core Data, as FreeRDP 3.30 sends it.
+fn without_error_info_support(connect_initial: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::gcc::{ClientEarlyCapabilityFlags, ConferenceCreateRequest};
+    use ironrdp_pdu::mcs::ConnectInitial;
+    use ironrdp_pdu::x224::{X224Data, X224};
+
+    let x224 = decode::<X224<X224Data<'_>>>(connect_initial)
+        .map_err(|e| anyhow::anyhow!("X.224 data: {e:?}"))?;
+    let mut ci = decode::<ConnectInitial>(&x224.0.data)
+        .map_err(|e| anyhow::anyhow!("Connect Initial: {e:?}"))?;
+    let mut blocks = ci.conference_create_request.into_gcc_blocks();
+    let flags = blocks
+        .core
+        .optional_data
+        .early_capability_flags
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("no earlyCapabilityFlags"))?;
+    anyhow::ensure!(flags.contains(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU));
+    flags.remove(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
+    ci.conference_create_request =
+        ConferenceCreateRequest::new(blocks).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let data = encode_vec(&ci).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    encode_vec(&X224(X224Data {
+        data: std::borrow::Cow::Owned(data),
+    }))
+    .map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
+/// The client's Client Info PDU with INFO_AUDIOCAPTURE set (mstsc "Record from
+/// this computer"), or `None` if `pdu` is not a Client Info PDU.
+fn with_audio_capture(pdu: &[u8]) -> Option<Vec<u8>> {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+    use ironrdp_pdu::rdp::ClientInfoPdu;
+    use ironrdp_pdu::x224::X224;
+
+    let x224 = decode::<X224<McsMessage<'_>>>(pdu).ok()?;
+    let McsMessage::SendDataRequest(req) = x224.0 else {
+        return None;
+    };
+    let mut info = decode::<ClientInfoPdu>(&req.user_data).ok()?;
+    info.client_info.flags |= ClientInfoFlags::AUDIO_CAPTURE;
+    let user_data = encode_vec(&info).ok()?;
+    encode_vec(&X224(McsMessage::SendDataRequest(SendDataRequest {
+        initiator_id: req.initiator_id,
+        channel_id: req.channel_id,
+        user_data: std::borrow::Cow::Owned(user_data),
+    })))
+    .ok()
+}
+
+/// A TLS man in the middle between the test client and the server that clears
+/// SUPPORT_ERR_INFO_PDU in the Connect Initial and passes everything else
+/// unchanged. The IronRDP client always sets the flag, and CredSSP is off, so
+/// this is the only way to make an in-process client without it.
+async fn strip_error_info_support(
+    client: tokio::io::DuplexStream,
+    server: tokio::io::DuplexStream,
+) -> anyhow::Result<()> {
+    patching_proxy(client, server, true, false).await
+}
+
+/// A TLS man in the middle between the test client and the server. It can
+/// clear SUPPORT_ERR_INFO_PDU in the Connect Initial (`strip_error_info`) and
+/// set INFO_AUDIOCAPTURE in the Client Info PDU (`audio_capture`); the IronRDP
+/// client cannot be told to do either. Everything else passes unchanged.
+async fn patching_proxy(
+    client: tokio::io::DuplexStream,
+    server: tokio::io::DuplexStream,
+    strip_error_info: bool,
+    audio_capture: bool,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut client, mut server) = (client, server);
+    // X.224 Connection Request and Confirm go through as they are.
+    let request = read_tpkt(&mut client).await?;
+    server.write_all(&request).await?;
+    let confirm = read_tpkt(&mut server).await?;
+    client.write_all(&confirm).await?;
+
+    let mut client = server_tls_acceptor().accept(client).await?;
+    let mut tls_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+        .with_no_client_auth();
+    tls_cfg.resumption = rustls::client::Resumption::disabled();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+    let mut server = TlsConnector::from(Arc::new(tls_cfg))
+        .connect(server_name, server)
+        .await?;
+
+    // The first PDU over TLS is the MCS Connect Initial.
+    let connect_initial = read_tpkt(&mut client).await?;
+    if strip_error_info {
+        server
+            .write_all(&without_error_info_support(&connect_initial)?)
+            .await?;
+    } else {
+        server.write_all(&connect_initial).await?;
+    }
+    if !audio_capture {
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        return Ok(());
+    }
+    // The client's slow-path PDUs up to the Client Info PDU (all TPKT; no
+    // fast-path before activation), while the server's go through as they are.
+    let (mut client_rx, mut client_tx) = tokio::io::split(client);
+    let (mut server_rx, mut server_tx) = tokio::io::split(server);
+    let to_client = async move {
+        let _ = tokio::io::copy(&mut server_rx, &mut client_tx).await;
+    };
+    let to_server = async move {
+        loop {
+            let pdu = read_tpkt(&mut client_rx).await?;
+            if let Some(patched) = with_audio_capture(&pdu) {
+                server_tx.write_all(&patched).await?;
+                break;
+            }
+            server_tx.write_all(&pdu).await?;
+        }
+        let _ = tokio::io::copy(&mut client_rx, &mut server_tx).await;
+        anyhow::Ok(())
+    };
+    let (_, sent) = tokio::join!(to_client, to_server);
+    sent
+}
+
+/// What a connected client reads after the server sends
+/// `ServerEvent::Disconnect(ERRINFO_IDLE_TIMEOUT)` (`src/idle.rs`): whether a
+/// Set Error Info with that code came before the connection closed.
+async fn idle_timeout_disconnect(strip_error_info: bool) -> anyhow::Result<bool> {
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_server::ServerEvent;
+
+    init_tracing();
+    let (client_io, proxy_client_io) = tokio::io::duplex(64 * 1024);
+    let (proxy_server_io, server_io) = tokio::io::duplex(64 * 1024);
+    // A live session (see `KeepAliveSound`), so the Disconnect is what ends it.
+    let mut server =
+        build_test_server_full(3389, 1024, 768, true, None, crate::bitmap_codecs(), true);
+    let events = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let proxy_task = tokio::task::spawn_local(async move {
+                if strip_error_info {
+                    strip_error_info_support(proxy_client_io, proxy_server_io).await
+                } else {
+                    let (mut a, mut b) = (proxy_client_io, proxy_server_io);
+                    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                    Ok(())
+                }
+            });
+            let (_size, mut framed) = connect_client(client_io, 1024, 768).await?;
+
+            // Sent after the connect: `run_connection` drops a Disconnect that is
+            // already queued when it starts (it belongs to an older connection).
+            events
+                .send(ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::IdleTimeout,
+                )))
+                .map_err(|_| anyhow::anyhow!("server event channel closed"))?;
+
+            let mut saw_idle_timeout = false;
+            loop {
+                let read =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), framed.read_pdu())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("the session was left alive"))?;
+                match read {
+                    Ok((_action, bytes)) => saw_idle_timeout |= is_idle_timeout_error_info(&bytes),
+                    Err(_) => break,
+                }
+            }
+            server_task.abort();
+            proxy_task.abort();
+            anyhow::Ok(saw_idle_timeout)
+        })
+        .await
+}
+
+/// `--idle-timeout` (`src/idle.rs`) ends the session with
+/// `ServerEvent::Disconnect(ERRINFO_IDLE_TIMEOUT)`. A client that advertised
+/// SUPPORT_ERR_INFO_PDU (mstsc, the IronRDP client) gets the Set Error Info
+/// first, so mstsc shows its idle message and does not auto-reconnect.
+#[tokio::test]
+async fn idle_timeout_disconnect_tells_an_error_info_client_why() -> anyhow::Result<()> {
+    assert!(
+        idle_timeout_disconnect(false).await?,
+        "the client must get ERRINFO_IDLE_TIMEOUT before the connection closes"
+    );
+    Ok(())
+}
+
+/// MS-RDPBCGR 3.3.5.7.1: a client without SUPPORT_ERR_INFO_PDU (FreeRDP 3.30)
+/// MUST NOT get the Set Error Info PDU; the connection just closes.
+#[tokio::test]
+async fn idle_timeout_disconnect_sends_no_error_info_to_a_client_without_it() -> anyhow::Result<()>
+{
+    assert!(
+        !idle_timeout_disconnect(true).await?,
+        "a client without SUPPORT_ERR_INFO_PDU must not get the Set Error Info PDU"
+    );
+    Ok(())
+}
+
+// ---- AUDIO_INPUT only for INFO_AUDIOCAPTURE (vendored divergence (34)) -----
+
+/// An audio-input factory that never receives audio (no sink).
+struct TestAudin;
+impl ironrdp_server::AudinServerFactory for TestAudin {
+    fn build_processor(&self) -> ironrdp_server::AudinServer {
+        ironrdp_server::AudinServer::new(None)
+    }
+}
+
+/// The DVC names the server offers (Create Requests) to a client that joins
+/// drdynvc and answers the Capabilities Request, with or without
+/// INFO_AUDIOCAPTURE in its Client Info PDU. The server has an audio-input
+/// factory, as with `--enable-microphone-redirection`.
+async fn offered_dvcs(audio_capture: bool) -> anyhow::Result<Vec<String>> {
+    use ironrdp_core::decode;
+    use ironrdp_dvc::pdu::{
+        CapabilitiesResponsePdu, CapsVersion, DrdynvcClientPdu, DrdynvcServerPdu,
+    };
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let (client_io, proxy_client_io) = tokio::io::duplex(64 * 1024);
+    let (proxy_server_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_audin_factory(Some(Box::new(TestAudin)))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let proxy_task = tokio::task::spawn_local(patching_proxy(
+                proxy_client_io,
+                proxy_server_io,
+                false,
+                audio_capture,
+            ));
+            let (result, mut framed) = connect_client_with(client_io, 1024, 768, true).await?;
+            let dvc_channel = result
+                .static_channels
+                .get_channel_id_by_type::<ironrdp_dvc::DrdynvcClient>()
+                .ok_or_else(|| anyhow::anyhow!("drdynvc not joined"))?;
+
+            let mut names = Vec::new();
+            let mut answered = false;
+            loop {
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_millis(if names.is_empty() { 10_000 } else { 500 }),
+                    framed.read_pdu(),
+                )
+                .await;
+                let Ok(read) = read else { break };
+                let (_action, bytes) = read?;
+                let Ok(x224) = decode::<X224<McsMessage<'_>>>(&bytes) else {
+                    continue;
+                };
+                let McsMessage::SendDataIndication(data) = x224.0 else {
+                    continue;
+                };
+                // CHANNEL_PDU_HEADER (length, flags), then one DVC PDU.
+                if data.channel_id != dvc_channel || data.user_data.len() < 8 {
+                    continue;
+                }
+                match decode::<DrdynvcServerPdu>(&data.user_data[8..]) {
+                    Ok(DrdynvcServerPdu::Capabilities(_)) if !answered => {
+                        answered = true;
+                        let caps = DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+                            CapsVersion::V2,
+                        ));
+                        let msg = ironrdp_svc::client_encode_svc_messages(
+                            vec![caps.into()],
+                            dvc_channel,
+                            result.user_channel_id,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                        framed.write_all(&msg).await?;
+                    }
+                    Ok(DrdynvcServerPdu::Create(req)) => names.push(req.channel_name().to_owned()),
+                    _ => {}
+                }
+            }
+            server_task.abort();
+            proxy_task.abort();
+            anyhow::ensure!(answered, "no DVC Capabilities Request from the server");
+            anyhow::Ok(names)
+        })
+        .await
+}
+
+/// mstsc without "Record from this computer" (no INFO_AUDIOCAPTURE) is not
+/// offered AUDIO_INPUT; the other DVCs are still offered.
+#[tokio::test]
+async fn audio_input_is_not_offered_without_audio_capture() -> anyhow::Result<()> {
+    let names = offered_dvcs(false).await?;
+    assert!(!names.is_empty(), "the server offered no DVC at all");
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == ironrdp_server::AUDIO_INPUT_CHANNEL_NAME),
+        "AUDIO_INPUT offered without INFO_AUDIOCAPTURE: {names:?}"
+    );
+    Ok(())
+}
+
+/// With INFO_AUDIOCAPTURE the AUDIO_INPUT DVC is offered.
+#[tokio::test]
+async fn audio_input_is_offered_with_audio_capture() -> anyhow::Result<()> {
+    let names = offered_dvcs(true).await?;
+    assert!(
+        names
+            .iter()
+            .any(|n| n == ironrdp_server::AUDIO_INPUT_CHANNEL_NAME),
+        "AUDIO_INPUT not offered with INFO_AUDIOCAPTURE: {names:?}"
+    );
+    Ok(())
 }

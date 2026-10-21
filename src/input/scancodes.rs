@@ -99,6 +99,7 @@ const fn build_scancode_normal() -> [u16; 256] {
     t[0x42] = 0x64; // F8
     t[0x43] = 0x65; // F9
     t[0x44] = 0x6D; // F10
+    t[0x45] = 0x47; // Num Lock → kVK_ANSI_KeypadClear (Clear sits there on a Mac keypad)
     t[0x47] = 0x59; // numpad 7
     t[0x48] = 0x5B; // numpad 8
     t[0x49] = 0x5C; // numpad 9
@@ -135,7 +136,44 @@ const fn build_scancode_extended() -> [u16; 256] {
     t[0x53] = 0x75; // Delete (forward delete)
     t[0x5B] = 0x37; // left GUI / Windows → kVK_Command
     t[0x5C] = 0x36; // right GUI → kVK_RightCommand
+    t[0x5D] = 0x6E; // Menu (Apps) → kVK_ContextualMenu, what a PC keyboard sends on a Mac
     t
+}
+
+/// Keypad key with Num Lock off (non-extended scancode) → macOS navigation
+/// keycode, as Windows does: 7 Home, 8 Up, 9 PgUp, 4 Left, 5 Clear, 6 Right,
+/// 1 End, 2 Down, 3 PgDn, 0 Insert (Help), . Delete. Other keys: `None` (use
+/// the normal table). Ported from macrdp-v1 d74b3cf
+/// (`keypad_navigation_keycode`), relicensed to MIT OR Apache-2.0 by the author.
+pub(crate) fn keypad_navigation_vk(scancode: u8) -> Option<u16> {
+    Some(match scancode {
+        0x47 => 0x73, // Home
+        0x48 => 0x7E, // Up
+        0x49 => 0x74, // Page Up
+        0x4B => 0x7B, // Left
+        0x4C => 0x47, // Clear (VK_CLEAR)
+        0x4D => 0x7C, // Right
+        0x4F => 0x77, // End
+        0x50 => 0x7D, // Down
+        0x51 => 0x79, // Page Down
+        0x52 => 0x72, // Insert → Help
+        0x53 => 0x75, // Delete
+        _ => return None,
+    })
+}
+
+/// The Windows modifier layout (`--ctrl-as-cmd`): takes the keycode of the
+/// default table (Ctrl → Control, Alt → Option, Win → Command) and returns the
+/// one to post, so that Ctrl → Command, Alt → Option, Win → Control. That is a
+/// Control/Command swap, per side; every other key is unchanged.
+pub(crate) fn ctrl_as_cmd_vk(vk: u16) -> u16 {
+    match vk {
+        0x3B => 0x37, // Left Ctrl: Control → Command
+        0x3E => 0x36, // Right Ctrl: Right Control → Right Command
+        0x37 => 0x3B, // Left Win: Command → Control
+        0x36 => 0x3E, // Right Win: Right Command → Right Control
+        other => other,
+    }
 }
 
 /// True for any macOS vk that hardware would mark with
@@ -189,6 +227,8 @@ mod tests {
         // 0x48 is numpad-8 normally but the Up arrow when extended.
         assert_eq!(scancode_to_cgkeycode(0x48, false), Some(0x5B));
         assert_eq!(scancode_to_cgkeycode(0x48, true), Some(0x7E));
+        // Menu (Apps) key: extended 0x5D.
+        assert_eq!(scancode_to_cgkeycode(0x5D, true), Some(0x6E));
         // GUI / Windows key only exists in the extended table.
         assert_eq!(scancode_to_cgkeycode(0x5B, true), Some(0x37));
         assert_eq!(scancode_to_cgkeycode(0x5B, false), None);
@@ -201,6 +241,33 @@ mod tests {
         assert_eq!(scancode_to_cgkeycode(0x46, false), None); // gap (ScrollLock)
         assert_eq!(scancode_to_cgkeycode(0x00, true), None);
         assert_eq!(scancode_to_cgkeycode(0xFF, true), None);
+    }
+
+    #[test]
+    fn keypad_keys_navigate_with_num_lock_off() {
+        assert_eq!(keypad_navigation_vk(0x47), Some(0x73)); // 7 → Home
+        assert_eq!(keypad_navigation_vk(0x4B), Some(0x7B)); // 4 → Left
+        assert_eq!(keypad_navigation_vk(0x50), Some(0x7D)); // 2 → Down
+        assert_eq!(keypad_navigation_vk(0x53), Some(0x75)); // . → Delete
+        assert_eq!(keypad_navigation_vk(0x4E), None); // + stays
+        assert_eq!(keypad_navigation_vk(0x37), None); // * stays
+        assert_eq!(keypad_navigation_vk(0x1E), None); // A
+
+        // Num Lock itself is posted as keypad Clear.
+        assert_eq!(scancode_to_cgkeycode(0x45, false), Some(0x47));
+    }
+
+    #[test]
+    fn ctrl_as_cmd_is_the_windows_modifier_layout() {
+        let map = |sc, ext| ctrl_as_cmd_vk(scancode_to_cgkeycode(sc, ext).unwrap());
+        assert_eq!(map(0x1D, false), 0x37); // Left Ctrl → Left Command
+        assert_eq!(map(0x1D, true), 0x36); // Right Ctrl → Right Command
+        assert_eq!(map(0x38, false), 0x3A); // Left Alt → Left Option
+        assert_eq!(map(0x38, true), 0x3D); // Right Alt → Right Option
+        assert_eq!(map(0x5B, true), 0x3B); // Left Win → Left Control
+        assert_eq!(map(0x5C, true), 0x3E); // Right Win → Right Control
+        assert_eq!(map(0x2E, false), 0x08); // C stays C
+        assert_eq!(map(0x2A, false), 0x38); // Shift stays Shift
     }
 
     #[test]

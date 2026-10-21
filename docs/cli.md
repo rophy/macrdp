@@ -54,6 +54,15 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Ctrl+click on a link opens it in a new tab instead
                           #   of a secondary click (right/middle click and
                           #   scroll keep the real modifiers). macOS-only.
+--ctrl-as-cmd             # Windows modifier layout for every key: Ctrl = Cmd,
+                          #   Alt = Option, Win = Control (default: Ctrl =
+                          #   Control, Alt = Option, Win = Cmd). Every Ctrl combo
+                          #   is the Cmd combo, in terminals too (Ctrl+C copies,
+                          #   Win+C is SIGINT); Ctrl+click is Cmd+click. Alt+Tab
+                          #   switches apps with --alt-tab-switch. Not with
+                          #   --map-ctrl-to-cmd (in config.env, CTRL_AS_CMD
+                          #   wins and MAP_CTRL_TO_CMD is ignored with a
+                          #   warning). macOS-only.
 --no-remap-apps LIST      # Comma-separated bundle ids where --map-ctrl-to-cmd is
                           #   suppressed, on top of the built-in terminal list —
                           #   for editors with an embedded terminal that can't be
@@ -480,6 +489,13 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   naming a file. AUDIT_LOG=1 (default) still gates
                           #   whether the events emit at all. Config key: AUDIT_FILE.
                           #   Schema + collector configs: docs/siem-forwarding.md.
+--no-wifi-keep-awake      # Do not send the Wi-Fi keep-awake ECHO requests / Heartbeat
+                          #   PDUs (default ON: one when nothing went out for 100 ms,
+                          #   while a client is connected and sent input in the last
+                          #   10 min). Config key: WIFI_KEEP_AWAKE=0.
+--idle-timeout SECS       # Disconnect the client after SECS s without keyboard or mouse
+                          #   input (default 0 = off); the client is told
+                          #   ERRINFO_IDLE_TIMEOUT. Config key: IDLE_TIMEOUT_SECS.
 --stats-endpoint          # Expose a loopback (127.0.0.1) READ-ONLY live-telemetry
                           #   endpoint that the menu-bar controller's Status pane
                           #   reads: current H.264 bitrate + ceiling, link RTT,
@@ -606,6 +622,44 @@ xfreerdp /v:127.0.0.1:3390 /u:$USER /cert:ignore /log-level:DEBUG
 ```
 
 When iterating on the capture/encode path, prefer FreeRDP with `/log-level:DEBUG` — its PDU traces are far more useful than mstsc's silent failures.
+
+### End-to-end test (`tests/e2e_test.sh`)
+
+A FreeRDP smoke test that runs from a Linux machine (FreeRDP 3 with H.264, `xvfb-run`;
+`xclip` for the clipboard test) against a running server. Start the server for it with:
+```bash
+macrdp --enable-h264 --bind 0.0.0.0:3390 --username "$USER" --password-file ~/.macrdp-pw \
+       --log-dir /tmp/macrdp-e2e --idle-timeout 30       # --idle-timeout only for test 11
+```
+Then on the Linux machine:
+```bash
+MACRDP_USER=<mac user> MACRDP_PASS_FILE=<file with the password> \
+MACRDP_MAC_SHELL="ssh <mac user>@<mac> sh" MACRDP_LOG=/tmp/macrdp-e2e/macrdp.log \
+MACRDP_IDLE_TIMEOUT=30 tests/e2e_test.sh <mac> 3390
+```
+`--keychain` instead of `--password-file` works too (the password then comes from the
+Keychain). The password goes to FreeRDP on stdin (`/args-from:stdin`), never on a command line.
+Tests: TCP connect; NLA login (`/auth-only`); a wrong password gets
+`ERRCONNECT_LOGON_FAILURE` (STATUS_LOGON_FAILURE, so mstsc asks again); a client without
+AVC gets legacy bitmap updates (EGFX declined); an AVC420 client gets H.264 frames; session
+takeover (the first client gets `ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION`); TLS-only with
+an empty password is rejected; `/audio-mode:2` does not start rdpsnd; `/dynamic-resolution`;
+clipboard file copy both ways; idle timeout (`ERRINFO_IDLE_TIMEOUT`). Optional parts:
+- `MACRDP_MAC_SHELL` (a command that runs a shell script from stdin on the Mac as the
+  logged-in user) enables the clipboard file copy test. It replaces the Mac pasteboard and
+  leaves an empty string on it.
+- `MACRDP_LOG` (the server's `macrdp.log`, read locally or through `MACRDP_MAC_SHELL`)
+  enables the server log checks (bitmap fallback, no rdpsnd).
+- `MACRDP_IDLE_TIMEOUT` (the server's `--idle-timeout`, 30 or more so that the other tests
+  stay under it) enables the idle timeout test.
+
+The exit code is the number of failed tests. The video checks only need FreeRDP; they say
+nothing about Windows mstsc.
+
+### Benchmark (`tests/bench/`)
+
+Frame rate, frame gaps, bandwidth and key-to-screen latency measured on a FreeRDP client;
+see `tests/bench/README.md`.
 
 To decrypt a Wireshark capture of a session, run macrdp with `SSLKEYLOGFILE=/path/to/keylog.txt`
 and point Wireshark at that file (Preferences → Protocols → TLS → "(Pre)-Master-Secret log

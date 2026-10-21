@@ -41,6 +41,7 @@ use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxServerFactory};
 use crate::handler::RdpServerInputHandler;
+use crate::heartbeat::{HeartbeatHandle, OutputActivity, encode_heartbeat};
 use crate::{SoundServerFactory, builder, capabilities};
 
 /// TCP listen backlog size for the RDP server socket.
@@ -171,6 +172,85 @@ pub trait ConnectionHandler: Send {
     fn on_client_fingerprint(&mut self, client_name: &str, rdp_version: u32, client_build: u32, platform: &str) {
         let _ = (client_name, rdp_version, client_build, platform);
     }
+
+    /// (vendored, divergence (30)) Called once per served connection when the
+    /// capability exchange completes (not on a deactivation–reactivation),
+    /// with what the client said it takes. Default: no-op.
+    fn on_client_session(&mut self, session: &ClientSession) {
+        let _ = session;
+    }
+}
+
+/// (vendored, divergence (30)) What the client of a new connection takes, for
+/// [`ConnectionHandler::on_client_session`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClientSession {
+    /// The client takes Server Heartbeat PDUs (MS-RDPBCGR 2.2.16.1): it set
+    /// `RNS_UD_CS_SUPPORT_HEARTBEAT_PDU` and has a message channel.
+    pub supports_heartbeat: bool,
+    /// (vendored, divergence (31)) The client wants the audio played on its
+    /// side; see [`audio_playback_wanted`].
+    pub audio_playback: bool,
+    /// (vendored, divergence (32)) The client takes Server Set Error Info PDUs
+    /// (`RNS_UD_CS_SUPPORT_ERRINFO_PDU`), so `ServerEvent::Disconnect` tells it why.
+    pub supports_error_info: bool,
+}
+
+/// (vendored, divergence (31)) The client asks for audio on its side unless it
+/// set "do not play" or "play on the remote computer" in the Client Info PDU
+/// (MS-RDPBCGR 2.2.1.11.1.1 INFO_NOAUDIOPLAYBACK / INFO_REMOTECONSOLEAUDIO).
+pub fn audio_playback_wanted(flags: ironrdp_pdu::rdp::client_info::ClientInfoFlags) -> bool {
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+    !flags.intersects(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO)
+}
+
+/// Audio-lag control of `dispatch_audio`: the audio shipped to the client
+/// minus the real time since the first wave is the client's queue. A wave
+/// that would make it larger than `MAX_LAG_MS` is dropped (the writer fell
+/// behind).
+///
+/// (vendored, divergence (35)) The queue is never below zero: after a gap
+/// (macrdp skips digital silence) the shipped total is raised to the real
+/// time at once. Before, it was raised only when the gap was over
+/// `RESYNC_DEFICIT_MS`, so a shorter gap G raised the drop limit to
+/// `MAX_LAG_MS + G` for the rest of the sound.
+#[derive(Debug, Default)]
+struct AudioLagModel {
+    shipped_ms: f64,
+}
+
+impl AudioLagModel {
+    const MAX_LAG_MS: f64 = 200.0;
+    /// Only for the log: a deficit this large means the writer stalled.
+    const RESYNC_DEFICIT_MS: f64 = 300.0;
+
+    /// Raise the shipped total to `real_elapsed_ms` if the client queue ran
+    /// empty. Returns the deficit when it was over `RESYNC_DEFICIT_MS`.
+    fn catch_up(&mut self, real_elapsed_ms: f64) -> Option<f64> {
+        let deficit_ms = real_elapsed_ms - self.shipped_ms;
+        if deficit_ms > 0.0 {
+            self.shipped_ms = real_elapsed_ms;
+        }
+        (deficit_ms > Self::RESYNC_DEFICIT_MS).then_some(deficit_ms)
+    }
+
+    /// The projected client queue if a `wave_ms` wave would be over the limit.
+    fn over_limit(&self, real_elapsed_ms: f64, wave_ms: f64) -> Option<f64> {
+        let projected_buffer_ms = self.shipped_ms + wave_ms - real_elapsed_ms;
+        (projected_buffer_ms > Self::MAX_LAG_MS).then_some(projected_buffer_ms)
+    }
+
+    fn shipped(&mut self, wave_ms: f64) {
+        self.shipped_ms += wave_ms;
+    }
+}
+
+/// (vendored, divergence (34)) The client wants its microphone redirected:
+/// INFO_AUDIOCAPTURE in the Client Info PDU (MS-RDPBCGR 2.2.1.11.1.1; mstsc
+/// "Record from this computer", FreeRDP `/microphone`).
+pub fn audio_capture_wanted(flags: ironrdp_pdu::rdp::client_info::ClientInfoFlags) -> bool {
+    flags.contains(ironrdp_pdu::rdp::client_info::ClientInfoFlags::AUDIO_CAPTURE)
 }
 
 #[derive(Clone)]
@@ -484,6 +564,14 @@ pub struct RdpServer {
     // when this is `Some`; byte-identical when None.
     audin_factory: Option<Rc<dyn crate::AudinServerFactory>>,
     echo_handle: EchoServerHandle,
+    /// (vendored, divergence (30)) On-demand Heartbeat PDUs.
+    heartbeat_requests: HeartbeatHandle,
+    /// (vendored, divergence (30)) Time of the last write to the client.
+    output_activity: OutputActivity,
+    /// (vendored, divergence (30)) Of the current connection: its MCS message
+    /// channel and the `earlyCapabilityFlags` of its Client Core Data.
+    message_channel_id: Option<u16>,
+    client_early_capability_flags: ironrdp_pdu::gcc::ClientEarlyCapabilityFlags,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Rc<dyn GfxServerFactory>>,
     #[cfg(feature = "egfx")]
@@ -715,6 +803,12 @@ pub enum ServerEvent {
     /// ~1-2 s per cycle). Telling the loser WHY it was disconnected is what
     /// makes it stay away.
     EvictedByOtherConnection,
+    /// (vendored, divergence (32)) End this connection and tell the client
+    /// why: a Server Set Error Info PDU with this code (MS-RDPBCGR 2.2.5.1.1),
+    /// if the client advertised `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, then the
+    /// disconnect. An event still queued when its connection ended is dropped
+    /// before the next connection is served.
+    Disconnect(rdp::server_error_info::ErrorInfo),
     Clipboard(ClipboardMessage),
     /// File-copy initiation that bypasses `ClipboardMessage::SendInitiateCopy`
     /// and reaches `CliprdrServer::initiate_file_copy` directly. The only
@@ -1225,6 +1319,10 @@ impl RdpServer {
             camera_factory: camera_factory.map(Rc::from),
             audin_factory: audin_factory.map(Rc::from),
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
+            heartbeat_requests: HeartbeatHandle::default(),
+            output_activity: OutputActivity::default(),
+            message_channel_id: None,
+            client_early_capability_flags: ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::empty(),
             #[cfg(feature = "egfx")]
             gfx_factory: gfx_factory.map(Rc::from),
             #[cfg(feature = "egfx")]
@@ -1458,6 +1556,19 @@ impl RdpServer {
         &self.echo_handle
     }
 
+    /// (vendored, divergence (30)) A handle that sends one Server Heartbeat
+    /// PDU on demand while [`Self::run`] owns this server; see
+    /// [`HeartbeatHandle::send`].
+    pub fn heartbeat_handle(&self) -> HeartbeatHandle {
+        self.heartbeat_requests.clone()
+    }
+
+    /// (vendored, divergence (30)) The time of the last write to the client
+    /// socket (any channel, over TCP).
+    pub fn output_activity(&self) -> OutputActivity {
+        self.output_activity.clone()
+    }
+
     /// Enable protocol-level auto-detect ([MS-RDPBCGR 2.2.14]).
     ///
     /// Auto-detect uses lightweight Share Data PDUs on the IO channel,
@@ -1545,7 +1656,9 @@ impl RdpServer {
         let mut discarded = 0usize;
         loop {
             match ev_receiver.try_recv() {
-                Ok(ServerEvent::EvictedByOtherConnection) => discarded += 1,
+                // (divergence (32)) A Disconnect is also addressed to the
+                // connection that is gone.
+                Ok(ServerEvent::EvictedByOtherConnection | ServerEvent::Disconnect(_)) => discarded += 1,
                 Ok(other) => keep.push(other),
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -1637,6 +1750,9 @@ impl RdpServer {
         if let Some(flag) = &self.input_reset_request {
             flag.store(true, Ordering::Relaxed);
         }
+        // (vendored, divergence (32)) A Disconnect (or eviction) queued for the
+        // previous connection must not end this one.
+        self.discard_stale_eviction_events().await;
 
         let framed = TokioFramed::new(stream);
 
@@ -2184,6 +2300,13 @@ impl RdpServer {
 
                 let (result, preempted_by) = outcome;
                 let duration = started.elapsed();
+
+                // (vendored, divergence 27) The connection is over (on its own
+                // or preempted): let the input handler release what it left
+                // pressed. Here, and not in `run_connection`, so it also runs
+                // when the connection future is dropped by a takeover or an
+                // error return. `conn` no longer borrows `self`.
+                self.handler.lock().await.connection_ended();
                 self.recently_evicted = recently_evicted;
 
                 // The eviction itself is logged inside the race, where the
@@ -2472,6 +2595,27 @@ impl RdpServer {
                         Err(error) => {
                             warn!(?error, "could not encode the eviction reason; disconnecting anyway");
                         }
+                    }
+                    return Ok(RunState::Disconnect);
+                }
+                ServerEvent::Disconnect(info) => {
+                    // MS-RDPBCGR 3.3.5.7.1: a client that did not advertise
+                    // SUPPORT_ERR_INFO_PDU MUST NOT get the PDU.
+                    if self.client_supports_error_info() {
+                        debug!(?info, "disconnecting the client with Error Info");
+                        let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(
+                            rdp::server_error_info::ServerSetErrorInfoPdu(info),
+                        );
+                        match encode_share_data_pdu(pdu, io_channel_id, user_channel_id) {
+                            Ok(bytes) => {
+                                if let Err(error) = writer.write_all(&bytes).await {
+                                    debug!(?error, "could not send the Error Info; disconnecting anyway");
+                                }
+                            }
+                            Err(error) => warn!(?error, "could not encode the Error Info; disconnecting anyway"),
+                        }
+                    } else {
+                        debug!(?info, "disconnecting the client (it takes no Error Info PDU)");
                     }
                     return Ok(RunState::Disconnect);
                 }
@@ -2791,10 +2935,16 @@ impl RdpServer {
     {
         debug!("Starting client loop");
         let mut display_updates = self.display.lock().await.updates().await?;
-        let mut writer = SharedWriter::new(writer);
+        let mut writer = SharedWriter::new(writer, self.output_activity.clone());
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let mut audio_writer = writer.clone();
+        // (vendored, divergence (30)) On-demand heartbeats.
+        let mut heartbeat_writer = writer.clone();
+        let heartbeat_requests = self.heartbeat_requests.clone();
+        // A request from before this loop has no client to go to.
+        let _stale = heartbeat_requests.take();
+        let heartbeat_channel_id = self.message_channel_id.filter(|_| self.client_supports_heartbeat());
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let audio_receiver = Arc::clone(&self.audio_receiver);
         // (M5c step 3b) Take this connection's inbound-tunnel receiver before `self`
@@ -2880,14 +3030,9 @@ impl RdpServer {
         let dispatch_audio = async move {
             // Task-local audio-lag state. Reset per connection because the
             // task is spawned fresh inside client_loop.
-            let mut audio_shipped_ms = 0.0_f64;
+            let mut lag = AudioLagModel::default();
             let mut audio_clock_start: Option<Instant> = None;
 
-            // Same constants as the prior on-Self model. See the
-            // "Cross-batch audio-lag control" comment block (formerly in
-            // dispatch_server_events) for the rationale.
-            const MAX_LAG_MS: f64 = 200.0;
-            const RESYNC_DEFICIT_MS: f64 = 300.0;
             // 16-bit stereo PCM at 44.1 kHz = 4 bytes/frame × 44 100 = 176 400 B/s,
             // i.e. 176.4 bytes per ms of audio. Matches `src/audio.rs::our_format()`
             // in the macrdp tree. Update if the audio backend's format changes.
@@ -2916,17 +3061,14 @@ impl RdpServer {
                 let now = Instant::now();
                 let start = *audio_clock_start.get_or_insert(now);
                 let real_elapsed_ms = (now - start).as_secs_f64() * 1000.0;
-                let deficit_ms = real_elapsed_ms - audio_shipped_ms;
-                if deficit_ms > RESYNC_DEFICIT_MS {
+                if let Some(deficit_ms) = lag.catch_up(real_elapsed_ms) {
                     debug!(
                         target: "audio_backlog",
                         deficit_ms,
                         "writer stalled; resyncing audio clock to live"
                     );
-                    audio_shipped_ms = real_elapsed_ms;
                 }
-                let projected_buffer_ms = audio_shipped_ms + wave_ms - real_elapsed_ms;
-                if projected_buffer_ms > MAX_LAG_MS {
+                if let Some(projected_buffer_ms) = lag.over_limit(real_elapsed_ms, wave_ms) {
                     debug!(
                         target: "audio_backlog",
                         projected_buffer_ms,
@@ -2957,7 +3099,7 @@ impl RdpServer {
                     if let Err(e) = res {
                         warn!(error = %e, "lossy audio wave route over UDP tunnel failed");
                     }
-                    audio_shipped_ms += wave_ms;
+                    lag.shipped(wave_ms);
                     continue;
                 }
 
@@ -2984,7 +3126,7 @@ impl RdpServer {
                 drop(this);
 
                 audio_writer.write_all(&encoded).await?;
-                audio_shipped_ms += wave_ms;
+                lag.shipped(wave_ms);
             }
         };
 
@@ -3029,12 +3171,33 @@ impl RdpServer {
             std::future::pending::<Result<RunState>>().await
         };
 
+        // (vendored, divergence (30)) One Heartbeat PDU per request. A client
+        // that did not advertise heartbeats (or has no message channel) gets
+        // none; its requests are dropped.
+        let send_heartbeats = async move {
+            loop {
+                let config = heartbeat_requests.requested().await;
+                let Some(channel_id) = heartbeat_channel_id else {
+                    trace!("Heartbeat not sent: the client did not advertise it");
+                    continue;
+                };
+                let data = match encode_heartbeat(&config, channel_id, user_channel_id) {
+                    Ok(data) => data,
+                    Err(e) => break Err::<RunState, _>(e),
+                };
+                if let Err(e) = heartbeat_writer.write_all(&data).await {
+                    break Err(anyhow::Error::from(e).context("send heartbeat"));
+                }
+            }
+        };
+
         let state = tokio::select!(
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
             state = dispatch_audio => state,
             state = dispatch_tunnel_inbound => state,
+            state = send_heartbeats => state,
         );
 
         debug!("End of client loop: {state:?}");
@@ -3447,6 +3610,21 @@ impl RdpServer {
         // the Windows Apps announce their host platform. Informational
         // fingerprinting only — a client can claim anything. Skipped on
         // reactivation (same connection, already logged).
+        // (vendored, divergence (30)) For on-demand heartbeats.
+        self.message_channel_id = result.message_channel_id;
+        self.client_early_capability_flags = result.client_early_capability_flags;
+        if !result.reactivation
+            && let Some(handler) = self.connection_handler.as_ref()
+        {
+            let session = ClientSession {
+                supports_heartbeat: self.client_supports_heartbeat(),
+                audio_playback: audio_playback_wanted(result.client_info_flags),
+                supports_error_info: self.client_supports_error_info(),
+            };
+            info!(?session, "client session");
+            handler.borrow_mut().on_client_session(&session);
+        }
+
         if !result.reactivation {
             let platform = result
                 .capabilities
@@ -3491,11 +3669,30 @@ impl RdpServer {
 
         self.static_channels = result.static_channels;
         if !result.reactivation {
-            for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
+            // (vendored, divergence (31)) rdpsnd only for a client that wants
+            // the audio played on its side: without the Server Audio Formats
+            // PDU the client never answers, so the backend never starts its
+            // capture.
+            let audio_playback = audio_playback_wanted(result.client_info_flags);
+            if !audio_playback && self.get_channel_id_by_type::<RdpsndServer>().is_some() {
+                info!(flags = ?result.client_info_flags, "Client asked for no audio playback, rdpsnd not started");
+            }
+            // (vendored, divergence (34)) The AUDIO_INPUT DVC only for a client
+            // that asked to redirect its microphone.
+            if !audio_capture_wanted(result.client_info_flags)
+                && let Some(dvc) = self.get_svc_processor::<ironrdp_dvc::DrdynvcServer>()
+                && dvc.remove_unoffered_channel_by_name(crate::audin::AUDIO_INPUT_CHANNEL_NAME)
+            {
+                info!("Client did not ask for microphone redirection, AUDIO_INPUT not offered");
+            }
+            for (type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
                     continue;
                 };
+                if !audio_playback && type_id == core::any::TypeId::of::<RdpsndServer>() {
+                    continue;
+                }
                 let svc_responses = channel.start()?;
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
@@ -3919,6 +4116,22 @@ impl RdpServer {
         }
     }
 
+    /// (vendored, divergence (30)) MS-RDPBCGR 2.2.16.1: heartbeats ride the
+    /// message channel, and only a client that advertised them gets them.
+    fn client_supports_heartbeat(&self) -> bool {
+        self.message_channel_id.is_some()
+            && self
+                .client_early_capability_flags
+                .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU)
+    }
+
+    /// (vendored, divergence (32)) MS-RDPBCGR 3.3.5.7.1: only a client that
+    /// set `RNS_UD_CS_SUPPORT_ERRINFO_PDU` gets a Set Error Info PDU.
+    fn client_supports_error_info(&self) -> bool {
+        self.client_early_capability_flags
+            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU)
+    }
+
     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
         debug!(?creds, "Changing credentials");
         self.creds = creds
@@ -3980,12 +4193,15 @@ async fn deactivate_all(
 
 struct SharedWriter<'w, W: FramedWrite> {
     writer: Rc<Mutex<&'w mut W>>,
+    /// (vendored, divergence (30)) Stamped after each write.
+    activity: OutputActivity,
 }
 
 impl<W: FramedWrite> Clone for SharedWriter<'_, W> {
     fn clone(&self) -> Self {
         Self {
             writer: Rc::clone(&self.writer),
+            activity: self.activity.clone(),
         }
     }
 }
@@ -4004,15 +4220,98 @@ where
             let mut writer = self.writer.lock().await;
 
             writer.write_all(buf).await?;
+            self.activity.note_write();
             Ok(())
         })
     }
 }
 
 impl<'a, W: FramedWrite> SharedWriter<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
+    fn new(writer: &'a mut W, activity: OutputActivity) -> Self {
         Self {
             writer: Rc::new(Mutex::new(writer)),
+            activity,
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+
+    use super::{AudioLagModel, audio_capture_wanted, audio_playback_wanted};
+
+    /// Waves shipped at `now_ms` before the model drops one.
+    fn shipped_before_drop(lag: &mut AudioLagModel, now_ms: f64, wave_ms: f64) -> usize {
+        let mut n = 0;
+        loop {
+            lag.catch_up(now_ms);
+            if lag.over_limit(now_ms, wave_ms).is_some() {
+                return n;
+            }
+            lag.shipped(wave_ms);
+            n += 1;
+        }
+    }
+
+    /// (divergence (35)) A 250 ms gap (skipped silence), then a burst of waves
+    /// at one instant (the writer stalled): the queue limit stays 200 ms.
+    /// Before, the gap raised it to 450 ms (21 waves).
+    #[test]
+    fn a_short_gap_does_not_raise_the_queue_limit() {
+        let wave = 1024.0 / 48.0;
+        let mut lag = AudioLagModel::default();
+        // One second of sound shipped in real time.
+        for i in 0..47 {
+            let now = f64::from(i) * wave;
+            lag.catch_up(now);
+            assert!(lag.over_limit(now, wave).is_none());
+            lag.shipped(wave);
+        }
+        let after_gap = lag.shipped_ms + 250.0;
+        assert_eq!(lag.catch_up(after_gap), None, "250 ms is no writer stall");
+        assert_eq!(shipped_before_drop(&mut lag, after_gap, wave), 9);
+    }
+
+    /// A long gap is still logged as a stall, and the limit is the same.
+    #[test]
+    fn a_long_gap_resyncs_and_reports_the_deficit() {
+        let wave = 1024.0 / 48.0;
+        let mut lag = AudioLagModel::default();
+        lag.shipped(wave);
+        let d = lag.catch_up(wave + 400.0).expect("a 400 ms deficit is reported");
+        assert!((d - 400.0).abs() < 1e-9);
+        assert_eq!(shipped_before_drop(&mut lag, wave + 400.0, wave), 9);
+    }
+
+    /// A queue that is not empty is kept: no catch-up while waves are ahead.
+    #[test]
+    fn a_full_queue_is_not_reset() {
+        let mut lag = AudioLagModel::default();
+        lag.shipped(150.0);
+        assert_eq!(lag.catch_up(100.0), None);
+        assert!((lag.shipped_ms - 150.0).abs() < 1e-9);
+        assert!(lag.over_limit(100.0, 100.0).is_none());
+        assert!(lag.over_limit(100.0, 160.0).is_some());
+    }
+
+    /// (divergence (34)) mstsc "Record from this computer" sets INFO_AUDIOCAPTURE.
+    #[test]
+    fn audio_capture_follows_the_client_info_flags() {
+        assert!(!audio_capture_wanted(ClientInfoFlags::UNICODE | ClientInfoFlags::MOUSE));
+        assert!(!audio_capture_wanted(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert!(audio_capture_wanted(
+            ClientInfoFlags::AUDIO_CAPTURE | ClientInfoFlags::NO_AUDIO_PLAYBACK
+        ));
+    }
+
+    /// (divergence (31)) mstsc "Remote audio": play on this computer / do not
+    /// play / play on the remote computer.
+    #[test]
+    fn audio_playback_follows_the_client_info_flags() {
+        assert!(audio_playback_wanted(ClientInfoFlags::empty()));
+        assert!(audio_playback_wanted(ClientInfoFlags::UNICODE | ClientInfoFlags::MOUSE));
+        assert!(!audio_playback_wanted(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert!(!audio_playback_wanted(ClientInfoFlags::REMOTE_CONSOLE_AUDIO));
     }
 }
