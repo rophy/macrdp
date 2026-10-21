@@ -1859,17 +1859,17 @@ impl Gfx {
     }
 
     /// Whether `submit_bgra` wants the tiles the next frame changed (lossless
-    /// text refinement is on and they can matter; see
-    /// `Refine::wants_changed_tiles`).
-    pub fn wants_changed_tiles(&self) -> bool {
+    /// text refinement is on and they can matter), and the tiles it need not
+    /// compare (see `Refine::compare_skip`).
+    pub fn changed_tiles_wanted(&self) -> Option<refine::TileGrid> {
         if !self.lossless_text {
-            return false;
+            return None;
         }
         let guard = self.ctx.lock().unwrap();
         guard
             .as_ref()
             .filter(|c| c.is_ready)
-            .is_some_and(|c| c.refine.lock().unwrap().wants_changed_tiles())
+            .and_then(|c| c.refine.lock().unwrap().compare_skip())
     }
 
     /// Turn lossless text refinement on or off (see `crate::refine`).

@@ -184,7 +184,15 @@ impl TileGrid {
     /// too: the cost of a tile marked for nothing is one tile in the next
     /// H.264 region. With no usable `last` (another length, a bad stride)
     /// everything is copied and marked.
-    pub fn mark_changed_copy(&mut self, last: &mut Vec<u8>, cur: &[u8], stride: usize) {
+    /// Tiles set in `skip` (a grid of the same size) are not compared and
+    /// not marked.
+    pub fn mark_changed_copy(
+        &mut self,
+        last: &mut Vec<u8>,
+        cur: &[u8],
+        stride: usize,
+        skip: Option<&TileGrid>,
+    ) {
         let row_bytes = self.width as usize * 4;
         let usable = self.width > 0
             && self.height > 0
@@ -202,6 +210,14 @@ impl TileGrid {
             .collect();
         let len = cur.len();
         let mut row_buf = vec![0u8; stride];
+        // Skipped tiles count as marked while comparing, and are unmarked at
+        // the end.
+        let skip = skip.filter(|s| s.set.len() == self.set.len());
+        if let Some(s) = skip {
+            for (t, &k) in self.set.iter_mut().zip(&s.set) {
+                *t |= k;
+            }
+        }
         for row in 0..self.rows {
             let (y0, y1) = (self.y_edge(row) as usize, self.y_edge(row + 1) as usize);
             let first = (row * self.cols) as usize;
@@ -226,6 +242,11 @@ impl TileGrid {
                 }
                 a.copy_from_slice(b);
                 all = tiles.iter().all(|&t| t);
+            }
+        }
+        if let Some(s) = skip {
+            for (t, &k) in self.set.iter_mut().zip(&s.set) {
+                *t &= !k;
             }
         }
     }
@@ -379,6 +400,8 @@ impl TileGrid {
 /// before it; `last` becomes a copy of `cur` (see
 /// [`TileGrid::mark_changed_copy`]). `prev_ok` says that `last` is a frame of
 /// the same size and stride; else all tiles count as changed.
+///
+/// Tiles set in `skip` are not compared (see [`Refine::compare_skip`]).
 pub fn diff_copy(
     last: &mut Vec<u8>,
     cur: &[u8],
@@ -386,12 +409,13 @@ pub fn diff_copy(
     width: u32,
     height: u32,
     prev_ok: bool,
+    skip: Option<&TileGrid>,
 ) -> TileGrid {
     let mut g = TileGrid::new(width, height);
     if !prev_ok {
         last.clear();
     }
-    g.mark_changed_copy(last, cur, stride);
+    g.mark_changed_copy(last, cur, stride, skip);
     g
 }
 
@@ -733,13 +757,16 @@ impl Refine {
         }
     }
 
-    /// Whether the tiles a new frame changed matter: while every tile is
-    /// pending (full-screen motion), the next frame updates the whole surface
-    /// anyway, so the capture loop need not compare the frames (it costs
-    /// 2-3 % of a core in full-screen motion at 60 fps). A frame given without
-    /// its changed tiles marks all of them, which is the same then.
-    pub fn wants_changed_tiles(&self) -> bool {
-        !self.pending.is_full()
+    /// The tiles whose change does not matter for the next frame, or None
+    /// when no tile's change matters. Pending tiles are in the next frame's
+    /// regions anyway (and only this capture thread removes tiles from
+    /// `pending`, after the frame is encoded), so the capture loop need not
+    /// compare them: comparing reads the kept frame copy, ~0.7 ms per
+    /// 1280x960 frame in motion. While every tile is pending (full-screen
+    /// motion) nothing is compared; a frame given without its changed tiles
+    /// marks all of them, which is the same then.
+    pub fn compare_skip(&self) -> Option<TileGrid> {
+        (!self.pending.is_full()).then(|| self.pending.clone())
     }
 
     /// Regions for the frame about to be encoded, or None when nothing on the
@@ -1018,23 +1045,23 @@ mod tests {
         assert!(g.is_full());
         // `diff_copy`: the same tiles, and `last` becomes `cur` (padding too).
         let mut last = prev.clone();
-        let g = diff_copy(&mut last, &cur, stride, w, h, true);
+        let g = diff_copy(&mut last, &cur, stride, w, h, true, None);
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(1, 0)]);
         assert_eq!(last, cur);
         let mut last = prev.clone();
         cur[5 * stride + 64 * 4 + 3] = 7; // padding only, besides the pixel
-        let g = diff_copy(&mut last, &cur, stride, w, h, true);
+        let g = diff_copy(&mut last, &cur, stride, w, h, true, None);
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(1, 0)]);
         assert_eq!(last, cur);
         // No usable previous frame, or another length: everything, full copy.
         let mut last = prev.clone();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, false).is_full());
+        assert!(diff_copy(&mut last, &cur, stride, w, h, false, None).is_full());
         assert_eq!(last, cur);
         let mut last = prev[..100].to_vec();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, true).is_full());
+        assert!(diff_copy(&mut last, &cur, stride, w, h, true, None).is_full());
         assert_eq!(last, cur);
         let mut last = cur.clone();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, true).is_empty());
+        assert!(diff_copy(&mut last, &cur, stride, w, h, true, None).is_empty());
     }
 
     #[test]
@@ -1358,7 +1385,7 @@ mod tests {
         match prev {
             None => r.on_captured(None),
             Some(p) => {
-                let g = diff_copy(&mut p.to_vec(), cur, w as usize * 4, w, h, true);
+                let g = diff_copy(&mut p.to_vec(), cur, w as usize * 4, w, h, true, None);
                 r.on_captured(Some(&g));
             }
         }
@@ -1413,9 +1440,9 @@ mod tests {
     #[test]
     fn no_compare_needed_while_every_tile_is_pending() {
         let mut r = Refine::new(128, 64);
-        assert!(r.wants_changed_tiles());
+        assert!(r.compare_skip().is_some_and(|g| g.is_empty()));
         r.on_shipped(&Regions::Whole, Instant::now());
-        assert!(!r.wants_changed_tiles());
+        assert!(r.compare_skip().is_none());
         // A frame given without its tiles: whole, as it would be anyway.
         cap(&mut r, None, &frame(128, 64, 0), 128, 64);
         assert!(matches!(r.regions(false), Some(Regions::Whole)));
@@ -1486,6 +1513,29 @@ mod tests {
             reset(&mut r);
             assert_ne!(before, r.job_tag(3));
         }
+    }
+
+    #[test]
+    fn skipped_tiles_are_copied_but_not_compared() {
+        let (w, h) = (128u32, 64u32);
+        let stride = 512;
+        let prev = frame(w, h, 0);
+        let mut cur = prev.clone();
+        cur[(5 * 128 + 10) * 4] = 1; // tile (0, 0)
+        cur[(40 * 128 + 100) * 4] = 1; // tile (3, 1)
+        let mut skip = TileGrid::new(w, h);
+        let mut one = frame(w, h, 0);
+        one[(40 * 128 + 100) * 4] = 1;
+        skip.mark_changed(&prev, &one, stride); // skip tile (3, 1)
+        let mut last = prev.clone();
+        let g = diff_copy(&mut last, &cur, stride, w, h, true, Some(&skip));
+        assert_eq!(g.tiles().collect::<Vec<_>>(), [(0, 0)]);
+        assert_eq!(last, cur, "skipped tiles are copied too");
+        // Every tile skipped: nothing compared, all copied.
+        skip.mark_all();
+        let mut last = prev.clone();
+        assert!(diff_copy(&mut last, &cur, stride, w, h, true, Some(&skip)).is_empty());
+        assert_eq!(last, cur);
     }
 
     #[test]

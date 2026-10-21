@@ -1745,7 +1745,7 @@ mod macos {
                     // while updating the copy of the last frame, in one pass
                     // (`last_frame` is then this frame, whatever `submit_bgra`
                     // answers; see `crate::refine::diff_copy`).
-                    let changed = gfx.wants_changed_tiles().then(|| {
+                    let changed = gfx.changed_tiles_wanted().map(|skip| {
                         let prev_ok = self.last_stride == stride_bytes
                             && self.last_dims == (pb_width, pb_height);
                         let g = crate::refine::diff_copy(
@@ -1755,6 +1755,7 @@ mod macos {
                             u32::from(pb_width),
                             u32::from(pb_height),
                             prev_ok,
+                            Some(&skip),
                         );
                         self.last_stride = stride_bytes;
                         self.last_dims = (pb_width, pb_height);
