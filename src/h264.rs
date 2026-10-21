@@ -97,7 +97,7 @@ const UDP_KEYFRAME_SECS: f32 = 2.0;
 
 /// A client that sent no EGFX frame ack this long after EGFX ready is taken as
 /// one that does not ack: the EGFX frame window stops holding its frames.
-const NO_ACK_GRACE: Duration = Duration::from_secs(5);
+const NO_ACK_GRACE: Duration = Duration::from_secs(2);
 
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
 /// ignores the ack-lag congestion signal. At connect the encoder ships an initial
