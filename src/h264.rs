@@ -81,6 +81,14 @@ use crate::videotoolbox::{EncodedFrame, Encoder};
 /// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
 const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
 
+/// Default periodic keyframe over TCP, in seconds of *encoded* frames (frames
+/// at the capture rate): an IDR after 60 s of continuous motion, after ~6 min of
+/// a blinking caret, never on a static screen (no frame is encoded). A safety
+/// net for a client decode glitch that only a keyframe clears (the reason the
+/// fork had a 2 s IDR, 245f1ee); not reproduced on Windows 10 mstsc in 10 min of
+/// typing and scrolling without it (R41).
+const TCP_SAFETY_KEYFRAME_SECS: u32 = 60;
+
 /// Periodic keyframe interval (seconds) while EGFX is on a UDP tunnel and
 /// `--keyframe-interval` is 0 (the default). On UDP a frame can be lost, and the
 /// periodic IDR is the backstop for a loss that no other path heals
@@ -1569,7 +1577,11 @@ impl Gfx {
         // derivation as Encoder::new), and a stretched value (~10 min) that
         // effectively suppresses the periodic IDR for the duration of a congestion
         // episode without a hard "never" (VT still honors forced keyframes).
-        let tcp_keyframe_frames = crate::videotoolbox::keyframe_frames(fps, keyframe_secs);
+        let tcp_keyframe_frames = if keyframe_secs > 0.0 {
+            crate::videotoolbox::keyframe_frames(fps, keyframe_secs)
+        } else {
+            fps.max(1).saturating_mul(TCP_SAFETY_KEYFRAME_SECS)
+        };
         let udp_keyframe_frames = crate::videotoolbox::keyframe_frames(
             fps,
             if keyframe_secs > 0.0 {
@@ -2761,6 +2773,11 @@ impl Gfx {
             ctx.encoder = Some(encoder);
             // The new encoder has the TCP periodic-keyframe interval.
             ctx.keyframe_on_udp = false;
+            if let Some(enc) = ctx.encoder.as_ref() {
+                if let Err(e) = enc.set_keyframe_interval(self.periodic_keyframe_frames(false)) {
+                    trace!(error = ?e, "TCP set_keyframe_interval failed");
+                }
+            }
             // A frame dropped before belongs to the old encoder (maybe another size).
             self.latest_dropped.store(false, Ordering::Relaxed);
             // Fresh throttle counters for this connection.
@@ -5414,7 +5431,8 @@ mod tests {
     #[test]
     fn no_periodic_keyframe_on_tcp_by_default_but_a_backstop_on_udp() {
         let gfx = gfx_with_keyframe(0.0);
-        assert_eq!(gfx.periodic_keyframe_frames(false), 60 * 3600);
+        // TCP: the safety net counts encoded frames (60 s of motion).
+        assert_eq!(gfx.periodic_keyframe_frames(false), 60 * 60);
         assert_eq!(gfx.periodic_keyframe_frames(true), 120);
         assert!(gfx.stretched_keyframe_frames > gfx.periodic_keyframe_frames(true));
         // An explicit interval applies on both transports.

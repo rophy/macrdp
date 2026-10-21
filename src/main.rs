@@ -212,8 +212,8 @@ struct Args {
     #[arg(long)]
     hidpi: bool,
 
-    /// Frame rate cap. Defaults to 15 for the legacy bitmap path, or 60 with
-    /// --enable-h264 (H.264 over mstsc holds a ~2-frame presentation buffer, so
+    /// Frame rate cap. Defaults to 60 with H.264 (the default), or 15 with
+    /// --no-h264 (H.264 over mstsc holds a ~2-frame presentation buffer, so
     /// 60fps keeps that buffer's wall-clock latency low enough that typing feels
     /// immediate — at 30fps it lags ~2 keystrokes). Set explicitly to override.
     #[arg(long)]
@@ -456,8 +456,10 @@ struct Args {
     bitrate: Option<u32>,
 
     /// H.264 periodic keyframe (IDR) interval in seconds (H.264
-    /// only). Default 0 = no periodic keyframe while the video runs
-    /// over TCP: TCP delivers every frame, and an IDR is ~50x a P-frame (about
+    /// only). Default 0 = no time-based keyframe while the video runs over
+    /// TCP, only a safety-net IDR after 60 s worth of encoded frames (60 s of
+    /// continuous motion; never on a static screen, where nothing is encoded).
+    /// TCP delivers every frame, and an IDR is ~50x a P-frame (about
     /// 290 KB at 720p), so a 2 s interval spent ~0.3 Mbps on a screen with only
     /// a blinking caret. Keyframes are still forced when the client needs one
     /// (first frame, new surface, resume after minimize, blank recovery, the
@@ -3294,8 +3296,14 @@ async fn async_main() -> Result<()> {
     };
 
     // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
-    // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for
-    // the legacy bitmap path (which has no such buffer and is bandwidth-heavier).
+    // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 with
+    // --no-h264 (the legacy bitmap path has no such buffer). It is chosen here,
+    // before any client connects, so a client without AVC420 that falls back to
+    // bitmaps under the H.264 default also captures at 60. Measured (FreeRDP
+    // 3.30 `/gfx:RFX` and `-gfx`, 2026-10-21): the bitmap path is link-bound
+    // (~62-64 Mbps) at 60 and at 15 fps; motion 13.7 vs 13.4 fps shown, 143 vs
+    // 136 % server CPU; scroll 19.6 vs 14.7 fps. So 60 costs little and scrolls
+    // smoother; it is kept.
     let fps = args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 });
 
     // Live session desktop size, shared by capture, input scaling, and the

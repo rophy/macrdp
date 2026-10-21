@@ -110,7 +110,8 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --no-adaptive-bitrate it is a fixed target. Config key:
                           BITRATE (the menu-bar controller's Video tab sets it).
 --keyframe-interval SECS  H.264 periodic keyframe (IDR) interval in seconds
-                          (default 0 = none over TCP; on a UDP tunnel this value,
+                          (default 0 = over TCP only a safety-net IDR after 60 s of
+                          encoded frames; on a UDP tunnel this value,
                           or 2 s when 0). H.264 only. Keyframes are
                           still forced when the client needs one; fractional
                           values OK.

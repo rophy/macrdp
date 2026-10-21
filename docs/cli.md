@@ -223,7 +223,8 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   bitrate (default) it's the
                           #   ceiling the encoder backs off from under congestion;
                           #   otherwise a fixed target. Config key: BITRATE.
---keyframe-interval SECS  # periodic IDR (default 0 = none over TCP; 2 s on a UDP tunnel
+--keyframe-interval SECS  # periodic IDR (default 0 = over TCP only after 60 s of encoded
+                          #   frames; 2 s on a UDP tunnel
                           #   when 0; H.264 only)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
