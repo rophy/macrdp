@@ -1598,8 +1598,27 @@ impl ShipFrame {
 #[derive(Debug)]
 enum Paired {
     Frame(ShipFrame),
-    /// An auxiliary view whose main view the encoder did not deliver.
-    Stray(EncodedFrame),
+    /// An auxiliary view that is not sent: the encoder did not deliver its
+    /// main view, or the main view already went alone (the auxiliary view came
+    /// after `AUX_VIEW_WAIT`).
+    Stray {
+        view: EncodedFrame,
+        /// Counts as a frame of its own for the in-flight counters: false
+        /// when its main view was already counted (shipped alone).
+        counted: bool,
+    },
+}
+
+impl Paired {
+    /// Encoded frames (`submit_bgra` calls) this output finishes: each
+    /// `submitted` frame must be counted once in `shipped`, or the
+    /// refinement gate (`submitted == shipped`) never sees an empty pipeline.
+    fn frames(&self) -> u64 {
+        match self {
+            Paired::Frame(_) | Paired::Stray { counted: true, .. } => 1,
+            Paired::Stray { counted: false, .. } => 0,
+        }
+    }
 }
 
 /// Pairs the AVC444 views from the encoder output: each main view (even PTS)
@@ -1608,6 +1627,8 @@ enum Paired {
 #[derive(Default)]
 struct ViewPairing {
     main: Option<EncodedFrame>,
+    /// PTS of the last main view that went alone.
+    alone: Option<i64>,
 }
 
 impl ViewPairing {
@@ -1629,9 +1650,11 @@ impl ViewPairing {
             }
             other => {
                 if let Some(main) = other {
+                    self.alone = Some(main.pts);
                     out.push(Paired::Frame(ShipFrame::Avc444 { main, aux: None }));
                 }
-                out.push(Paired::Stray(f));
+                let counted = self.alone.map(|p| p.wrapping_add(1)) != Some(f.pts);
+                out.push(Paired::Stray { view: f, counted });
             }
         }
     }
@@ -1639,6 +1662,7 @@ impl ViewPairing {
     /// Send a waiting main view alone.
     fn flush(&mut self, out: &mut Vec<Paired>) {
         if let Some(main) = self.main.take() {
+            self.alone = Some(main.pts);
             out.push(Paired::Frame(ShipFrame::Avc444 { main, aux: None }));
         }
     }
@@ -3418,7 +3442,7 @@ impl Gfx {
             while let Ok(f) = rx.try_recv() {
                 frames.push(f);
             }
-            let (items, strays) = if avc444 {
+            let (items, strays, done) = if avc444 {
                 let mut paired = Vec::new();
                 for f in frames {
                     pairing.push(f, &mut paired);
@@ -3426,19 +3450,22 @@ impl Gfx {
                 if timed_out {
                     pairing.flush(&mut paired);
                 }
+                let done: u64 = paired.iter().map(Paired::frames).sum();
                 let mut items = Vec::new();
                 let mut strays = Vec::new();
                 for p in paired {
                     match p {
                         Paired::Frame(f) => items.push(f),
-                        Paired::Stray(f) => strays.push(f.pts),
+                        Paired::Stray { view, .. } => strays.push(view.pts),
                     }
                 }
-                (items, strays)
+                (items, strays, done)
             } else {
+                let n = frames.len() as u64;
                 (
                     frames.into_iter().map(ShipFrame::Avc420).collect(),
                     Vec::new(),
+                    n,
                 )
             };
             if !strays.is_empty() {
@@ -3449,7 +3476,7 @@ impl Gfx {
                     warn!(error = ?e, "EGFX ship_frames failed");
                 }
             }
-            shipped.fetch_add((items.len() + strays.len()) as u64, Ordering::Relaxed);
+            shipped.fetch_add(done, Ordering::Relaxed);
         }
         debug!("EGFX ship loop exiting (output channel closed)");
     }
@@ -3466,8 +3493,9 @@ impl Gfx {
         self.latest_dropped.store(true, Ordering::Relaxed);
         warn!(
             ?pts,
-            "EGFX AVC444 auxiliary view without its main view (the encoder dropped a frame): \
-             not sent; the next frame is a keyframe"
+            "EGFX AVC444 auxiliary view not sent (its main view was dropped by the encoder, or \
+             went alone after the wait): the next frame is a keyframe; frames already encoded \
+             against it show wrong pixels until then"
         );
     }
 
@@ -6685,7 +6713,7 @@ mod tests {
                 (main.pts, aux.as_ref().map(|a| a.pts), false)
             }
             Paired::Frame(ShipFrame::Avc420(f)) => (f.pts, None, false),
-            Paired::Stray(f) => (f.pts, None, true),
+            Paired::Stray { view, .. } => (view.pts, None, true),
         }
     }
 
@@ -6721,6 +6749,38 @@ mod tests {
             ]
         );
         assert!(!p.waiting());
+    }
+
+    /// Every encoded frame counts once in `shipped` (R45 review I2): a main
+    /// view that went alone after the wait, then its late auxiliary view, is
+    /// one frame; an auxiliary view whose main view the encoder dropped is one
+    /// frame; a main view whose auxiliary view never came (encoder dropped it,
+    /// or its submit failed) is one frame.
+    #[test]
+    fn avc444_views_count_each_frame_once() {
+        let count = |pushes: &[i64], timeouts_after: &[usize]| {
+            let mut p = ViewPairing::default();
+            let mut out = Vec::new();
+            for (i, &pts) in pushes.iter().enumerate() {
+                p.push(view(pts, false), &mut out);
+                if timeouts_after.contains(&i) {
+                    p.flush(&mut out);
+                }
+            }
+            p.flush(&mut out);
+            out.iter().map(Paired::frames).sum::<u64>()
+        };
+        // Late auxiliary view: main 0 times out, aux 1 comes later.
+        assert_eq!(count(&[0, 1], &[0]), 1);
+        // Late auxiliary view, then normal pairs.
+        assert_eq!(count(&[0, 1, 2, 3, 4, 5], &[0]), 3);
+        // Failed / dropped auxiliary view: main 0 alone, then main 2 + aux 3.
+        assert_eq!(count(&[0, 2, 3], &[]), 2);
+        assert_eq!(count(&[0], &[0]), 1);
+        // Dropped main view: aux 3 alone is still one frame.
+        assert_eq!(count(&[0, 1, 3], &[]), 2);
+        // Normal pairs.
+        assert_eq!(count(&[0, 1, 2, 3], &[]), 2);
     }
 
     /// A frame is a keyframe when either view is one (the periodic interval

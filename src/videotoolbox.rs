@@ -239,25 +239,28 @@ impl Encoder {
                 &mut self.yuv_scratch,
             );
             let (w, h) = (planes.width(), planes.height());
-            ffi::encode_nv12(
-                &self.inner,
-                w,
-                h,
-                pts,
-                self.fps,
-                force_keyframe,
-                |y, ys, c, cs| planes.fill_main(y, ys, c, cs),
-            )?;
+            let inner = &self.inner;
+            let fps = self.fps;
+            let planes = &*planes;
             // The auxiliary view follows its main view; a forced keyframe is
             // the main view, so the periodic keyframes stay on main views too.
-            return ffi::encode_nv12(
-                &self.inner,
-                w,
-                h,
-                pts.wrapping_add(1),
-                self.fps,
-                false,
-                |y, ys, c, cs| planes.fill_aux(y, ys, c, cs),
+            return submit_views(
+                || {
+                    ffi::encode_nv12(inner, w, h, pts, fps, force_keyframe, |y, ys, c, cs| {
+                        planes.fill_main(y, ys, c, cs)
+                    })
+                },
+                || {
+                    ffi::encode_nv12(
+                        inner,
+                        w,
+                        h,
+                        pts.wrapping_add(1),
+                        fps,
+                        false,
+                        |y, ys, c, cs| planes.fill_aux(y, ys, c, cs),
+                    )
+                },
             );
         }
         let pts = self.next_pts;
@@ -297,6 +300,20 @@ impl Encoder {
         ffi::complete_frames(&self.inner)?;
         Ok(self.drain())
     }
+}
+
+/// Submit the two views of an AVC444 frame. Once the main view is in the
+/// encoder the frame counts as submitted (the caller counts it in
+/// `submitted`): a failed auxiliary view is logged and the frame goes
+/// luma-only (the ship thread sends a main view alone after its wait), so
+/// `submitted` and `shipped` stay equal. A failed main view fails the frame
+/// and the auxiliary view is not tried.
+fn submit_views(main: impl FnOnce() -> Result<()>, aux: impl FnOnce() -> Result<()>) -> Result<()> {
+    main()?;
+    if let Err(e) = aux() {
+        tracing::warn!(error = ?e, "AVC444 auxiliary view not encoded; the frame goes luma-only");
+    }
+    Ok(())
 }
 
 // VT's compression session is thread-safe according to Apple's docs
@@ -2052,5 +2069,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// R45 review I2: a failed auxiliary view does not fail the frame (its
+    /// main view is in the encoder and will be shipped and counted); a failed
+    /// main view fails it and skips the auxiliary view.
+    #[test]
+    fn a_failed_auxiliary_view_still_submits_the_frame() {
+        let aux_ran = std::cell::Cell::new(false);
+        assert!(super::submit_views(
+            || Ok(()),
+            || {
+                aux_ran.set(true);
+                Err(anyhow!("aux failed"))
+            }
+        )
+        .is_ok());
+        assert!(aux_ran.get());
+        aux_ran.set(false);
+        assert!(super::submit_views(
+            || Err(anyhow!("main failed")),
+            || {
+                aux_ran.set(true);
+                Ok(())
+            }
+        )
+        .is_err());
+        assert!(!aux_ran.get());
     }
 }
