@@ -1982,7 +1982,7 @@ impl Gfx {
 
     ///
     /// `changed` is the tiles in which this frame differs from the one given
-    /// before (`crate::refine::diff_frames`), for lossless refinement; `None`
+    /// before (`crate::refine::diff_copy`), for lossless refinement; `None`
     /// counts as all changed. `dims` is the size of `bgra` in pixels.
     pub fn submit_bgra(
         &self,

@@ -174,10 +174,66 @@ impl TileGrid {
         self.set.fill(true);
     }
 
+    /// Mark the tiles in which `cur` differs from `last` (two BGRA frames of
+    /// this grid's size with the same `stride`) and make `last` a copy of
+    /// `cur`, in one pass over `cur`: each row of `cur` is read once into a
+    /// small row buffer, compared with the row of `last`, and copied into
+    /// `last` only when it differs. The capture loop keeps a copy of the last
+    /// frame anyway, so the compare adds little to that copy (a copy followed
+    /// by a second compare pass cost ~0.7 ms per 1280x960 frame). Alpha counts
+    /// too: the cost of a tile marked for nothing is one tile in the next
+    /// H.264 region. With no usable `last` (another length, a bad stride)
+    /// everything is copied and marked.
+    pub fn mark_changed_copy(&mut self, last: &mut Vec<u8>, cur: &[u8], stride: usize) {
+        let row_bytes = self.width as usize * 4;
+        let usable = self.width > 0
+            && self.height > 0
+            && stride >= row_bytes
+            && last.len() == cur.len()
+            && cur.len() >= stride * (self.height as usize - 1) + row_bytes;
+        if !usable {
+            last.clear();
+            last.extend_from_slice(cur);
+            self.mark_all();
+            return;
+        }
+        let col_bytes: Vec<(usize, usize)> = (0..self.cols)
+            .map(|c| (self.x_edge(c) as usize * 4, self.x_edge(c + 1) as usize * 4))
+            .collect();
+        let len = cur.len();
+        let mut row_buf = vec![0u8; stride];
+        for row in 0..self.rows {
+            let (y0, y1) = (self.y_edge(row) as usize, self.y_edge(row + 1) as usize);
+            let first = (row * self.cols) as usize;
+            let tiles = &mut self.set[first..first + self.cols as usize];
+            let mut all = tiles.iter().all(|&t| t);
+            for y in y0..y1 {
+                let (s0, s1) = (y * stride, ((y + 1) * stride).min(len));
+                if all {
+                    last[s0..s1].copy_from_slice(&cur[s0..s1]);
+                    continue;
+                }
+                let b = &mut row_buf[..s1 - s0];
+                b.copy_from_slice(&cur[s0..s1]);
+                let a = &mut last[s0..s1];
+                if *a == *b {
+                    continue;
+                }
+                for (c, &(x0, x1)) in col_bytes.iter().enumerate() {
+                    if !tiles[c] && a[x0..x1] != b[x0..x1] {
+                        tiles[c] = true;
+                    }
+                }
+                a.copy_from_slice(b);
+                all = tiles.iter().all(|&t| t);
+            }
+        }
+    }
+
     /// Mark the tiles in which `cur` differs from `prev` (two BGRA frames of
-    /// this grid's size with the same `stride`). Alpha counts too: the cost of
-    /// a tile marked for nothing is one tile in the next H.264 region. Frames
-    /// that are too short mark everything.
+    /// this grid's size with the same `stride`). Frames that are too short
+    /// mark everything.
+    #[cfg(test)]
     pub fn mark_changed(&mut self, prev: &[u8], cur: &[u8], stride: usize) {
         let row_bytes = self.width as usize * 4;
         let usable = self.width > 0
@@ -319,16 +375,12 @@ impl TileGrid {
 }
 
 /// The tiles in which the captured frame `cur` (`width` x `height` pixels,
-/// `stride` bytes per row) differs from `prev`, the frame captured before it.
-/// `prev_ok` says that `prev` is a frame of the same size and stride; else
-/// all tiles count as changed.
-///
-/// Both frames should be in normal memory: the capture loop copies the
-/// capture buffer first (it keeps that copy anyway) and compares the copies.
-/// Reading the capture buffer twice (compare, then copy) cost 2-3 % of a core
-/// more in full-screen motion than one copy.
-pub fn diff_frames(
-    prev: &[u8],
+/// `stride` bytes per row) differs from `last`, the copy of the frame captured
+/// before it; `last` becomes a copy of `cur` (see
+/// [`TileGrid::mark_changed_copy`]). `prev_ok` says that `last` is a frame of
+/// the same size and stride; else all tiles count as changed.
+pub fn diff_copy(
+    last: &mut Vec<u8>,
     cur: &[u8],
     stride: usize,
     width: u32,
@@ -336,11 +388,10 @@ pub fn diff_frames(
     prev_ok: bool,
 ) -> TileGrid {
     let mut g = TileGrid::new(width, height);
-    if prev_ok && prev.len() == cur.len() {
-        g.mark_changed(prev, cur, stride);
-    } else {
-        g.mark_all();
+    if !prev_ok {
+        last.clear();
     }
+    g.mark_changed_copy(last, cur, stride);
     g
 }
 
@@ -671,7 +722,7 @@ impl Refine {
         self.seq = 0;
     }
 
-    /// A captured frame changed the tiles `changed` (see [`diff_frames`]; None:
+    /// A captured frame changed the tiles `changed` (see [`diff_copy`]; None:
     /// all, a grid of another size: all): those tiles go into the next
     /// encoded frame.
     pub fn on_captured(&mut self, changed: Option<&TileGrid>) {
@@ -965,10 +1016,25 @@ mod tests {
         g.clear();
         g.mark_changed(&prev[..100], &cur, stride);
         assert!(g.is_full());
-        // `diff_frames`: no usable previous frame, or another length: everything.
-        assert!(diff_frames(&prev, &cur, stride, w, h, false).is_full());
-        assert!(diff_frames(&prev[..100], &cur, stride, w, h, true).is_full());
-        assert!(diff_frames(&cur, &cur, stride, w, h, true).is_empty());
+        // `diff_copy`: the same tiles, and `last` becomes `cur` (padding too).
+        let mut last = prev.clone();
+        let g = diff_copy(&mut last, &cur, stride, w, h, true);
+        assert_eq!(g.tiles().collect::<Vec<_>>(), [(1, 0)]);
+        assert_eq!(last, cur);
+        let mut last = prev.clone();
+        cur[5 * stride + 64 * 4 + 3] = 7; // padding only, besides the pixel
+        let g = diff_copy(&mut last, &cur, stride, w, h, true);
+        assert_eq!(g.tiles().collect::<Vec<_>>(), [(1, 0)]);
+        assert_eq!(last, cur);
+        // No usable previous frame, or another length: everything, full copy.
+        let mut last = prev.clone();
+        assert!(diff_copy(&mut last, &cur, stride, w, h, false).is_full());
+        assert_eq!(last, cur);
+        let mut last = prev[..100].to_vec();
+        assert!(diff_copy(&mut last, &cur, stride, w, h, true).is_full());
+        assert_eq!(last, cur);
+        let mut last = cur.clone();
+        assert!(diff_copy(&mut last, &cur, stride, w, h, true).is_empty());
     }
 
     #[test]
@@ -1292,7 +1358,7 @@ mod tests {
         match prev {
             None => r.on_captured(None),
             Some(p) => {
-                let g = diff_frames(p, cur, w as usize * 4, w, h, true);
+                let g = diff_copy(&mut p.to_vec(), cur, w as usize * 4, w, h, true);
                 r.on_captured(Some(&g));
             }
         }

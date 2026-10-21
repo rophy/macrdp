@@ -978,9 +978,6 @@ mod macos {
         last_stride: usize,
         /// Size in pixels of `last_frame`.
         last_dims: (u16, u16),
-        /// The frame before `last_frame` (lossless text refinement compares
-        /// the two; the buffers swap on each frame).
-        prev_frame: Vec<u8>,
         /// Color limit for lossless text refinement (see `crate::refine`): the
         /// picture scale against the display pixels decides it.
         refine_color_share: usize,
@@ -1254,7 +1251,6 @@ mod macos {
                 last_frame: Vec::new(),
                 last_stride: 0,
                 last_dims: (0, 0),
-                prev_frame: Vec::new(),
                 refine_color_share,
                 capture_started: Instant::now(),
                 held_frame: false,
@@ -1745,26 +1741,24 @@ mod macos {
                     } else {
                         false
                     };
-                    // Lossless text refinement: copy this frame first (`last_frame`
-                    // is then this frame, whatever `submit_bgra` answers) and
-                    // compare the copy with the frame before it, in normal
-                    // memory (see `crate::refine::diff_frames`).
+                    // Lossless text refinement: find the tiles that changed
+                    // while updating the copy of the last frame, in one pass
+                    // (`last_frame` is then this frame, whatever `submit_bgra`
+                    // answers; see `crate::refine::diff_copy`).
                     let changed = gfx.wants_changed_tiles().then(|| {
                         let prev_ok = self.last_stride == stride_bytes
                             && self.last_dims == (pb_width, pb_height);
-                        std::mem::swap(&mut self.prev_frame, &mut self.last_frame);
-                        self.last_frame.clear();
-                        self.last_frame.extend_from_slice(src);
-                        self.last_stride = stride_bytes;
-                        self.last_dims = (pb_width, pb_height);
-                        crate::refine::diff_frames(
-                            &self.prev_frame,
-                            &self.last_frame,
+                        let g = crate::refine::diff_copy(
+                            &mut self.last_frame,
+                            src,
                             stride_bytes,
                             u32::from(pb_width),
                             u32::from(pb_height),
                             prev_ok,
-                        )
+                        );
+                        self.last_stride = stride_bytes;
+                        self.last_dims = (pb_width, pb_height);
+                        g
                     });
                     match gfx.submit_bgra(
                         src,
