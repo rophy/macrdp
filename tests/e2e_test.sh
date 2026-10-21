@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E smoke test for macrdp
 # Runs from a Linux machine with FreeRDP 3 (H.264 support needed) against a Mac running macrdp, started as
-#   macrdp --bind 0.0.0.0:<port> --username <user> --password-file <file> [--idle-timeout <secs>]
+#   macrdp --bind 0.0.0.0:<port> --username <user> --password-file <file> [--idle-timeout <secs>] [--avc444]
 #
 # Usage: MACRDP_USER=<user> MACRDP_PASS_FILE=<file> ./tests/e2e_test.sh <host> [port]
 #   or set MACRDP_HOST / MACRDP_PORT instead of arguments (port default: 3390)
@@ -13,6 +13,8 @@
 #   MACRDP_MAC_SHELL: command that runs a shell script from stdin on the Mac as the logged-in
 #     user, e.g. "ssh user@mac sh" (enables test 10, clipboard file copy; leaves an empty string on the pasteboard)
 #   MACRDP_IDLE_TIMEOUT: the --idle-timeout seconds of the server (enables test 11)
+#   MACRDP_AVC444=1: the server runs with --avc444; test 12 then expects AVC444 frames (the Mac
+#     screen must change during the test), else AVC420 frames to the AVC444 client
 
 set -euo pipefail
 
@@ -28,7 +30,7 @@ if [[ -z "${XFREERDP:-}" ]]; then
     command -v "$XFREERDP" &>/dev/null || XFREERDP=xfreerdp
 fi
 if [[ -z "$HOST" || -z "$USER" || -z "$PASS" ]]; then
-    sed -n '2,16p' "$0" >&2
+    sed -n '2,18p' "$0" >&2
     exit 2
 fi
 ADDR="${HOST}:${PORT}"
@@ -356,6 +358,24 @@ else
     else
         pass "Idle timeout: ERRINFO_IDLE_TIMEOUT after ${IDLE_SECS}s"
     fi
+fi
+
+# 12. AVC444 client: with --avc444 (config AVC444=1) the server sends AVC444 to a client that
+#     negotiates it; without, the same client gets AVC420.
+echo "[12] AVC444 client (/gfx:AVC444)"
+if ! command -v xvfb-run &>/dev/null; then
+    echo "  SKIP: xvfb-run not available"
+elif [[ "${MACRDP_AVC444:-}" == 1 ]]; then
+    # 1280x720 (not the 1024x768 default) gives GFX PDUs larger than 64 KiB. Frames must
+    # keep coming (about 2 logs per second), so the Mac screen must change during the test,
+    # for example a clock with seconds or a video.
+    session 20 "$LOGDIR/avc444.log" /gfx:AVC444 /size:1280x720
+    check_gfx_session "AVC444 client" "$LOGDIR/avc444.log" "AVC444|AVC444v2" 20 15
+    sleep 2
+else
+    session 10 "$LOGDIR/avc444.log" /gfx:AVC444
+    check_gfx_session "AVC444 client, server without --avc444 (AVC420)" "$LOGDIR/avc444.log" AVC420 10
+    sleep 2
 fi
 
 # Summary
