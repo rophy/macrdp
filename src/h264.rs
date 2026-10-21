@@ -664,7 +664,9 @@ struct BlankRecoveryParams {
     /// no QoE at all), the session is conclusively blank — fire without waiting
     /// for the full count. Safe to be prompt because the reactivation heal is
     /// non-destructive: an occasional early fire costs a brief re-handshake, not
-    /// a dropped session. `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
+    /// a dropped session. A connection that has reported any nonzero
+    /// decode+render time also needs one of the `lapse_tiers`.
+    /// `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
     blank_max_wait: Duration,
     /// Minimum all-zero QoE reports for the wall-clock fast-path (above). Its
     /// only job is to rule out a client that sends NO QoE (e.g. FreeRDP, which
@@ -672,9 +674,24 @@ struct BlankRecoveryParams {
     /// low **1**: a single all-zero report after `arm_delay` (by which a
     /// rendering session has already presented and disarmed via
     /// `qoe_render_seen`, ~1-2 s on LAN) is conclusive on a trustworthy-RTT
-    /// link. Raise it (`MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS`) if a
+    /// link (for a connection with no nonzero report so far; see
+    /// `lapse_tiers` for the others). Raise it
+    /// (`MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS`) if a
     /// slow-to-first-present client trips a spurious (cheap) reactivation.
     blank_min_reports: u64,
+    /// Lapse tiers for the wall-clock fast path: `(zeros in a row, time since
+    /// the last nonzero report)`. A connection with 1-2 nonzero reports (not
+    /// latched) is a fast-path blank only once one tier holds. Found
+    /// 2026-10-21 on Windows 10 mstsc FS 1920x1080: a healthy session can have
+    /// only 1-2 nonzero reports in its first 4 s, interleaved with zeros, so a
+    /// single zero is no evidence. Before the latch, 107 recorded healthy fresh
+    /// connects (AVC420, AVC444, static desktop, window) never had 3+ zeros in
+    /// a row more than 5.7 s after a nonzero report, nor 11+ zeros in a row; a
+    /// frozen start (one stray nonzero, then zero on every report) meets
+    /// `(12, 4 s)` about 4 s in on an active screen (~5 reports/s) and
+    /// `(4, 8 s)` about 13 s in on a static one (~0.3 reports/s). Times are
+    /// RTT-scaled like `blank_max_wait`. No env knob.
+    lapse_tiers: [(u64, Duration); 2],
     /// Reconnect-storm guard: if this many CONSECUTIVE connections all ended in
     /// a blank-recovery drop (no connection in between ever presented a frame),
     /// stop dropping — the client is truly stuck (mstsc retains surfaces for
@@ -1054,21 +1071,25 @@ fn should_blank_recover(
     // zero reports with nonzero ones (see `should_latch_presented_clean`).
     // After an attempt the count path and the heal-confirmation deadline
     // decide; both need more than one stray zero.
-    // The fast path also needs a connection that has not reported a single
-    // nonzero decode+render time (2026-10-21, Windows 10 mstsc FS 1920x1080):
-    // the connect-time blank is zero from frame one, but a healthy mstsc can
-    // have only 1-2 nonzero reports in its first 4 s (AVC444: about 11 QoE
-    // reports in 4 s, 60 % zero), so it missed the 3-report latch and was
-    // reactivated, then dropped by the heal-confirmation deadline, while its
-    // picture moved the whole time. Such a connection is still covered by the
-    // count path (its longest zero run on a healthy mstsc was 12 of 24).
+    // One zero report is enough only for a connection that has not reported
+    // a single nonzero decode+render time (the connect-time blank is zero from
+    // the first report). A connection with some nonzero reports must also show
+    // a lapse (`lapse_tiers`): enough zeros in a row, long enough after its last
+    // nonzero report (2026-10-21, Windows 10 mstsc FS 1920x1080: a healthy
+    // session had only 2 nonzero reports in its first 4 s, `1,0,0,0,0,23,0,0,
+    // 0,0`, missed the 3-report latch and was reactivated, then dropped by the
+    // heal-confirmation deadline, while its picture moved the whole time).
+    let lapsed = qoe.nonzero_since_reset() == 0
+        || p.lapse_tiers
+            .iter()
+            .any(|&(zeros, wait)| qoe.zero_streak >= zeros && since_last_nonzero >= wait);
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
         || post_attempt_unconfirmed
         || (attempts == 0
             && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
-            && qoe.nonzero_since_reset() == 0
+            && lapsed
             && !established);
     blank_evidence
         && !presenting_now
@@ -1110,6 +1131,9 @@ fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParam
         established_max_wait: p.established_max_wait.mul_f64(mult),
         // mul_f64 of zero stays zero, so "0 = disabled" survives scaling.
         heal_confirm_deadline: p.heal_confirm_deadline.mul_f64(mult),
+        lapse_tiers: p
+            .lapse_tiers
+            .map(|(zeros, wait)| (zeros, wait.mul_f64(mult))),
         ..*p
     }
 }
@@ -2010,6 +2034,7 @@ impl Gfx {
             max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
             blank_max_wait: watchdog_ms("MACRDP_BLANK_RECOVERY_MAX_WAIT_MS", 4000),
             blank_min_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS", 1)),
+            lapse_tiers: [(12, Duration::from_secs(4)), (4, Duration::from_secs(8))],
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
@@ -5196,6 +5221,8 @@ mod tests {
             // 3 for the tests (the production default is a more aggressive 1);
             // the wall-clock test asserts against this value.
             blank_min_reports: 3,
+            // Production values; the lapse tests assert against them.
+            lapse_tiers: [(12, ms(4000)), (4, ms(8000))],
             reactivate: false,
         }
     }
@@ -6078,59 +6105,159 @@ mod tests {
         ));
     }
 
-    /// Windows 10 mstsc, FS 1920x1080, AVC444, moving picture (live
-    /// 2026-10-21, run x45-09): the QoE reports of the first 4 s. Only 2 are
-    /// nonzero, so the 3-report latch did not set.
-    const MSTSC_FS_AVC444_FIRST_4S: [u16; 10] = [1, 0, 0, 0, 0, 23, 0, 0, 0, 0];
-
-    #[test]
-    fn wall_clock_fast_path_needs_a_never_presented_connection() {
+    /// Replay recorded QoE reports `(ms since EGFX ready, timeDiffEDR)` through
+    /// the latch and the detector, with production fast-path values, as the
+    /// capture loop would (checked every 50 ms, no attempt yet). Returns the
+    /// time of the first recovery in ms, or `None` (latched, or no fire
+    /// before `end_ms`).
+    fn replay_first_fire(reports: &[(u64, u16)], end_ms: u64) -> Option<u64> {
         let p = BlankRecoveryParams {
+            min_qoe_reports: 24,
             blank_max_wait: ms(4000),
             blank_min_reports: 1,
             ..blank_params()
         };
-        let q = qoe_from(&MSTSC_FS_AVC444_FIRST_4S);
-        assert!(!should_latch_presented_clean(&q, 0, p.min_render_reports));
-        // Live, this healthy session was reactivated at 4.0 s and dropped
-        // 8 s later; now the fast path holds.
-        assert!(!should_blank_recover(
-            q,
-            true,
-            false,
-            ms(4000),
-            ms(0),
-            ms(60_000),
-            0,
-            false,
-            &p
-        ));
-        // The count path still covers it if it goes all zero later.
-        let mut later = MSTSC_FS_AVC444_FIRST_4S.to_vec();
-        later.extend([0; 120]);
-        assert!(should_blank_recover(
-            qoe_from(&later),
-            true,
-            false,
-            ms(30_000),
-            ms(0),
-            ms(60_000),
-            0,
-            false,
-            &p
-        ));
-        // A connect-time blank (zero from the first report) still fires at 4 s.
-        assert!(should_blank_recover(
-            qoe_from(&[0; 10]),
-            true,
-            false,
-            ms(4000),
-            ms(0),
-            ms(60_000),
-            0,
-            false,
-            &p
-        ));
+        let mut q = QoeEvidence::default();
+        let mut last_nonzero = 0;
+        let mut next = 0;
+        let mut t = 0;
+        while t <= end_ms {
+            while next < reports.len() && reports[next].0 <= t {
+                let (at, dr) = reports[next];
+                q.record(dr);
+                if dr > 0 {
+                    last_nonzero = at;
+                }
+                if should_latch_presented_clean(&q, 0, p.min_render_reports) {
+                    q.presented_clean = true;
+                }
+                next += 1;
+            }
+            if should_blank_recover(
+                q,
+                true,
+                false,
+                ms(t),
+                ms(t - last_nonzero),
+                ms(60_000),
+                0,
+                false,
+                &p,
+            ) {
+                return Some(t);
+            }
+            t += 50;
+        }
+        None
+    }
+
+    /// Recorded on Windows 10 mstsc 10.0.19041.4717, FS 1920x1080, 2026-10-21
+    /// (runs of round 46). All four were HEALTHY (picture shown, moving where
+    /// the Mac screen moved); each missed the 3-report latch at 4 s.
+    /// x45-09, AVC444, moving: reactivated at 4.0 s and dropped at 12 s live.
+    const HEALTHY_X45_09: [(u64, u16); 12] = [
+        (452, 1),
+        (762, 0),
+        (1073, 0),
+        (1377, 0),
+        (1873, 0),
+        (2204, 23),
+        (2532, 0),
+        (2836, 0),
+        (3174, 0),
+        (3816, 0),
+        (4240, 0),
+        (4800, 20),
+    ];
+    /// x46-08, AVC444, moving: 2 nonzero in 4 s, latched at 5.3 s.
+    const HEALTHY_X46_08: [(u64, u16); 15] = [
+        (457, 0),
+        (784, 7),
+        (1092, 0),
+        (1359, 0),
+        (1836, 0),
+        (2145, 8),
+        (2392, 0),
+        (2692, 0),
+        (2975, 0),
+        (3285, 0),
+        (3825, 0),
+        (4097, 0),
+        (4520, 0),
+        (4811, 0),
+        (5305, 17),
+    ];
+    /// x46s-08, AVC444, static desktop: the longest pre-latch zero run of all
+    /// 107 recorded healthy connects (10 zeros, 5.7 s after a nonzero report).
+    const HEALTHY_X46S_08: [(u64, u16); 21] = [
+        (458, 0),
+        (949, 0),
+        (1382, 0),
+        (1909, 1),
+        (2223, 0),
+        (2973, 0),
+        (3411, 0),
+        (3690, 0),
+        (4067, 0),
+        (4323, 24),
+        (5019, 0),
+        (5330, 0),
+        (6021, 0),
+        (6629, 0),
+        (7088, 0),
+        (7364, 0),
+        (7949, 0),
+        (8350, 0),
+        (8870, 0),
+        (9364, 0),
+        (10042, 6),
+    ];
+    /// x46s-01, AVC444, static desktop: the longest pre-latch time since a
+    /// nonzero report (18.9 s, with 2 zeros).
+    const HEALTHY_X46S_01: [(u64, u16); 6] = [
+        (760, 2),
+        (1072, 0),
+        (19660, 0),
+        (19997, 16),
+        (20461, 0),
+        (20864, 10),
+    ];
+
+    /// A frozen start (legacy hold off, frz46-02): zero on every report, one
+    /// report every ~175 ms. `first` replaces the first reports.
+    fn frozen_start(first: &[u16], interval_ms: u64, count: u64) -> Vec<(u64, u16)> {
+        (0..count)
+            .map(|i| {
+                let dr = first.get(i as usize).copied().unwrap_or(0);
+                (121 + i * interval_ms, dr)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn healthy_mstsc_with_few_nonzero_reports_is_not_recovered() {
+        assert_eq!(replay_first_fire(&HEALTHY_X45_09, 4800), None);
+        assert_eq!(replay_first_fire(&HEALTHY_X46_08, 5305), None);
+        assert_eq!(replay_first_fire(&HEALTHY_X46S_08, 10_042), None);
+        assert_eq!(replay_first_fire(&HEALTHY_X46S_01, 20_864), None);
+    }
+
+    #[test]
+    fn frozen_starts_are_recovered_fast() {
+        // All zero from the first report: the fast path at 4 s.
+        assert_eq!(
+            replay_first_fire(&frozen_start(&[], 175, 200), 30_000),
+            Some(4000)
+        );
+        // One stray nonzero report, then zero on every report: `(12, 4 s)`.
+        let stray = replay_first_fire(&frozen_start(&[1], 175, 200), 30_000).unwrap();
+        assert!((4000..=4500).contains(&stray), "{stray}");
+        // Presents twice, then freezes before 4 s.
+        let twice = replay_first_fire(&frozen_start(&[12, 7], 175, 200), 30_000).unwrap();
+        assert!((4000..=4700).contains(&twice), "{twice}");
+        // Static screen, one report every ~3.3 s: `(4, 8 s)` at the 4th zero.
+        let stat = replay_first_fire(&frozen_start(&[1], 3300, 20), 60_000).unwrap();
+        assert!((13_000..=13_500).contains(&stat), "{stat}");
     }
 
     #[test]
