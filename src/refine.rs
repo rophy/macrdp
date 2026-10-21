@@ -1,6 +1,7 @@
 //! Lossless refinement of a quiet screen (mixed mode).
 //!
-//! Ported from macrdp-v1 (7f652c1, d8e3936, 349869d), relicensed by the author.
+//! Ported from macrdp-v1 (7f652c1, d8e3936, 349869d, 59be57b, b149b99,
+//! c569680), relicensed by the author.
 //!
 //! H.264 AVC420 keeps only a quarter of the chroma, so colored text stays
 //! blurred (MS-RDPEGFX clients show what the decoder gives). Windows hosts send
@@ -43,6 +44,43 @@ pub const REFINE_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// (anti-aliasing); photo tiles have almost one color per pixel. Measured on
 /// 32x32 tiles of the bench page: text max 180, photo p10 843 of 1024.
 pub const COLOR_SHARE: usize = 4;
+
+/// [`COLOR_SHARE`] for a scaled picture (client desktop larger or smaller
+/// than the Mac display): the scaler blends the anti-aliased edges into more
+/// colors. Measured on mstsc screenshots of the bench page: with 1/4, only
+/// 50-60 % of the text tiles were sent lossless at 1.25x and 1.5x, and 52 % at
+/// 0.8x. Simulation on the bench page (bilinear, bicubic, Lanczos; 32x32
+/// tiles): 1.25x-1.5x, text max 445 colors of 1024, photo p10 662-811;
+/// 0.6x-0.8x, text max 467, photo p10 800-919. A few photo tiles are below 512
+/// and are sent lossless too (1.25x-1.5x: 2.6-4.6 %; 0.8x: 0.7-1.7 %; 0.6x-0.7x:
+/// none). The cost is one ClearCodec tile each, once per quiet screen.
+pub const SCALED_COLOR_SHARE: usize = 2;
+
+/// The color share for a picture drawn at `pixel_scale` times the display
+/// size in pixels (not in points: a Retina display has 2 pixels per point).
+pub fn color_share(pixel_scale: f64) -> usize {
+    if (pixel_scale - 1.0).abs() < 1e-3 {
+        COLOR_SHARE
+    } else {
+        SCALED_COLOR_SHARE
+    }
+}
+
+/// Scale of the captured picture against the display pixels: `session` is the
+/// capture (session) size, `backing` the display size in pixels. With
+/// `letterbox` the picture keeps the aspect ratio (the smaller factor);
+/// stretched, any axis that is not 1:1 makes it a scaled picture.
+pub fn capture_pixel_scale(session: (u16, u16), backing: (u16, u16), letterbox: bool) -> f64 {
+    let sx = f64::from(session.0) / f64::from(backing.0.max(1));
+    let sy = f64::from(session.1) / f64::from(backing.1.max(1));
+    if letterbox {
+        sx.min(sy)
+    } else if (sx - 1.0).abs() >= 1e-3 {
+        sx
+    } else {
+        sy
+    }
+}
 
 /// ClearCodec uses its glyph cache for bitmaps of this many pixels or fewer;
 /// lossless rectangles are kept larger than this.
@@ -983,6 +1021,58 @@ mod tests {
             },
         );
         assert_eq!(c, [px(2), px(3)].concat());
+    }
+
+    #[test]
+    fn scaled_pictures_up_or_down_use_the_scaled_share() {
+        assert_eq!(color_share(1.0), COLOR_SHARE);
+        assert_eq!(color_share(1.5), SCALED_COLOR_SHARE);
+        assert_eq!(color_share(0.8), SCALED_COLOR_SHARE);
+    }
+
+    #[test]
+    fn capture_scale_is_in_display_pixels() {
+        // 1:1 capture of a 1x display.
+        assert_eq!(
+            color_share(capture_pixel_scale((1280, 720), (1280, 720), false)),
+            COLOR_SHARE
+        );
+        // Retina at points: the capture scales 2880x1800 down to 1440x900.
+        assert_eq!(
+            color_share(capture_pixel_scale((1440, 900), (2880, 1800), false)),
+            SCALED_COLOR_SHARE
+        );
+        // Client 1920x1080 on a 1280x720 display, letterboxed: 1.5x.
+        assert_eq!(
+            color_share(capture_pixel_scale((1920, 1080), (1280, 720), true)),
+            SCALED_COLOR_SHARE
+        );
+        // Letterbox with bands on one axis only: the picture is 1:1.
+        assert_eq!(
+            color_share(capture_pixel_scale((1280, 960), (1280, 720), true)),
+            COLOR_SHARE
+        );
+        // Stretched on one axis: scaled.
+        assert_eq!(
+            color_share(capture_pixel_scale((1280, 960), (1280, 720), false)),
+            SCALED_COLOR_SHARE
+        );
+    }
+
+    #[test]
+    fn scaled_text_tile_with_more_colors_is_text() {
+        // 32x32 tile with 300 colors: a picture at 1/4, text when scaled up (1/2).
+        let data: Vec<u8> = (0..1024u32)
+            .flat_map(|i| [(i % 300) as u8, (i % 300 / 256) as u8, 0, 255])
+            .collect();
+        let r = TileRect {
+            x: 0,
+            y: 0,
+            w: 32,
+            h: 32,
+        };
+        assert!(!is_text_like(&data, 128, r, COLOR_SHARE));
+        assert!(is_text_like(&data, 128, r, SCALED_COLOR_SHARE));
     }
 
     /// A 128x64 BGRA frame (4x2 tiles of 32 px): `photo` tiles get a new color

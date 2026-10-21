@@ -981,7 +981,8 @@ mod macos {
         /// The frame before `last_frame` (lossless text refinement compares
         /// the two; the buffers swap on each frame).
         prev_frame: Vec<u8>,
-        /// Color limit for lossless text refinement (see `crate::refine`).
+        /// Color limit for lossless text refinement (see `crate::refine`): the
+        /// picture scale against the display pixels decides it.
         refine_color_share: usize,
         /// When this capture stream started (one per activation): the legacy
         /// hold of `Gfx::hold_legacy` is measured from here.
@@ -1206,7 +1207,12 @@ mod macos {
             // which can make a native-size pointer look small. Clamped to a
             // sane band; the hotspot stays accurate at any value.
             let cursor_scale = cursor_scale_multiplier.clamp(0.1, 8.0);
-            let refine_color_share = crate::refine::COLOR_SHARE;
+            let refine_color_share =
+                crate::refine::color_share(crate::refine::capture_pixel_scale(
+                    (width, height),
+                    (backing_w, backing_h),
+                    letterbox,
+                ));
             tracing::debug!(
                 native_w,
                 native_h,
