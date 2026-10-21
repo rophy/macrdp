@@ -357,7 +357,8 @@ mod macos {
         ))
     }
 
-    /// Resample a tightly-packed top-down RGBA cursor bitmap (and its hotspot)
+    /// Resample a tightly-packed cursor bitmap (B,G,R,A, bottom row first;
+    /// any 4-byte order works) and its hotspot
     /// by `scale`. Returns the input untouched when no resize is needed
     /// (`scale` ≈ 1, or rounding lands on the same dimensions), so the 1× and
     /// `--hidpi` cases stay byte-identical. Output dims are clamped to the RDP
@@ -375,7 +376,8 @@ mod macos {
         resize_cursor(data, w, h, hot_x, hot_y, new_w, new_h)
     }
 
-    /// Resample a tightly-packed top-down RGBA cursor bitmap (and its hotspot)
+    /// Resample a tightly-packed cursor bitmap (B,G,R,A, bottom row first;
+    /// any 4-byte order works) and its hotspot
     /// to exact target dimensions. Returns the input untouched when the
     /// dimensions already match.
     fn resize_cursor(

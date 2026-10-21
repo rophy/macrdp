@@ -326,7 +326,9 @@ impl TileGrid {
 /// or stride) marks all tiles.
 ///
 /// Tiles set in `skip` are not compared and not marked (see
-/// [`Refine::compare_skip`]).
+/// [`Refine::compare_skip`]). With a `prev` that is too short (not reached:
+/// the caller passes only a frame of the same size and stride) all tiles but
+/// the skipped ones are marked.
 pub fn diff_frames(
     prev: Option<&[u8]>,
     cur: &[u8],
