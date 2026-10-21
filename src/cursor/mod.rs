@@ -200,6 +200,11 @@ mod macos {
             // the bitmap (and hotspot, which tracks it) purely for comfort.
             let (data, w, h, hot_x, hot_y) =
                 scale_cursor(data, w, h, hot_x, hot_y, self.cursor_scale);
+            // mstsc ignores a larger pointer (it kept the previous shape for
+            // a 127x127 one): scale it down to 96x96, the large pointer size
+            // (MS-RDPBCGR LARGE_POINTER_FLAG_96x96).
+            let (data, w, h, hot_x, hot_y) = fit_pointer_side(data, w, h, hot_x, hot_y);
+            let data = visible_if_hidden(data);
             // Oversized sprites (shake-to-locate at Retina backing pixels)
             // would overflow the pointer PDU's u16 mask length and kill the
             // client loop — shrink them to fit instead.
@@ -396,6 +401,38 @@ mod macos {
         (resized, new_w, new_h, hot_x, hot_y)
     }
 
+    /// Largest pointer side sent (MS-RDPBCGR 2.2.7.2.7, 96x96 large pointers).
+    const MAX_POINTER_SIDE: u16 = 96;
+
+    /// Scale a cursor down (aspect and hotspot kept) so that no side is above
+    /// [`MAX_POINTER_SIDE`]; a smaller one passes through untouched.
+    fn fit_pointer_side(
+        data: Vec<u8>,
+        w: u16,
+        h: u16,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> (Vec<u8>, u16, u16, u16, u16) {
+        let side = w.max(h);
+        if side <= MAX_POINTER_SIDE {
+            return (data, w, h, hot_x, hot_y);
+        }
+        let scale =
+            |v: u16| ((u32::from(v) * u32::from(MAX_POINTER_SIDE)) / u32::from(side)).max(1) as u16;
+        resize_cursor(data, w, h, hot_x, hot_y, scale(w), scale(h))
+    }
+
+    /// A hidden cursor (CSS `cursor: none`, every pixel alpha 0) as a cursor
+    /// mstsc also hides: Windows takes a cursor whose alpha is 0 in all pixels
+    /// as one without alpha, and mstsc then showed a black pixel. One pixel
+    /// with alpha 1 (not visible) keeps the alpha channel in use.
+    fn visible_if_hidden(mut data: Vec<u8>) -> Vec<u8> {
+        if data.len() >= 4 && data.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
+            data[3] = 1;
+        }
+        data
+    }
+
     /// Shrink an oversized cursor sprite so its 32-bpp bitmap fits the wire
     /// format. `TS_COLORPOINTERATTRIBUTE` carries the bitmap as its XOR mask
     /// with a u16 byte length, so `w*h*4` must stay ≤ 65535 (area ≤ 16383 px)
@@ -492,7 +529,38 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use super::{clamp_pointer_size, resample_rgba, scale_cursor};
+        use super::{
+            clamp_pointer_size, fit_pointer_side, resample_rgba, scale_cursor, visible_if_hidden,
+        };
+
+        #[test]
+        fn a_large_cursor_is_scaled_to_96() {
+            let data = vec![255u8; 128 * 128 * 4];
+            let (out, w, h, hx, hy) = fit_pointer_side(data, 128, 128, 64, 64);
+            assert_eq!((w, h, hx, hy), (96, 96, 48, 48));
+            assert_eq!(out.len(), 96 * 96 * 4);
+            // Aspect kept for a tall one.
+            let (_, w, h, _, _) = fit_pointer_side(vec![0u8; 64 * 192 * 4], 64, 192, 0, 0);
+            assert_eq!((w, h), (32, 96));
+        }
+
+        #[test]
+        fn a_cursor_up_to_96_is_untouched() {
+            let data = vec![7u8; 96 * 40 * 4];
+            let (out, w, h, hx, hy) = fit_pointer_side(data.clone(), 96, 40, 5, 6);
+            assert_eq!((w, h, hx, hy), (96, 40, 5, 6));
+            assert_eq!(out, data);
+        }
+
+        #[test]
+        fn a_hidden_cursor_gets_one_pixel_of_alpha_1() {
+            let out = visible_if_hidden(vec![0u8; 4 * 4]);
+            assert_eq!(out[3], 1);
+            assert!(out.iter().enumerate().all(|(i, &b)| b == u8::from(i == 3)));
+            // A visible cursor is untouched.
+            let shown = vec![0, 0, 0, 255, 0, 0, 0, 0];
+            assert_eq!(visible_if_hidden(shown.clone()), shown);
+        }
 
         #[test]
         fn scale_one_is_passthrough() {
