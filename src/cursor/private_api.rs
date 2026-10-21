@@ -217,15 +217,21 @@ const MAX_SIDE: usize = 256;
 /// differ in colour and in the alpha of edge pixels. Return the smallest
 /// divisor of `h` (at least 2 frames, at most [`MAX_SIDE`] rows) for which
 /// each row covers the same pixels as the matching row of the first frame.
-/// `None` when no such height exists.
+/// `None` when no such height exists, and when every row covers the same
+/// pixels (a bar: no frame can be told apart, and a slice of it is not the
+/// cursor).
 fn strip_frame_height(buf: &[u8], row_bytes: usize, w: usize, h: usize) -> Option<usize> {
     if buf.len() < h * row_bytes {
         return None;
     }
     let covered = |row: usize, x: usize| buf[row * row_bytes + x * 4 + 3] != 0;
-    (1..=MAX_SIDE.min(h / 2))
+    let same_rows = |a: usize, b: usize| (0..w).all(|x| covered(a, x) == covered(b, x));
+    if (1..h).all(|row| same_rows(row, 0)) {
+        return None;
+    }
+    (2..=MAX_SIDE.min(h / 2))
         .filter(|&fh| h.is_multiple_of(fh))
-        .find(|&fh| (fh..h).all(|row| (0..w).all(|x| covered(row, x) == covered(row % fh, x))))
+        .find(|&fh| (fh..h).all(|row| same_rows(row, row % fh)))
 }
 
 fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
@@ -294,6 +300,22 @@ mod tests {
         // Padded rows (row_bytes > w * 4) and a Retina-size strip.
         let buf = strip(56, 80, 15, 240);
         assert_eq!(strip_frame_height(&buf, 240, 56, 1200), Some(80));
+    }
+
+    #[test]
+    fn tall_bar_with_the_same_rows_is_not_cut_into_frames() {
+        // 28x300 solid bar, and the same bar with a colour gradient: every row
+        // covers the same pixels, so no frame height (not even 1 or 2 rows).
+        let mut buf = vec![0u8; 112 * 300];
+        for (i, px) in buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *px = [0, 0, (i / 28) as u8, 255];
+        }
+        assert_eq!(strip_frame_height(&buf, 112, 28, 300), None);
+        buf.as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|px| px[2] = 9);
+        assert_eq!(strip_frame_height(&buf, 112, 28, 300), None);
     }
 
     #[test]
