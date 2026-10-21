@@ -493,6 +493,11 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   PDUs (default ON: one when nothing went out for 100 ms,
                           #   while a client is connected and sent input in the last
                           #   10 min). Config key: WIFI_KEEP_AWAKE=0.
+--no-lossless-text        # Do not send text losslessly (default ON, H.264 only): each
+                          #   H.264 frame updates only the changed 32-px tiles, and
+                          #   200 ms after the screen stops changing, the changed
+                          #   tiles with few colors (text, UI) go again as ClearCodec
+                          #   (lossless). Config key: LOSSLESS_TEXT=0.
 --idle-timeout SECS       # Disconnect the client after SECS s without keyboard or mouse
                           #   input (default 0 = off); the client is told
                           #   ERRINFO_IDLE_TIMEOUT. Config key: IDLE_TIMEOUT_SECS.

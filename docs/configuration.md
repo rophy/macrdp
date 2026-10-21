@@ -252,6 +252,15 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           moment gets the next packet 50-150 ms late, so a key
                           after a pause shows late. About 10 small packets per
                           second while it runs. Config: WIFI_KEEP_AWAKE=0.
+--no-lossless-text        Do not send text losslessly (H.264 only; default ON).
+                          Each H.264 frame updates only the 32-pixel tiles that
+                          changed, and 200 ms after the screen stops changing the
+                          changed tiles with few colors (text, UI) are sent again
+                          with ClearCodec (MS-RDPEGFX 2.2.4.1), which is lossless:
+                          H.264 4:2:0 blurs colored text. The refinement goes in
+                          chunks of about 64 KB, ZGFX-compressed, one at a time.
+                          Costs a burst of data and some CPU after each change.
+                          Config: LOSSLESS_TEXT=0.
 --idle-timeout SECS       Disconnect the client after SECS seconds without keyboard
                           or mouse input (default 0 = off). The client gets a Set
                           Error Info PDU with ERRINFO_IDLE_TIMEOUT, so mstsc shows
@@ -450,7 +459,7 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 | `encoder` | (default) / `--no-h264` | `ENABLE_H264` | H.264 (VideoToolbox, hardware) is the default; `--no-h264` / `ENABLE_H264=0` serves legacy bitmaps / RemoteFX only |
 | `quality` | none | | Use `--bitrate` |
 | `chroma_mode` | none | | AVC420 only (no AVC444) |
-| `lossless_text` | none | | No ClearCodec pass |
+| `lossless_text` | `--no-lossless-text` to turn off | `LOSSLESS_TEXT=0` | Default on (H.264 only) |
 | `ctrl_as_cmd` | `--ctrl-as-cmd` | `CTRL_AS_CMD` | `--map-ctrl-to-cmd` remaps only editing shortcuts |
 | `wifi_keep_awake` | `--no-wifi-keep-awake` to turn off | `WIFI_KEEP_AWAKE=0` | Default on |
 | `idle_timeout_secs` | `--idle-timeout` | `IDLE_TIMEOUT_SECS` | Default 0 (off) |
