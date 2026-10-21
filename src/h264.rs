@@ -3576,6 +3576,7 @@ impl Gfx {
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
             for (f, frame_regions) in frames.iter().zip(regions) {
+                let frame_regions = frame_regions.map(|r| refine::ship_regions(r, f.is_keyframe));
                 // Region = full actual frame, inclusive bounds (or, with
                 // lossless refinement, the tiles this frame updates; see
                 // `avc420_regions`). QP 22 / quality 100 are first-light

@@ -545,6 +545,19 @@ pub enum Regions {
     Tiles(TileGrid),
 }
 
+/// Regions an encoded frame goes out with: `taken` (see [`Refine::take_regions`]),
+/// but the whole frame for a keyframe. A keyframe is the loss backstop on a
+/// lossy UDP tunnel (a lost frame leaves wrong tiles that are no longer dirty
+/// or pending) and the TCP safety net for a client decode glitch, so it
+/// repaints the whole surface as it did before the tile regions.
+pub fn ship_regions(taken: Regions, keyframe: bool) -> Regions {
+    if keyframe {
+        Regions::Whole
+    } else {
+        taken
+    }
+}
+
 /// Whether a refinement chunk can go now.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RefineGate {
@@ -1358,6 +1371,19 @@ mod tests {
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(0, 0), (3, 0)]);
         // A frame with no entry: whole.
         assert!(matches!(r.take_regions(7), Regions::Whole));
+    }
+
+    #[test]
+    fn keyframes_repaint_the_whole_surface() {
+        let g = TileGrid::new(128, 64);
+        assert!(matches!(
+            ship_regions(Regions::Tiles(g.clone()), false),
+            Regions::Tiles(_)
+        ));
+        assert!(matches!(
+            ship_regions(Regions::Tiles(g), true),
+            Regions::Whole
+        ));
     }
 
     #[test]
