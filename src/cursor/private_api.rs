@@ -93,9 +93,10 @@ fn cursor_data_fn() -> Option<SLSGetGlobalCursorDataFn> {
 
 /// Snapshot the real WindowServer cursor.
 ///
-/// Returns `(rgba_unpremult, width, height, hot_x, hot_y)`. The pixel
-/// buffer is tightly packed, top-down, RGBA with non-premultiplied alpha
-/// — exactly what `RGBAPointer` wants. Returns `None` if any private
+/// Returns `(bitmap, width, height, hot_x, hot_y)`. The bitmap is tightly
+/// packed, bottom row first, B,G,R,A with straight alpha: the RDP 32 bpp
+/// pointer XOR mask that `RGBAPointer` carries as is (see
+/// [`to_pointer_bitmap`]). Returns `None` if any private
 /// symbol is missing or any SLS call fails.
 pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
     let main_conn = main_connection_fn()?;
@@ -175,40 +176,32 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
             strip_frame_height(&buf, row_bytes, w, h)?
         };
 
-        // BGRA premult (host-endian little, so memory bytes are B,G,R,A)
-        // → RGBA non-premult, tightly packed.
-        //
-        // SLS lays the buffer out bottom-up (row 0 of `buf` = bottom
-        // scan-line of the cursor) — same convention as BMP/DIB and
-        // RDP wire-format pointers. The NSCursor fallback path produces
-        // top-down R,G,B,A and that's what mstsc/FreeRDP have been
-        // rendering correctly, so we feed `RGBAPointer` top-down too.
-        // Read source rows in reverse to flip into top-down.
-        let mut out = Vec::with_capacity(w * h * 4);
-        for row in 0..h {
-            let src_row_idx = h - 1 - row;
-            let src_row_start = src_row_idx * row_bytes;
-            if src_row_start + w * 4 > buf.len() {
-                return None;
-            }
-            let src_row = &buf[src_row_start..src_row_start + w * 4];
-            for px in src_row.as_chunks::<4>().0 {
-                let b = px[0];
-                let g = px[1];
-                let r = px[2];
-                let a = px[3];
-                let (r, g, b) = un_premultiply(r, g, b, a);
-                out.push(r);
-                out.push(g);
-                out.push(b);
-                out.push(a);
-            }
-        }
+        let out = to_pointer_bitmap(&buf, row_bytes, w, h)?;
 
         let hot_x = hot.x.round().max(0.0).min(f64::from(u16::MAX)) as u16;
         let hot_y = hot.y.round().max(0.0).min(f64::from(u16::MAX)) as u16;
         Some((out, w as u16, h as u16, hot_x, hot_y))
     }
+}
+
+/// Convert the SkyLight cursor buffer to the RDP 32 bpp pointer bitmap.
+///
+/// SkyLight gives premultiplied little-endian BGRA (memory bytes B,G,R,A),
+/// first row = top scan-line. The pointer XOR mask (MS-RDPBCGR 2.2.9.1.1.4.4)
+/// wants straight-alpha B,G,R,A, first row = bottom scan-line. So keep the
+/// byte order, remove the premultiplication and reverse the rows. `None` if
+/// `buf` is too short.
+fn to_pointer_bitmap(buf: &[u8], row_bytes: usize, w: usize, h: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in (0..h).rev() {
+        let start = row * row_bytes;
+        let src_row = buf.get(start..start + w * 4)?;
+        for &[b, g, r, a] in src_row.as_chunks::<4>().0 {
+            let (r, g, b) = un_premultiply(r, g, b, a);
+            out.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+    Some(out)
 }
 
 /// Largest cursor side taken from SkyLight (the RDP pointer limit).
@@ -272,6 +265,25 @@ mod tests {
             }
         }
         buf
+    }
+
+    #[test]
+    fn pointer_bitmap_keeps_bgra_order_and_puts_the_bottom_row_first() {
+        // 2x2, row_bytes 12 (padding 4). Top row: opaque red, half-alpha blue
+        // (premultiplied 0x80 -> 0xff). Bottom row: transparent, opaque white.
+        let buf = [
+            0, 0, 255, 255, 128, 0, 0, 128, 9, 9, 9, 9, //
+            0, 0, 0, 0, 255, 255, 255, 255, 9, 9, 9, 9,
+        ];
+        let out = to_pointer_bitmap(&buf, 12, 2, 2).unwrap();
+        assert_eq!(
+            out,
+            [
+                0, 0, 0, 0, 255, 255, 255, 255, // bottom row first
+                0, 0, 255, 255, 255, 0, 0, 128, // red stays B=0,G=0,R=255
+            ]
+        );
+        assert_eq!(to_pointer_bitmap(&buf[..19], 12, 2, 2), None);
     }
 
     #[test]

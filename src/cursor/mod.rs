@@ -4,8 +4,8 @@
 //! `SLSGetGlobalCursorData`) — reads the WindowServer's actually-
 //! composited cursor, so I-beams in other apps, crosshairs during
 //! `screencapture -i`, hand pointers over links, etc. all forward
-//! correctly. Returns raw RGBA bytes + hotspot directly, no CGImage
-//! round-trip.
+//! correctly. Returns the pointer bitmap (B,G,R,A, bottom row first) +
+//! hotspot directly, no CGImage round-trip.
 //!
 //! Fallback path: `NSCursor.currentSystemCursor` rendered via
 //! `NSBitmapImageRep` — process-local cursor stack, only sees cursors
@@ -263,7 +263,8 @@ mod macos {
         }
     }
 
-    /// Snapshot the current system cursor into a tightly-packed RGBA buffer.
+    /// Snapshot the current system cursor into a tightly-packed pointer bitmap
+    /// (B,G,R,A, straight alpha, bottom row first: the RDP 32 bpp XOR mask).
     /// Returns `(data, width, height, hot_x, hot_y)` or `None` if anything
     /// went wrong (no cursor available, weird image size, draw failed).
     ///
@@ -337,10 +338,14 @@ mod macos {
         }
         let stride = rep.bytesPerRow() as usize;
         let row_bytes = (w as usize) * 4;
+        // The rep is R,G,B,A top row first; the pointer bitmap is B,G,R,A
+        // bottom row first (as `private_api::copy_current_system_cursor`).
         let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for row in 0..(h as usize) {
+        for row in (0..(h as usize)).rev() {
             let src = std::slice::from_raw_parts(ptr.add(row * stride), row_bytes);
-            data.extend_from_slice(src);
+            for &[r, g, b, a] in src.as_chunks::<4>().0 {
+                data.extend_from_slice(&[b, g, r, a]);
+            }
         }
 
         Some((
@@ -462,7 +467,8 @@ mod macos {
         resize_cursor(data, w, h, hot_x, hot_y, new_w, new_h)
     }
 
-    /// Area-average resample of a tightly-packed top-down RGBA buffer. RGB is
+    /// Area-average resample of a tightly-packed 4-byte-per-pixel buffer (alpha
+    /// last; colour byte order and row order pass through). Colour is
     /// averaged weighted by alpha (premultiplied) so the cursor's transparent
     /// edges don't bleed dark/light fringes; alpha is area-averaged. Fine for
     /// the small down-scales we do here (e.g. 2:1 on Retina).
