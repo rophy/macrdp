@@ -51,6 +51,7 @@ mod shield;
 mod stats;
 mod switcher_hud;
 mod usb_redirect;
+mod version;
 mod videotoolbox;
 mod virtual_display;
 
@@ -187,7 +188,11 @@ fn ensure_screen_recording_access() {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "macrdp", about = "Native RDP server for macOS")]
+#[command(
+    name = "macrdp",
+    about = "Native RDP server for macOS",
+    version = version::version()
+)]
 struct Args {
     /// Address to bind. Defaults to loopback only — pass `0.0.0.0:3390`
     /// explicitly to accept LAN connections. Port 3389 (the standard RDP
@@ -2887,6 +2892,7 @@ async fn async_main() -> Result<()> {
         }
     });
     logging::init(filter, args.log_dir.as_deref(), audit_file.as_deref());
+    info!(version = version::version(), "macrdp starting");
     for w in &args.config_warnings {
         warn!("{w}");
     }

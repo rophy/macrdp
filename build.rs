@@ -10,6 +10,7 @@
 use std::process::Command;
 
 fn main() {
+    git_describe();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -49,4 +50,24 @@ fn main() {
             format!("{xcode_dev_dir}/Toolchains/XcodeDefault.xctoolchain/usr/lib/{slice}/macosx");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
     }
+}
+
+/// `MACRDP_GIT_DESCRIBE` for `--version` and the startup log (see
+/// `src/version.rs`): `git describe` output, or empty without git.
+fn git_describe() {
+    // Rebuild when HEAD, refs or the index change, so describe stays current.
+    // Only when the files exist: a missing path would rebuild every time.
+    if std::path::Path::new(".git/HEAD").exists() {
+        for path in [".git/HEAD", ".git/refs", ".git/index"] {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let describe = Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=MACRDP_GIT_DESCRIBE={describe}");
 }
