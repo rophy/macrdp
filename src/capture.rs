@@ -1480,9 +1480,15 @@ mod macos {
                 // A frame held during the EGFX negotiation also waits at most
                 // one frame interval, so it goes out once EGFX is ready even
                 // when the screen is static.
+                // A capture dropped to bound the frames in flight (and not
+                // followed by a newer one) is re-submitted too, so the newest
+                // picture reaches the client when the screen goes static.
+                let resend_latest = self.gfx.as_ref().is_some_and(|g| g.latest_dropped())
+                    && !self.last_frame.is_empty();
                 let sample = if self.flush_remaining > 0
                     || self.pending_resize.has_pending()
                     || self.held_frame
+                    || resend_latest
                 {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
@@ -1534,8 +1540,8 @@ mod macos {
                                 }
                                 continue;
                             }
-                            if self.flush_remaining > 0 {
-                                self.flush_remaining -= 1;
+                            if self.flush_remaining > 0 || resend_latest {
+                                let mut dropped = false;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if !self.last_frame.is_empty() {
                                         if let Err(e) = gfx.submit_bgra(
@@ -1545,7 +1551,13 @@ mod macos {
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
+                                        dropped = gfx.latest_dropped();
                                     }
+                                }
+                                // A flush frame that was dropped (frames in
+                                // flight) is tried again on the next interval.
+                                if self.flush_remaining > 0 && !dropped {
+                                    self.flush_remaining -= 1;
                                 }
                             }
                             continue;

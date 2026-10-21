@@ -216,12 +216,14 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   lock-state check. See the auto-unlock note in
                           #   known-quirks.md. macOS-only.
 --enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
---bitrate N               # H.264 bitrate ceiling in Mbps (default 6; only with
-                          #   --enable-h264). With --adaptive-bitrate it's the
+--bitrate N               # H.264 bitrate ceiling in Mbps (default: automatic, 12 bits
+                          #   per pixel/s at 30 fps, scaled up for more fps: 22 Mbps at
+                          #   1280x720@60; H.264 only). With adaptive
+                          #   bitrate (default) it's the
                           #   ceiling the encoder backs off from under congestion;
                           #   otherwise a fixed target. Config key: BITRATE.
 --keyframe-interval SECS  # periodic IDR (default 0 = none over TCP; 2 s on a UDP tunnel
-                          #   when 0; only with --enable-h264)
+                          #   when 0; H.264 only)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
 --enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
@@ -356,9 +358,16 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   was always on TCP). Promoted 2026-06-28 from the
                           #   MACRDP_UDP_MIGRATE_EGFX env var (still works as a
                           #   fallback). macOS-built; protocol layer cross-platform.
---adaptive-bitrate        # Opt-in (default OFF; ADAPTIVE_BITRATE=1 in config.env).
-                          #   Congestion-responsive H.264 rate control on BOTH the UDP
-                          #   tunnel AND the TCP path (only with --enable-h264): an
+--no-adaptive-bitrate     # Turn off adaptive bitrate (ON by default; ADAPTIVE_BITRATE=0
+                          #   in config.env; --adaptive-bitrate is a no-op kept for old
+                          #   command lines). Over TCP: an EGFX frame window (frames of
+                          #   one base round trip + 1, min 3; MACRDP_EGFX_FRAME_WINDOW=0
+                          #   turns it off) and a bitrate level of 100/80/50/30/15 % of
+                          #   the ceiling that follows the median queueing delay of the
+                          #   last 300 ms / 1 s (down above 100 ms, up after 3+ s below
+                          #   50 ms). On the UDP tunnel:
+                          #   Congestion-responsive H.264 rate control (only with
+                          #   --enable-h264): an
                           #   AIMD controller reads the STANDING QUEUE DELAY — each
                           #   frame's ship→ack round trip minus the windowed-minimum
                           #   RTT, EWMA-smoothed — plus reliable-tunnel retransmits,

@@ -69,6 +69,8 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+use crate::bitrate_level::BitrateLevel;
+use crate::frame_window::FrameWindow;
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
@@ -84,6 +86,10 @@ const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
 /// periodic IDR is the backstop for a loss that no other path heals
 /// (docs/rdp-udp-multitransport-feasibility.md). On TCP there is no periodic IDR.
 const UDP_KEYFRAME_SECS: f32 = 2.0;
+
+/// A client that sent no EGFX frame ack this long after EGFX ready is taken as
+/// one that does not ack: the EGFX frame window stops holding its frames.
+const NO_ACK_GRACE: Duration = Duration::from_secs(5);
 
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
 /// ignores the ack-lag congestion signal. At connect the encoder ships an initial
@@ -256,6 +262,15 @@ struct ConnectionContext {
     /// nanoseconds; never taken while holding another lock), read in
     /// `on_frame_ack` to time each frame's ship→ack round trip.
     ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
+    /// EGFX frame window (frames sent and not acknowledged, base RTT): bounds
+    /// frames in flight at capture so frames do not queue in a client that
+    /// decodes slower than the capture rate (see `crate::frame_window`). A leaf
+    /// mutex like `ship_times`: written by the ship thread and `on_frame_ack`,
+    /// read by `submit_bgra`; never held while taking another lock.
+    window: Arc<Mutex<FrameWindow>>,
+    /// Bitrate level of the adaptive controller while EGFX runs over TCP
+    /// (see `Gfx::tcp_bitrate_step`).
+    bitrate_level: BitrateLevel,
     /// Windowed-minimum ack RTT (two `RTT_MIN_WINDOW` buckets, so a route
     /// change re-baselines within ~2 windows). The minimum over the window is
     /// the link's base RTT including the empty-pipe server-side path;
@@ -1293,6 +1308,15 @@ pub struct Gfx {
     /// Read in `submit_bgra` — NOT the EGFX send-side window (that's `u32::MAX`,
     /// so encoded frames are never dropped, which would break the H.264 chain).
     max_in_flight: u32,
+    /// Capture interval (1 / fps); sizes the EGFX frame window.
+    frame_interval: Duration,
+    /// EGFX frame window on TCP (`MACRDP_EGFX_FRAME_WINDOW=0` turns it off).
+    frame_window_enabled: bool,
+    /// A capture was dropped to bound the frames in flight (VT pipeline or EGFX
+    /// frame window) and no newer frame has been encoded yet. The capture loop
+    /// then re-submits its newest frame, so the last change of a burst is not
+    /// left out on a screen that goes static (see `Gfx::latest_dropped`).
+    latest_dropped: Arc<AtomicBool>,
     wire_format: WireFormat,
     /// Ack-driven IDR recovery (EGFX-on-lossy). `recovery_enabled` is the opt-in
     /// env gate (`MACRDP_UDP_EGFX_ACK_RECOVERY`); `egfx_on_lossy` is the *runtime*
@@ -1623,6 +1647,10 @@ impl Gfx {
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        let frame_window_enabled = !matches!(
+            std::env::var("MACRDP_EGFX_FRAME_WINDOW").as_deref(),
+            Ok("0") | Ok("false") | Ok("FALSE")
+        );
         let legacy_hold = Duration::from_millis(u64::from(env_u32_zero_ok(
             "MACRDP_EGFX_LEGACY_HOLD_MS",
             3000,
@@ -1630,7 +1658,15 @@ impl Gfx {
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
-            width, height, fps, keyframe_secs, max_in_flight, "EGFX/H.264 pipeline configured"
+            width,
+            height,
+            fps,
+            keyframe_secs,
+            max_in_flight,
+            bitrate_bps,
+            adaptive = adaptive_enabled,
+            frame_window = frame_window_enabled,
+            "EGFX/H.264 pipeline configured"
         );
         if recovery_enabled {
             info!(
@@ -1664,6 +1700,9 @@ impl Gfx {
             bitrate_bps,
             keyframe_secs,
             max_in_flight,
+            frame_interval: Duration::from_secs_f64(1.0 / f64::from(fps.max(1))),
+            frame_window_enabled,
+            latest_dropped: Arc::new(AtomicBool::new(false)),
             wire_format,
             recovery_enabled,
             recovery_params,
@@ -2115,7 +2154,41 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
+                self.latest_dropped.store(true, Ordering::Relaxed);
                 return Ok(true); // still the active path; just dropped this frame
+            }
+            // EGFX frame window (TCP): at most `window.target` frames between
+            // encode and the client's FrameAcknowledge. Without it the server
+            // encodes every capture and a client that decodes slower than the
+            // capture rate (Windows 10 mstsc in a VM: ~35 fps) queues them: the
+            // ack RTT grows, the adaptive controller reads it as congestion and
+            // cut a 60 fps motion stream to its 10 fps floor (measured). The
+            // window is the frames of one base round trip plus one (min 3), so
+            // a far client still gets the full rate. Also before the first ack
+            // (window 3): otherwise a link slower than the bitrate fills the
+            // socket with seconds of frames before any ack returns (FreeRDP
+            // through an 8 Mbit/s limit: first ack after 42 s, so no feedback).
+            // Not held: a client that suspends acks, or that sent none within
+            // `NO_ACK_GRACE` of EGFX ready (it does not ack at all).
+            let now = Instant::now();
+            if self.frame_window_enabled
+                && !self.egfx_on_udp.load(Ordering::Relaxed)
+                && !ctx.acks_suspended
+                && (ctx.egfx_acks_seen || now.saturating_duration_since(ctx.epoch) < NO_ACK_GRACE)
+            {
+                let (in_flight, target) = {
+                    let mut w = ctx.window.lock().unwrap();
+                    (w.in_flight(), w.target(self.frame_interval, now))
+                };
+                if in_flight >= target {
+                    trace!(
+                        in_flight,
+                        target,
+                        "EGFX frame window full; dropping capture to latest"
+                    );
+                    self.latest_dropped.store(true, Ordering::Relaxed);
+                    return Ok(true);
+                }
             }
             // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
             // socket backpressure to pace us to the client (unlike TCP), so without
@@ -2222,6 +2295,7 @@ impl Gfx {
             }
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
+            self.latest_dropped.store(false, Ordering::Relaxed);
         }
         Ok(true)
     }
@@ -2245,6 +2319,12 @@ impl Gfx {
     /// there and the unbounded ship channel lets `shipped` advance, so the lag
     /// reflects the real backlog). IDR backoff stays UDP-only — on TCP the periodic
     /// keyframe is cheap insurance and not worth the false-suppress risk.
+    /// A capture was dropped to bound the frames in flight and nothing newer was
+    /// encoded since: the caller should re-submit its newest frame shortly.
+    pub fn latest_dropped(&self) -> bool {
+        self.latest_dropped.load(Ordering::Relaxed)
+    }
+
     /// The periodic-keyframe interval (frames) for the transport EGFX is on.
     fn periodic_keyframe_frames(&self, on_udp: bool) -> u32 {
         if on_udp {
@@ -2252,6 +2332,56 @@ impl Gfx {
         } else {
             self.tcp_keyframe_frames
         }
+    }
+
+    /// Adaptive bitrate over TCP: the bitrate level (100/80/50/30/15 % of the
+    /// ceiling) follows the median queueing delay of the stream frames, measured
+    /// against the EGFX frame window's base RTT (`BitrateLevel`). It reacts to a
+    /// queue that lasts (median of 300 ms), not to one late acknowledgement: the
+    /// UDP controller below fed one frame's round trip into an EWMA, and on a
+    /// Wi-Fi Mac single 200-450 ms acks cut a 57 fps FreeRDP motion stream to the
+    /// 2.8 Mbps floor and its 10 fps frame-rate floor (measured, 22 fps shown).
+    /// No frame-rate floor here (`adaptive_congested` stays false).
+    fn tcp_bitrate_step(
+        &self,
+        ctx: &mut ConnectionContext,
+        now: Instant,
+        ceiling: u32,
+        mut actions: AdaptiveActions,
+    ) -> AdaptiveActions {
+        let ms = |(d, n): (Duration, usize)| (d.as_secs_f32() * 1000.0, n);
+        let (short, long) = {
+            let mut w = ctx.window.lock().unwrap();
+            (
+                w.queue_delay(now, crate::bitrate_level::DOWN_SPAN).map(ms),
+                w.queue_delay(now, crate::frame_window::DELAY_SPAN).map(ms),
+            )
+        };
+        let quality = ctx.bitrate_level.update(short, long, now);
+        trace!(?short, ?long, quality, "EGFX TCP bitrate level input");
+        let target = ((f64::from(ceiling) * quality).round() as u32).max(1);
+        ctx.adaptive_congested = false;
+        if target != ctx.adaptive_target_bps {
+            debug!(
+                from_bps = ctx.adaptive_target_bps,
+                to_bps = target,
+                queue_delay_ms = ?long.map(|(d, _)| d),
+                samples = ?long.map(|(_, n)| n),
+                "EGFX adaptive bitrate adjusted (TCP)"
+            );
+            ctx.adaptive_target_bps = target;
+            actions.bitrate_bps = Some(target);
+        }
+        if let Some(s) = crate::stats::global() {
+            s.bitrate_bps.store(target, Ordering::Relaxed);
+            if let Some((d, _)) = long {
+                s.queue_delay_ms.store(d.round() as u32, Ordering::Relaxed);
+            }
+            s.rtt_ms
+                .store(self.link_rtt_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+            s.fps.store(self.fps, Ordering::Relaxed);
+        }
+        actions
     }
 
     fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> AdaptiveActions {
@@ -2297,6 +2427,9 @@ impl Gfx {
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
+        if !on_udp {
+            return self.tcp_bitrate_step(ctx, now, ceiling, actions);
+        }
 
         if now.duration_since(ctx.adaptive_last_control) < self.adaptive_interval {
             return actions;
@@ -2590,6 +2723,8 @@ impl Gfx {
             ctx.encoder = Some(encoder);
             // The new encoder has the TCP periodic-keyframe interval.
             ctx.keyframe_on_udp = false;
+            // A frame dropped before belongs to the old encoder (maybe another size).
+            self.latest_dropped.store(false, Ordering::Relaxed);
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
             ctx.shipped.store(0, Ordering::Relaxed);
@@ -2730,6 +2865,7 @@ impl Gfx {
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
+            self.latest_dropped.store(false, Ordering::Relaxed);
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
     }
@@ -2854,7 +2990,7 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times) = {
+            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times, window) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -2878,6 +3014,7 @@ impl Gfx {
                     ctx.server_handle.clone(),
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
+                    ctx.window.clone(),
                 )
             };
 
@@ -2920,6 +3057,7 @@ impl Gfx {
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
                     ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
+                    window.lock().unwrap().on_sent(frame_id, Instant::now());
                 }
                 match sent {
                     Some(frame_id) if f.is_keyframe => debug!(
@@ -3060,6 +3198,7 @@ impl GfxServerFactory for Gfx {
         } else {
             self.bitrate_bps
         };
+        self.latest_dropped.store(false, Ordering::Relaxed);
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
             server_handle: handle.clone(),
             encoder: None,
@@ -3081,6 +3220,12 @@ impl GfxServerFactory for Gfx {
             last_acked_frame_id: Arc::new(AtomicU64::new(0)),
             egfx_acks_seen: false,
             ship_times: Arc::new(Mutex::new(vec![(u64::MAX, Instant::now()); RTT_RING])),
+            window: Arc::new(Mutex::new(FrameWindow::default())),
+            bitrate_level: if initial_target_bps < self.bitrate_bps {
+                BitrateLevel::seeded()
+            } else {
+                BitrateLevel::default()
+            },
             rtt_min_cur_ms: f64::INFINITY,
             rtt_min_prev_ms: f64::INFINITY,
             rtt_bucket_started: Instant::now(),
@@ -3232,6 +3377,10 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+            ctx.window
+                .lock()
+                .unwrap()
+                .on_ack(frame_id, queue_depth, Instant::now());
             // Record decode progress for the UDP frame-ack-lag backpressure gate.
             // The client sends FrameAcknowledge after it DECODES a frame, so this
             // is the floor of its decode backlog. Only advance on a real ack (not

@@ -292,12 +292,12 @@ private struct VideoTab: View {
             }
             Section("Bitrate") {
                 Stepper(value: Binding(
-                    get: { Int(model.bitrateMbps) ?? 6 },
+                    get: { Int(model.bitrateMbps) ?? 22 },
                     set: { model.setBitrate(String($0)) }), in: 1...50) {
-                    Text("Ceiling: \(model.bitrateMbps) Mbps")
+                    Text(model.bitrateMbps.isEmpty ? "Ceiling: automatic" : "Ceiling: \(model.bitrateMbps) Mbps")
                 }
                 .disabled(!model.bool("ENABLE_H264"))
-                Toggle("Adaptive bitrate (lower under congestion)", isOn: model.boolBinding("ADAPTIVE_BITRATE"))
+                Toggle("Adaptive bitrate (lower under congestion)", isOn: model.boolBinding("ADAPTIVE_BITRATE", default: true))
                     .disabled(!model.bool("ENABLE_H264"))
                 Text("The ceiling is the maximum. With Adaptive on, the server drops below it "
                     + "under congestion (thin/lossy link) and climbs back when it clears; on a "

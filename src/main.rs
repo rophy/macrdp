@@ -14,6 +14,8 @@ mod audio;
 mod auth;
 mod auth_guard;
 mod avc444;
+#[cfg(target_os = "macos")]
+mod bitrate_level;
 mod camera;
 mod capture;
 mod clipboard;
@@ -25,6 +27,8 @@ mod cursor;
 mod file_promise;
 #[cfg(target_os = "macos")]
 mod file_promise_lazy;
+#[cfg(target_os = "macos")]
+mod frame_window;
 #[cfg(target_os = "macos")]
 mod h264;
 mod h264_sps;
@@ -436,12 +440,14 @@ struct Args {
     #[arg(long)]
     enable_h264: bool,
 
-    /// Target H.264 bitrate in megabits/sec (only with --enable-h264).
-    /// Default 6. Raising it sharpens detail at the cost of bigger per-frame
-    /// writes, which can fill the socket buffer and delay audio on a
-    /// constrained link (e.g. Wi-Fi); try 8–12 if you have headroom.
-    #[arg(long, default_value_t = 6)]
-    bitrate: u32,
+    /// H.264 bitrate ceiling in megabits/sec (only with --enable-h264).
+    /// Default: automatic from the desktop size and frame rate (12 bits per
+    /// pixel per second at 30 fps, scaled up for a higher rate: 22 Mbps for
+    /// 1280x720 at 60 fps), so motion is not capped on a good link. Adaptive
+    /// bitrate (on by default) backs off from it when the link queues. With
+    /// --no-adaptive-bitrate it is a fixed target; then try 6–12.
+    #[arg(long)]
+    bitrate: Option<u32>,
 
     /// H.264 periodic keyframe (IDR) interval in seconds (only with
     /// --enable-h264). Default 0 = no periodic keyframe while the video runs
@@ -682,21 +688,28 @@ struct Args {
     #[arg(long)]
     udp_migrate_egfx: bool,
 
-    /// Opt-in (default OFF). Congestion-responsive H.264 bitrate, on BOTH the TCP
-    /// path and the UDP tunnel (only with --enable-h264): an AIMD controller reads
+    /// Turn off congestion-responsive H.264 bitrate (on by default; config key
+    /// ADAPTIVE_BITRATE=0). On BOTH the TCP path and the UDP tunnel (only with
+    /// --enable-h264): an AIMD controller reads
     /// the standing queue delay (each frame's ship→ack round trip minus the
     /// windowed-minimum RTT, EWMA-smoothed) plus reliable-tunnel retransmits, and
     /// moves the VideoToolbox bitrate within [floor, --bitrate] — so --bitrate is a
     /// ceiling. A long but clean link (VPN/ZeroTier) keeps full quality; a thin one
     /// degrades gracefully instead of freezing. Under sustained congestion it also
-    /// stretches the periodic keyframe and, once the bitrate is at its floor, caps
+    /// stretches the periodic keyframe (where one runs) and, once the bitrate is at its floor, caps
     /// the frame rate (default 10 fps, never zero). A link whose measured RTT at
     /// connect is >= MACRDP_ADAPTIVE_SEED_RTT_MS (50) starts at ceiling/3. Tunables:
     /// MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,DECREASE,INTERVAL_MS,RETX_TOLERANCE},
     /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,EWMA_ALPHA,FLOOR_FPS}. macOS-only build; see
     /// docs/cli.md.
-    #[arg(long)]
-    adaptive_bitrate: bool,
+    #[arg(long = "no-adaptive-bitrate")]
+    no_adaptive_bitrate: bool,
+
+    /// Deprecated/no-op: adaptive bitrate is now on by default. Accepted so
+    /// existing command lines keep working; use --no-adaptive-bitrate to turn it off.
+    #[arg(long = "adaptive-bitrate", action = clap::ArgAction::SetTrue, hide = true)]
+    #[allow(dead_code)]
+    adaptive_bitrate_compat: bool,
 
     /// EXPERIMENTAL, opt-in (default OFF; implies --enable-udp-multitransport,
     /// requires --enable-aac and --enable-h264). Stream RDPSND audio over a LOSSY
@@ -2491,8 +2504,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("UDP_MIGRATE_EGFX", false) {
         argv.push("--udp-migrate-egfx".into());
     }
-    if on("ADAPTIVE_BITRATE", false) {
-        argv.push("--adaptive-bitrate".into());
+    if !on("ADAPTIVE_BITRATE", true) {
+        argv.push("--no-adaptive-bitrate".into());
     }
     if on("ENABLE_LOSSY_AUDIO", false) {
         argv.push("--enable-lossy-audio".into());
@@ -2700,6 +2713,20 @@ fn args_from_config(path: &Path) -> Result<Args> {
     // would be (SocketAddr, numeric ranges, mutually-exclusive checks).
     Args::try_parse_from(&argv)
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
+}
+
+/// Automatic H.264 bitrate ceiling (bits/s) for a `width` x `height` desktop at
+/// `fps`: 12 bits per pixel per second at 30 fps, scaled up for a higher frame
+/// rate (not down for a lower one). 1280x720 at 60 fps: ~22 Mbps, what macrdp-v1
+/// sends for full-screen motion (19-22 Mbps measured; its ceiling formula is
+/// twice this, but its encoder stays below it, while this one spends the whole
+/// target: 48 Mbps at a 44 Mbps ceiling, for the same 56-57 fps). The adaptive
+/// controller backs off from it when the link queues.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn auto_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+    let per_second = u64::from(width) * u64::from(height) * 12;
+    let scaled = per_second * u64::from(fps.max(30)) / 30;
+    u32::try_from(scaled).unwrap_or(u32::MAX).max(1_000_000)
 }
 
 async fn async_main() -> Result<()> {
@@ -3374,18 +3401,24 @@ async fn async_main() -> Result<()> {
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
+    // H.264 bitrate ceiling: --bitrate, else automatic from the desktop size.
+    #[cfg(target_os = "macos")]
+    let bitrate_bps = match args.bitrate {
+        Some(mbps) => mbps.max(1).saturating_mul(1_000_000),
+        None => auto_bitrate_bps(u32::from(width), u32::from(height), fps),
+    };
     #[cfg(target_os = "macos")]
     let gfx = args.enable_h264.then(|| {
         h264::Gfx::new(
             desktop_size.clone(),
             fps,
-            args.bitrate.max(1).saturating_mul(1_000_000),
+            bitrate_bps,
             args.keyframe_interval,
             args.h264_frames_in_flight.max(1),
             egfx_on_lossy_flag.clone(),
             egfx_on_udp_flag.clone(),
             egfx_demigrate_flag.clone(),
-            args.adaptive_bitrate,
+            !args.no_adaptive_bitrate,
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
         )
@@ -4044,26 +4077,53 @@ mod config_tests {
     fn bitrate_config_bridge() {
         // BITRATE alone maps to --bitrate.
         let p = write_temp("br1", "BITRATE=8\n");
-        assert_eq!(args_from_config(&p).unwrap().bitrate, 8);
+        assert_eq!(args_from_config(&p).unwrap().bitrate, Some(8));
         fs::remove_file(&p).ok();
 
         // BITRATE wins over a stale `--bitrate` in EXTRA_FLAGS (which is dropped
         // so clap never sees a duplicate) WITHOUT eating the other EXTRA_FLAGS.
         let p = write_temp("br2", "EXTRA_FLAGS=\"--fps 24 --bitrate 6\"\nBITRATE=12\n");
         let a = args_from_config(&p).unwrap();
-        assert_eq!(a.bitrate, 12);
+        assert_eq!(a.bitrate, Some(12));
         assert_eq!(a.fps, Some(24)); // the non-bitrate flag survived the strip
         fs::remove_file(&p).ok();
 
-        // Unset → the server default (6).
+        // Unset → the server default (automatic ceiling).
         let p = write_temp("br3", "ENABLE_H264=1\n");
-        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        assert_eq!(args_from_config(&p).unwrap().bitrate, None);
         fs::remove_file(&p).ok();
 
         // Empty BITRATE is ignored (no arg pushed) → default, not an error.
         let p = write_temp("br4", "BITRATE=\n");
-        assert_eq!(args_from_config(&p).unwrap().bitrate, 6);
+        assert_eq!(args_from_config(&p).unwrap().bitrate, None);
         fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn adaptive_bitrate_is_on_unless_turned_off() {
+        let p = write_temp("ab1", "ENABLE_H264=1\n");
+        assert!(!args_from_config(&p).unwrap().no_adaptive_bitrate);
+        fs::remove_file(&p).ok();
+        let p = write_temp("ab2", "ADAPTIVE_BITRATE=1\n");
+        assert!(!args_from_config(&p).unwrap().no_adaptive_bitrate);
+        fs::remove_file(&p).ok();
+        let p = write_temp("ab3", "ADAPTIVE_BITRATE=0\n");
+        assert!(args_from_config(&p).unwrap().no_adaptive_bitrate);
+        fs::remove_file(&p).ok();
+        // The old opt-in flag is still accepted.
+        assert!(Args::try_parse_from(["macrdp", "--adaptive-bitrate"]).is_ok());
+    }
+
+    #[test]
+    fn auto_bitrate_follows_size_and_frame_rate() {
+        // 1280x720 at 60 fps: 12 bits/pixel/s at 30 fps, doubled.
+        assert_eq!(auto_bitrate_bps(1280, 720, 60), 22_118_400);
+        // 30 fps and lower use the 30 fps value.
+        assert_eq!(auto_bitrate_bps(1280, 720, 30), 11_059_200);
+        assert_eq!(auto_bitrate_bps(1280, 720, 15), 11_059_200);
+        // Never below 1 Mbps, never overflows.
+        assert_eq!(auto_bitrate_bps(16, 16, 60), 1_000_000);
+        assert_eq!(auto_bitrate_bps(8192, 8192, 240), u32::MAX);
     }
 
     #[test]
@@ -4208,6 +4268,8 @@ mod config_tests {
         assert!(args.keychain);
         assert!(!args.virtual_display);
         assert!(!args.enable_h264);
+        // Adaptive bitrate is on by default.
+        assert!(!args.no_adaptive_bitrate);
         assert!(!args.enable_udp_multitransport);
         assert!(!args.udp_migrate_egfx);
     }

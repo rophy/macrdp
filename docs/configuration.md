@@ -100,14 +100,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           hardware-encoded via VideoToolbox, instead of legacy
                           bitmaps. Falls back to legacy automatically for
                           clients that don't negotiate H.264. See [video.md](video.md).
---bitrate N               Target H.264 bitrate in Mbps (default 6; only with
-                          --enable-h264). Raise it (8–12) for sharper detail if
-                          you have bandwidth headroom. With --adaptive-bitrate it
-                          is the ceiling, not a fixed target. Config key: BITRATE
-                          (the menu-bar controller's Video tab sets it).
+--bitrate N               H.264 bitrate ceiling in Mbps (H.264 only).
+                          Default: automatic, 12 bits per pixel per second at
+                          30 fps, scaled up for a higher rate (22 Mbps for
+                          1280x720 at 60 fps). Adaptive bitrate (on by default)
+                          backs off from it when the link queues; with
+                          --no-adaptive-bitrate it is a fixed target. Config key:
+                          BITRATE (the menu-bar controller's Video tab sets it).
 --keyframe-interval SECS  H.264 periodic keyframe (IDR) interval in seconds
                           (default 0 = none over TCP; on a UDP tunnel this value,
-                          or 2 s when 0). Only with --enable-h264. Keyframes are
+                          or 2 s when 0). H.264 only. Keyframes are
                           still forced when the client needs one; fractional
                           values OK.
 --keyframe-on-change      Force on-change H.264 keyframes (OFF by default; only
@@ -116,8 +118,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           The flush-burst already covers this,
                           so enable it only if big updates lag. See [video.md](video.md).
 --flush-frames N          Trailing frames re-sent after each change to drain
-                          mstsc's presentation buffer (default 4; only with
-                          --enable-h264). Stops the last keystroke before a pause
+                          mstsc's presentation buffer (default 4; H.264 only). Stops the last keystroke before a pause
                           lagging until the next keyframe. 0 disables. See [video.md](video.md).
 --enable-aac              Compress system audio as AAC-LC over RDPSND
                           (WAVE_FORMAT_AAC_MS) instead of raw PCM — ~11x less
@@ -282,15 +283,16 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           like TCP — but an auto-recovery watchdog de-migrates
                           EGFX back to TCP on a wedge (no more freeze-until-
                           reconnect; audio always rode TCP). Off by default.
---adaptive-bitrate        Opt-in. Congestion-responsive H.264 rate control on
-                          both the UDP tunnel and the TCP path (only with
-                          --enable-h264): an AIMD controller reads the client's
-                          frame-ack lag (EWMA-smoothed) + retransmits and live-
-                          adjusts the encoder bitrate within [floor, --bitrate
-                          ceiling] — backs off under congestion, climbs back when
-                          clear. So --bitrate becomes a ceiling, not a fixed
-                          target: set it high (e.g. 8) and let it adapt. Off by
-                          default.
+--no-adaptive-bitrate     Turn off congestion-responsive H.264 rate control (on
+                          by default; config ADAPTIVE_BITRATE=0). Over TCP the
+                          bitrate steps between 100/80/50/30/15 % of the ceiling
+                          on the median queueing delay of the frames (frame ack
+                          time above the base round trip); on the UDP tunnel an
+                          AIMD controller also reads retransmits. An EGFX frame
+                          window (frames of one base round trip + 1, at least 3)
+                          bounds the frames in flight over TCP
+                          (MACRDP_EGFX_FRAME_WINDOW=0 turns it off).
+                          (--adaptive-bitrate is still accepted; it is a no-op.)
 --enable-lossy-audio      EXPERIMENTAL, opt-in (implies --enable-udp-multitransport;
                           needs --enable-aac + --enable-h264). Stream RDPSND audio
                           over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-

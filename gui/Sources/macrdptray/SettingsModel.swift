@@ -171,11 +171,12 @@ final class SettingsModel: ObservableObject {
     // MARK: - H.264 bitrate ceiling (Mbit/s)
 
     /// Effective ceiling: the BITRATE key if set, else a `--bitrate N` left in
-    /// EXTRA_FLAGS (back-compat with hand-edited configs), else the default (6).
+    /// EXTRA_FLAGS (back-compat with hand-edited configs), else "" (the server
+    /// picks the ceiling from the desktop size: 22 Mbps for 1280x720 at 60 fps).
     var bitrateMbps: String {
         if let b = draft["BITRATE"], !b.isEmpty { return b }
         if let n = Self.extraFlagsBitrate(string("EXTRA_FLAGS")) { return n }
-        return "6"
+        return ""
     }
 
     /// Set the ceiling via BITRATE and strip any `--bitrate N` from EXTRA_FLAGS so
