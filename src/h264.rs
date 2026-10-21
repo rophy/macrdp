@@ -2418,6 +2418,10 @@ impl Gfx {
             s.rtt_ms
                 .store(self.link_rtt_ms.load(Ordering::Relaxed), Ordering::Relaxed);
             s.fps.store(self.fps, Ordering::Relaxed);
+            s.frames_sent.store(
+                ctx.last_shipped_frame_id.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
         actions
     }

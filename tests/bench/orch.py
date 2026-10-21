@@ -77,7 +77,7 @@ def server_stats():
 def stats_delta(a, b, wall):
     if not a or not b:
         return None
-    # frames_sent moves only with --adaptive-bitrate or for a client that sends EGFX QoE
+    # frames_sent moves only with adaptive bitrate (default) or for a client that sends EGFX QoE
     # reports (mstsc; FreeRDP does not): None when it never moved.
     fps = round((b["frames_sent"] - a["frames_sent"]) / wall, 2) if b["frames_sent"] else None
     return {"server_fps": fps,

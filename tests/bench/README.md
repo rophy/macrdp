@@ -46,7 +46,7 @@ Screen Recording TCC grant for `/usr/sbin/screencapture`.
 Start the server with H.264 and, for `server_stats`, the stats endpoint:
 
 ```sh
-macrdp --enable-h264 --stats-endpoint --bind 0.0.0.0:3390 --password-file ~/.macrdp-pw   # or --keychain
+macrdp --stats-endpoint --bind 0.0.0.0:3390 --password-file ~/.macrdp-pw   # or --keychain
 ```
 
 Put the account password into a file on the VM (mode 0600; it goes to FreeRDP on stdin, never
@@ -69,8 +69,7 @@ Notes:
   The server's Wi-Fi keep-awake (default on) hides most of it; compare with
   `--no-wifi-keep-awake` when latency numbers matter.
 - `server_stats` covers the H.264 path only (frames sent through EGFX). The server updates its
-  frame counter only with `--adaptive-bitrate` or for a client that sends EGFX QoE reports (mstsc;
-  FreeRDP does not), so with FreeRDP `server_fps` is `null` unless the server runs with
-  `--adaptive-bitrate`.
+  frame counter with adaptive bitrate (the default) or for a client that sends EGFX QoE reports
+  (mstsc; FreeRDP does not), so with FreeRDP and `--no-adaptive-bitrate` `server_fps` is `null`.
 - The macOS Screen Sharing comparison of macrdp-v1 (`ardproxy.py`, `rfbparse.py`, the `vnc`
   configs) is not part of this port.
