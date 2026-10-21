@@ -684,12 +684,14 @@ struct BlankRecoveryParams {
     /// latched) is a fast-path blank only once one tier holds. Found
     /// 2026-10-21 on Windows 10 mstsc FS 1920x1080: a healthy session can have
     /// only 1-2 nonzero reports in its first 4 s, interleaved with zeros, so a
-    /// single zero is no evidence. Before the latch, 107 recorded healthy fresh
-    /// connects (AVC420, AVC444, static desktop, window) never had 3+ zeros in
-    /// a row more than 5.7 s after a nonzero report, nor 11+ zeros in a row; a
-    /// frozen start (one stray nonzero, then zero on every report) meets
-    /// `(12, 4 s)` about 4 s in on an active screen (~5 reports/s) and
-    /// `(4, 8 s)` about 13 s in on a static one (~0.3 reports/s). Times are
+    /// single zero is no evidence. Before the latch, 167 recorded healthy fresh
+    /// connects (AVC420, AVC444, static desktop, window) had at most 13 zeros in
+    /// a row 3.6 s after a nonzero report, and at most 5.7 s after one with 3 or
+    /// more zeros in a row (fewer zeros: up to 19 s on a static desktop). A
+    /// frozen start (one stray nonzero, then zero on every report) is caught by
+    /// the count path at about 4.4 s on a moving screen (~5.7 reports/s;
+    /// measured live), by `(12, 6 s)` at about 6 s at 2-4 reports/s, and by
+    /// `(4, 10 s)` at about 13 s on a static screen (~0.3 reports/s). Times are
     /// RTT-scaled like `blank_max_wait`. No env knob.
     lapse_tiers: [(u64, Duration); 2],
     /// Reconnect-storm guard: if this many CONSECUTIVE connections all ended in
@@ -2034,7 +2036,7 @@ impl Gfx {
             max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
             blank_max_wait: watchdog_ms("MACRDP_BLANK_RECOVERY_MAX_WAIT_MS", 4000),
             blank_min_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS", 1)),
-            lapse_tiers: [(12, Duration::from_secs(4)), (4, Duration::from_secs(8))],
+            lapse_tiers: [(12, Duration::from_secs(6)), (4, Duration::from_secs(10))],
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
@@ -5231,7 +5233,7 @@ mod tests {
             // the wall-clock test asserts against this value.
             blank_min_reports: 3,
             // Production values; the lapse tests assert against them.
-            lapse_tiers: [(12, ms(4000)), (4, ms(8000))],
+            lapse_tiers: [(12, ms(6000)), (4, ms(10_000))],
             reactivate: false,
         }
     }
@@ -6196,8 +6198,9 @@ mod tests {
         (4811, 0),
         (5305, 17),
     ];
-    /// x46s-08, AVC444, static desktop: the longest pre-latch zero run of all
-    /// 107 recorded healthy connects (10 zeros, 5.7 s after a nonzero report).
+    /// x46s-08, AVC444, static desktop: of all 167 recorded healthy connects,
+    /// the longest pre-latch time after a nonzero report with 4 or more zeros
+    /// in a row (5.7 s, 10 zeros).
     const HEALTHY_X46S_08: [(u64, u16); 21] = [
         (458, 0),
         (949, 0),
@@ -6232,6 +6235,30 @@ mod tests {
         (20864, 10),
     ];
 
+    /// h48-09, AVC420, moving: 13 zeros in a row, the 3rd nonzero report (the
+    /// latch) 3.6 s after the 2nd. The closest healthy case to `(12, 6 s)`.
+    const HEALTHY_H48_09: [(u64, u16); 19] = [
+        (131, 4),
+        (487, 6),
+        (811, 0),
+        (1026, 0),
+        (1251, 0),
+        (1468, 0),
+        (1642, 0),
+        (1938, 0),
+        (2134, 0),
+        (2382, 0),
+        (2595, 0),
+        (2803, 0),
+        (3027, 0),
+        (3272, 0),
+        (3875, 0),
+        (4102, 14),
+        (4330, 0),
+        (4908, 0),
+        (5114, 22),
+    ];
+
     /// A frozen start (legacy hold off, frz46-02): zero on every report, one
     /// report every ~175 ms. `first` replaces the first reports.
     fn frozen_start(first: &[u16], interval_ms: u64, count: u64) -> Vec<(u64, u16)> {
@@ -6249,6 +6276,7 @@ mod tests {
         assert_eq!(replay_first_fire(&HEALTHY_X46_08, 5305), None);
         assert_eq!(replay_first_fire(&HEALTHY_X46S_08, 10_042), None);
         assert_eq!(replay_first_fire(&HEALTHY_X46S_01, 20_864), None);
+        assert_eq!(replay_first_fire(&HEALTHY_H48_09, 5114), None);
     }
 
     #[test]
@@ -6258,13 +6286,18 @@ mod tests {
             replay_first_fire(&frozen_start(&[], 175, 200), 30_000),
             Some(4000)
         );
-        // One stray nonzero report, then zero on every report: `(12, 4 s)`.
+        // One stray nonzero report, then zero on every report. At the frozen
+        // start's own cadence (~5.7 reports/s) the count path (24 zeros in a
+        // row) is first.
         let stray = replay_first_fire(&frozen_start(&[1], 175, 200), 30_000).unwrap();
         assert!((4000..=4500).contains(&stray), "{stray}");
+        // At 2.5 reports/s the count path would need ~9.7 s: `(12, 6 s)`.
+        let stray = replay_first_fire(&frozen_start(&[1], 400, 100), 30_000).unwrap();
+        assert!((6000..=6500).contains(&stray), "{stray}");
         // Presents twice, then freezes before 4 s.
-        let twice = replay_first_fire(&frozen_start(&[12, 7], 175, 200), 30_000).unwrap();
-        assert!((4000..=4700).contains(&twice), "{twice}");
-        // Static screen, one report every ~3.3 s: `(4, 8 s)` at the 4th zero.
+        let twice = replay_first_fire(&frozen_start(&[12, 7], 400, 100), 30_000).unwrap();
+        assert!((6000..=6700).contains(&twice), "{twice}");
+        // Static screen, one report every ~3.3 s: `(4, 10 s)` at the 4th zero.
         let stat = replay_first_fire(&frozen_start(&[1], 3300, 20), 60_000).unwrap();
         assert!((13_000..=13_500).contains(&stat), "{stat}");
     }
