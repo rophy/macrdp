@@ -205,6 +205,13 @@ pub fn audio_playback_wanted(flags: ironrdp_pdu::rdp::client_info::ClientInfoFla
     !flags.intersects(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO)
 }
 
+/// (vendored, divergence (34)) The client wants its microphone redirected:
+/// INFO_AUDIOCAPTURE in the Client Info PDU (MS-RDPBCGR 2.2.1.11.1.1; mstsc
+/// "Record from this computer", FreeRDP `/microphone`).
+pub fn audio_capture_wanted(flags: ironrdp_pdu::rdp::client_info::ClientInfoFlags) -> bool {
+    flags.contains(ironrdp_pdu::rdp::client_info::ClientInfoFlags::AUDIO_CAPTURE)
+}
+
 #[derive(Clone)]
 pub struct RdpServerOptions {
     pub addr: SocketAddr,
@@ -3637,6 +3644,14 @@ impl RdpServer {
             if !audio_playback && self.get_channel_id_by_type::<RdpsndServer>().is_some() {
                 info!(flags = ?result.client_info_flags, "Client asked for no audio playback, rdpsnd not started");
             }
+            // (vendored, divergence (34)) The AUDIO_INPUT DVC only for a client
+            // that asked to redirect its microphone.
+            if !audio_capture_wanted(result.client_info_flags)
+                && let Some(dvc) = self.get_svc_processor::<ironrdp_dvc::DrdynvcServer>()
+                && dvc.remove_unoffered_channel_by_name(crate::audin::AUDIO_INPUT_CHANNEL_NAME)
+            {
+                info!("Client did not ask for microphone redirection, AUDIO_INPUT not offered");
+            }
             for (type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
@@ -4191,7 +4206,17 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
 mod session_tests {
     use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
 
-    use super::audio_playback_wanted;
+    use super::{audio_capture_wanted, audio_playback_wanted};
+
+    /// (divergence (34)) mstsc "Record from this computer" sets INFO_AUDIOCAPTURE.
+    #[test]
+    fn audio_capture_follows_the_client_info_flags() {
+        assert!(!audio_capture_wanted(ClientInfoFlags::UNICODE | ClientInfoFlags::MOUSE));
+        assert!(!audio_capture_wanted(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+        assert!(audio_capture_wanted(
+            ClientInfoFlags::AUDIO_CAPTURE | ClientInfoFlags::NO_AUDIO_PLAYBACK
+        ));
+    }
 
     /// (divergence (31)) mstsc "Remote audio": play on this computer / do not
     /// play / play on the remote computer.

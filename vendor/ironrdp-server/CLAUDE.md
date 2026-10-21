@@ -2124,3 +2124,12 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     connection that ended cannot end the next one. Upstream has a similar
     graceful disconnect (f7253861, #1798, `ServerEvent::Disconnect`); drop
     on a pin bump past it.
+
+(34) AUDIO_INPUT only for a client that asks for it (NOT upstreamed; added
+    2026-10-21; uses `vendor/ironrdp-dvc` divergence (34)). `client_accepted`
+    removes the (opt-in) microphone DVC from the drdynvc channel list before
+    the channel starts when the Client Info PDU has no INFO_AUDIOCAPTURE
+    (MS-RDPBCGR 2.2.1.11.1.1; `audio_capture_wanted`), so the client never
+    gets its Create Request. mstsc sets the flag with "Record from this
+    computer" (checked 2026-10-21, Windows 10 22H2) and opened the channel
+    only then anyway.

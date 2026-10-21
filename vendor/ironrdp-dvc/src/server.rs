@@ -168,6 +168,23 @@ impl DrdynvcServer {
             .map(|(id, _)| *id)
     }
 
+    /// (macrdp divergence (34)) Drop a registered channel that has not been
+    /// offered yet (no Create Request sent), so the client never sees it.
+    /// Returns `false` if there is no such channel, or it was already offered.
+    pub fn remove_unoffered_channel_by_name(&mut self, name: &str) -> bool {
+        let Some(id) = self.get_channel_id_by_name(name) else {
+            return false;
+        };
+        if self
+            .dynamic_channels
+            .get(id)
+            .is_none_or(|c| c.state != ChannelState::Pending)
+        {
+            return false;
+        }
+        self.remove_by_channel_id(id).is_some()
+    }
+
     /// Returns `true` if the DVC channel with the given ID has completed
     /// its creation handshake and is in the `Opened` state.
     pub fn is_channel_opened(&self, channel_id: u32) -> bool {
@@ -356,4 +373,58 @@ fn decode_dvc_message(user_data: &[u8]) -> DecodeResult<DrdynvcClientPdu> {
 
 fn as_svc_msg_with_flag(pdu: DrdynvcServerPdu) -> PduResult<SvcMessage> {
     Ok(SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pdu::CapabilitiesResponsePdu;
+
+    struct Named(&'static str);
+    impl_as_any!(Named);
+    impl DvcProcessor for Named {
+        fn channel_name(&self) -> &str {
+            self.0
+        }
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+    impl DvcServerProcessor for Named {}
+
+    struct Other(Named);
+    impl_as_any!(Other);
+    impl DvcProcessor for Other {
+        fn channel_name(&self) -> &str {
+            self.0.0
+        }
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<crate::DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+    impl DvcServerProcessor for Other {}
+
+    /// (divergence (34)) A channel removed before the Capabilities Response gets no
+    /// Create Request; an offered channel cannot be removed this way.
+    #[test]
+    fn an_unoffered_channel_can_be_removed() {
+        let mut server = DrdynvcServer::new()
+            .with_dynamic_channel(Named("ECHO"))
+            .with_dynamic_channel(Other(Named("AUDIO_INPUT")));
+        assert!(server.remove_unoffered_channel_by_name("AUDIO_INPUT"));
+        assert!(!server.remove_unoffered_channel_by_name("AUDIO_INPUT"));
+        assert_eq!(server.get_channel_id_by_name("AUDIO_INPUT"), None);
+        assert_eq!(server.get_channel_id_by_type::<Other>(), None);
+
+        let caps = DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(CapsVersion::V2));
+        let creates = server.process(&ironrdp_core::encode_vec(&caps).unwrap()).unwrap();
+        assert_eq!(creates.len(), 1, "only ECHO is offered");
+        assert!(!server.remove_unoffered_channel_by_name("ECHO"), "ECHO was offered");
+    }
 }

@@ -120,6 +120,12 @@ since the lib is `test = false`.
     redirected USB drive mid-session tore its controller down and re-attaching
     re-presented it (the `close` arm fired the USB processor's teardown).
 
+(34) `DrdynvcServer::remove_unoffered_channel_by_name` (NOT upstreamed; added
+    2026-10-21). Drops a registered channel that is still `Pending` (no Create
+    Request sent yet). The vendored server uses it to skip the AUDIO_INPUT DVC
+    for a client that did not ask for microphone redirection (server
+    divergence (34)). Additive; test `an_unoffered_channel_can_be_removed`.
+
 ## Upstream candidacy
 
 The Soft-Sync request/response PDUs and the two `process()` arms are a clean,
