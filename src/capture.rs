@@ -917,6 +917,10 @@ mod macos {
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
 
+    /// How often the capture loop reads the cursor shape (~15 Hz), also while
+    /// the screen is static (the loop then waits at most this long for a sample).
+    const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(66);
+
     pub struct ScreenCaptureUpdates {
         stream: AsyncSCStream,
         pending: std::collections::VecDeque<DisplayUpdate>,
@@ -1419,7 +1423,6 @@ mod macos {
                 // capture/encode critical path, and 60 Hz buys nothing over
                 // 15 Hz for shape changes (see the `last_cursor_poll` field
                 // note — time-based, so animated cursors keep animating).
-                const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(66);
                 let poll_due = self
                     .last_cursor_poll
                     .is_none_or(|t| t.elapsed() >= CURSOR_POLL_INTERVAL);
@@ -1617,9 +1620,14 @@ mod macos {
                         }
                     }
                 } else {
-                    match self.stream.next().await {
-                        Some(sample) => sample,
-                        None => return Ok(None),
+                    // A static screen gives no samples: wake at the cursor poll
+                    // interval anyway, so a pointer shape change (I-beam, hand,
+                    // resize arrows, hidden) reaches the client without waiting
+                    // for the next screen change.
+                    match tokio::time::timeout(CURSOR_POLL_INTERVAL, self.stream.next()).await {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => return Ok(None),
+                        Err(_) => continue,
                     }
                 };
 
