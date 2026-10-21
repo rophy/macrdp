@@ -1980,6 +1980,7 @@ impl Gfx {
         hold
     }
 
+    /// Feed one full-frame BGRA buffer (see the doc above `hold_legacy`).
     ///
     /// `changed` is the tiles in which this frame differs from the one given
     /// before (`crate::refine::diff_copy`), for lossless refinement; `None`

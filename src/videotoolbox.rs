@@ -144,6 +144,12 @@ impl Encoder {
         unsafe { ffi::set_max_keyframe_interval(self.inner.session, keyframe_frames) }
     }
 
+    /// Presentation time stamp the next `encode_bgra` gives its frame
+    /// (`EncodedFrame::pts`).
+    pub fn next_pts(&self) -> i64 {
+        self.next_pts
+    }
+
     /// Submit a BGRA frame for encoding. `stride` is in bytes per row
     /// of the source buffer — VideoToolbox is told the source pixel
     /// format is `kCVPixelFormatType_32BGRA`, so each pixel is 4 bytes
@@ -159,12 +165,6 @@ impl Encoder {
     /// Returns immediately; encoded output arrives asynchronously via
     /// `drain()`. VT calls our output callback on its own thread, so
     /// the channel decouples producer and consumer cleanly.
-    /// Presentation time stamp the next `encode_bgra` gives its frame
-    /// (`EncodedFrame::pts`).
-    pub fn next_pts(&self) -> i64 {
-        self.next_pts
-    }
-
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
         let expected = stride
             .checked_mul(self.height.into())
