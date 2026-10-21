@@ -921,6 +921,13 @@ mod macos {
     /// the screen is static (the loop then waits at most this long for a sample).
     const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(66);
 
+    /// Captured frames queued for the capture loop; when it is full the
+    /// oldest is dropped. With the pool of 3 (before the H.264 path kept
+    /// buffers) at most 2 could wait; 2 keeps that bound with the larger
+    /// pool, so a slow consumer (legacy bitmap updates) never works through
+    /// more old frames than before.
+    const SAMPLE_QUEUE: usize = 2;
+
     /// Lock the kept capture buffer (`last_frame`) to read its pixels.
     fn lock_kept(kept: &Option<CVPixelBuffer>) -> Option<CVPixelBufferLockGuard<'_>> {
         kept.as_ref().and_then(|pb| pb.lock_read_only().ok())
@@ -1205,14 +1212,15 @@ mod macos {
                 .with_scales_to_fit(true)
                 .with_preserves_aspect_ratio(letterbox)
                 // The H.264 encoder keeps the capture buffers it encodes (no
-                // copy, see `Gfx::submit_bgra`): next to the frames queued
-                // for this loop, the one in hand and the kept last frame
-                // (`last_frame`), up to `--h264-frames-in-flight` more stay in
-                // use. The default pool of 3 would make SCK skip frames; 8 is
-                // the SCK maximum.
+                // copy, see `Gfx::submit_bgra`) until VideoToolbox has encoded
+                // them (1-2): next to the frames queued for this loop (at most
+                // `SAMPLE_QUEUE`), the one in hand and the kept last frame
+                // (`last_frame`). The default pool of 3 would make SCK skip
+                // frames; 8 is the SCK maximum.
                 .with_queue_depth(8);
 
-            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
+            let stream =
+                AsyncSCStream::new(&filter, &config, SAMPLE_QUEUE, SCStreamOutputType::Screen);
             stream
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
