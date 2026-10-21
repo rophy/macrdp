@@ -2301,7 +2301,7 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
-        let force_keyframe = {
+        let force_keyframe = 'ctx_step: {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(false); // no active connection
@@ -2563,6 +2563,15 @@ impl Gfx {
                         );
                     }
                 }
+            }
+            // A recovery action is armed: this capture is dropped by the action
+            // below anyway, so skip the throttles — their early returns would
+            // lose the action, and `blank_recovery_attempts` already counts it,
+            // so the detector would not fire again (Windows 10 mstsc, 2026-10-21:
+            // a Drop decided while the frame window was full never ran, and the
+            // frozen session stayed black). `need_keyframe` stays armed.
+            if blank_recovery.is_some() {
+                break 'ctx_step false;
             }
             // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
             // its floor AND the link is still congested, lowering quality can't help —
