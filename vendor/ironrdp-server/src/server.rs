@@ -205,6 +205,47 @@ pub fn audio_playback_wanted(flags: ironrdp_pdu::rdp::client_info::ClientInfoFla
     !flags.intersects(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO)
 }
 
+/// Audio-lag control of `dispatch_audio`: the audio shipped to the client
+/// minus the real time since the first wave is the client's queue. A wave
+/// that would make it larger than `MAX_LAG_MS` is dropped (the writer fell
+/// behind).
+///
+/// (vendored, divergence (35)) The queue is never below zero: after a gap
+/// (macrdp skips digital silence) the shipped total is raised to the real
+/// time at once. Before, it was raised only when the gap was over
+/// `RESYNC_DEFICIT_MS`, so a shorter gap G raised the drop limit to
+/// `MAX_LAG_MS + G` for the rest of the sound.
+#[derive(Debug, Default)]
+struct AudioLagModel {
+    shipped_ms: f64,
+}
+
+impl AudioLagModel {
+    const MAX_LAG_MS: f64 = 200.0;
+    /// Only for the log: a deficit this large means the writer stalled.
+    const RESYNC_DEFICIT_MS: f64 = 300.0;
+
+    /// Raise the shipped total to `real_elapsed_ms` if the client queue ran
+    /// empty. Returns the deficit when it was over `RESYNC_DEFICIT_MS`.
+    fn catch_up(&mut self, real_elapsed_ms: f64) -> Option<f64> {
+        let deficit_ms = real_elapsed_ms - self.shipped_ms;
+        if deficit_ms > 0.0 {
+            self.shipped_ms = real_elapsed_ms;
+        }
+        (deficit_ms > Self::RESYNC_DEFICIT_MS).then_some(deficit_ms)
+    }
+
+    /// The projected client queue if a `wave_ms` wave would be over the limit.
+    fn over_limit(&self, real_elapsed_ms: f64, wave_ms: f64) -> Option<f64> {
+        let projected_buffer_ms = self.shipped_ms + wave_ms - real_elapsed_ms;
+        (projected_buffer_ms > Self::MAX_LAG_MS).then_some(projected_buffer_ms)
+    }
+
+    fn shipped(&mut self, wave_ms: f64) {
+        self.shipped_ms += wave_ms;
+    }
+}
+
 /// (vendored, divergence (34)) The client wants its microphone redirected:
 /// INFO_AUDIOCAPTURE in the Client Info PDU (MS-RDPBCGR 2.2.1.11.1.1; mstsc
 /// "Record from this computer", FreeRDP `/microphone`).
@@ -2989,14 +3030,9 @@ impl RdpServer {
         let dispatch_audio = async move {
             // Task-local audio-lag state. Reset per connection because the
             // task is spawned fresh inside client_loop.
-            let mut audio_shipped_ms = 0.0_f64;
+            let mut lag = AudioLagModel::default();
             let mut audio_clock_start: Option<Instant> = None;
 
-            // Same constants as the prior on-Self model. See the
-            // "Cross-batch audio-lag control" comment block (formerly in
-            // dispatch_server_events) for the rationale.
-            const MAX_LAG_MS: f64 = 200.0;
-            const RESYNC_DEFICIT_MS: f64 = 300.0;
             // 16-bit stereo PCM at 44.1 kHz = 4 bytes/frame × 44 100 = 176 400 B/s,
             // i.e. 176.4 bytes per ms of audio. Matches `src/audio.rs::our_format()`
             // in the macrdp tree. Update if the audio backend's format changes.
@@ -3025,17 +3061,14 @@ impl RdpServer {
                 let now = Instant::now();
                 let start = *audio_clock_start.get_or_insert(now);
                 let real_elapsed_ms = (now - start).as_secs_f64() * 1000.0;
-                let deficit_ms = real_elapsed_ms - audio_shipped_ms;
-                if deficit_ms > RESYNC_DEFICIT_MS {
+                if let Some(deficit_ms) = lag.catch_up(real_elapsed_ms) {
                     debug!(
                         target: "audio_backlog",
                         deficit_ms,
                         "writer stalled; resyncing audio clock to live"
                     );
-                    audio_shipped_ms = real_elapsed_ms;
                 }
-                let projected_buffer_ms = audio_shipped_ms + wave_ms - real_elapsed_ms;
-                if projected_buffer_ms > MAX_LAG_MS {
+                if let Some(projected_buffer_ms) = lag.over_limit(real_elapsed_ms, wave_ms) {
                     debug!(
                         target: "audio_backlog",
                         projected_buffer_ms,
@@ -3066,7 +3099,7 @@ impl RdpServer {
                     if let Err(e) = res {
                         warn!(error = %e, "lossy audio wave route over UDP tunnel failed");
                     }
-                    audio_shipped_ms += wave_ms;
+                    lag.shipped(wave_ms);
                     continue;
                 }
 
@@ -3093,7 +3126,7 @@ impl RdpServer {
                 drop(this);
 
                 audio_writer.write_all(&encoded).await?;
-                audio_shipped_ms += wave_ms;
+                lag.shipped(wave_ms);
             }
         };
 
@@ -4206,7 +4239,61 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
 mod session_tests {
     use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
 
-    use super::{audio_capture_wanted, audio_playback_wanted};
+    use super::{AudioLagModel, audio_capture_wanted, audio_playback_wanted};
+
+    /// Waves shipped at `now_ms` before the model drops one.
+    fn shipped_before_drop(lag: &mut AudioLagModel, now_ms: f64, wave_ms: f64) -> usize {
+        let mut n = 0;
+        loop {
+            lag.catch_up(now_ms);
+            if lag.over_limit(now_ms, wave_ms).is_some() {
+                return n;
+            }
+            lag.shipped(wave_ms);
+            n += 1;
+        }
+    }
+
+    /// (divergence (35)) A 250 ms gap (skipped silence), then a burst of waves
+    /// at one instant (the writer stalled): the queue limit stays 200 ms.
+    /// Before, the gap raised it to 450 ms (21 waves).
+    #[test]
+    fn a_short_gap_does_not_raise_the_queue_limit() {
+        let wave = 1024.0 / 48.0;
+        let mut lag = AudioLagModel::default();
+        // One second of sound shipped in real time.
+        for i in 0..47 {
+            let now = f64::from(i) * wave;
+            lag.catch_up(now);
+            assert!(lag.over_limit(now, wave).is_none());
+            lag.shipped(wave);
+        }
+        let after_gap = lag.shipped_ms + 250.0;
+        assert_eq!(lag.catch_up(after_gap), None, "250 ms is no writer stall");
+        assert_eq!(shipped_before_drop(&mut lag, after_gap, wave), 9);
+    }
+
+    /// A long gap is still logged as a stall, and the limit is the same.
+    #[test]
+    fn a_long_gap_resyncs_and_reports_the_deficit() {
+        let wave = 1024.0 / 48.0;
+        let mut lag = AudioLagModel::default();
+        lag.shipped(wave);
+        let d = lag.catch_up(wave + 400.0).expect("a 400 ms deficit is reported");
+        assert!((d - 400.0).abs() < 1e-9);
+        assert_eq!(shipped_before_drop(&mut lag, wave + 400.0, wave), 9);
+    }
+
+    /// A queue that is not empty is kept: no catch-up while waves are ahead.
+    #[test]
+    fn a_full_queue_is_not_reset() {
+        let mut lag = AudioLagModel::default();
+        lag.shipped(150.0);
+        assert_eq!(lag.catch_up(100.0), None);
+        assert!((lag.shipped_ms - 150.0).abs() < 1e-9);
+        assert!(lag.over_limit(100.0, 100.0).is_none());
+        assert!(lag.over_limit(100.0, 160.0).is_some());
+    }
 
     /// (divergence (34)) mstsc "Record from this computer" sets INFO_AUDIOCAPTURE.
     #[test]

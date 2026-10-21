@@ -2133,3 +2133,12 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     gets its Create Request. mstsc sets the flag with "Record from this
     computer" (checked 2026-10-21, Windows 10 22H2) and opened the channel
     only then anyway.
+
+(35) Audio-lag model: the client queue is never below zero (NOT upstreamed;
+    added 2026-10-21). `dispatch_audio`'s model is now `AudioLagModel`. It
+    raises the shipped total to the real time at every wave when the queue
+    ran empty, not only after a deficit over 300 ms (that size is now only
+    logged as a writer stall). macrdp skips digital silence, so gaps under
+    300 ms are normal; before, each one raised the drop limit by its length
+    for the rest of the sound. Tests: `a_short_gap_does_not_raise_the_queue_limit`
+    and two more in `session_tests`.
