@@ -94,12 +94,14 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           `none` to disable translation. Keys are translated via
                           UCKeyTranslate and posted as Unicode; the Mac's own
                           input source is untouched. macOS-only.
---fps N                   Frame rate cap (default 15, or 60 with --enable-h264
+--fps N                   Frame rate cap (default 60 with H.264, or 15 with --no-h264
                           — see [video.md](video.md) for why H.264 wants the higher rate)
---enable-h264             Stream the display as H.264 over EGFX (AVC420),
-                          hardware-encoded via VideoToolbox, instead of legacy
-                          bitmaps. Falls back to legacy automatically for
-                          clients that don't negotiate H.264. See [video.md](video.md).
+--no-h264                 Serve legacy bitmaps only. By default the display is
+                          H.264 over EGFX (AVC420), hardware-encoded via
+                          VideoToolbox, with an automatic legacy fallback for
+                          clients that don't negotiate H.264. Config key:
+                          ENABLE_H264=0. (--enable-h264 is still accepted; it is
+                          a no-op.) See [video.md](video.md).
 --bitrate N               H.264 bitrate ceiling in Mbps (H.264 only).
                           Default: automatic, 12 bits per pixel per second at
                           30 fps, scaled up for a higher rate (22 Mbps for
@@ -364,7 +366,7 @@ copy-paste collector configs: **`docs/siem-forwarding.md`**.
 `MACRDP_LOG_MAX_FILES` (default 5); see `--log-dir`. The audit file has its own
 `MACRDP_AUDIT_LOG_MAX_BYTES` / `MACRDP_AUDIT_LOG_MAX_FILES`.)
 
-### Blank recovery + auto-reconnect (on by default with `--enable-h264`)
+### Blank recovery + auto-reconnect (on by default with H.264)
 
 The mstsc reconnect-blank auto-heal: on a detected blank the server sends a bare
 core Deactivation–Reactivation that makes mstsc re-map its retained surface and
@@ -442,9 +444,8 @@ Both restore the original layout when the last client disconnects, and both auto
 ./macrdp --fps 30 --cert-dir ~/.macrdp-certs
 
 # H.264 video over EGFX — much lower bandwidth AND crisper than legacy bitmaps.
-# Recommended for mstsc / Microsoft Remote Desktop / FreeRDP / Thincast: the
-# default legacy bitmap path looks grainy on those clients by comparison.
-./macrdp --enable-h264
+# H.264 is the default. Legacy bitmaps only (e.g. to compare):
+./macrdp --no-h264
 
 # Make Windows shortcuts (Ctrl+C/V/X/…) drive macOS copy/paste; keep VSCode's
 # integrated terminal on real Ctrl.

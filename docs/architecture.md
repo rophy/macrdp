@@ -157,7 +157,7 @@ src/virtual_display/    Opt-in headless display via undocumented
                         private_api.rs (the maintenance boundary —
                         when Apple changes the API in a future macOS,
                         update only that file).
-src/h264.rs       EGFX/H.264 video pipeline (opt-in via --enable-h264).
+src/h264.rs       EGFX/H.264 video pipeline (default; --no-h264 turns it off).
                   Bridges the VideoToolbox encoder (src/videotoolbox.rs) to
                   upstream's GraphicsPipelineServer: per SCK frame, encode →
                   non-blocking drain → AVC420 (Annex-B framing) → DRDYNVC →

@@ -432,13 +432,19 @@ struct Args {
     #[arg(long)]
     stats_endpoint: bool,
 
-    /// Serve the display as H.264 video over the EGFX virtual channel
-    /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
-    /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
-    /// automatically for clients that don't negotiate EGFX. Experimental;
-    /// macOS-only.
-    #[arg(long)]
+    /// Serve legacy RemoteFx/QOI BitmapUpdates only, not H.264. By default the
+    /// display is H.264 video over the EGFX virtual channel (MS-RDPEGFX,
+    /// AVC420), hardware-encoded via VideoToolbox, with an automatic fallback
+    /// to the legacy path for clients that don't negotiate EGFX with AVC420.
+    /// Config key: ENABLE_H264=0. macOS-only.
+    #[arg(long = "no-h264", action = clap::ArgAction::SetFalse)]
     enable_h264: bool,
+
+    /// Deprecated/no-op: H.264 is now on by default. Accepted so existing
+    /// command lines keep working; use --no-h264 for legacy bitmaps only.
+    #[arg(long = "enable-h264", action = clap::ArgAction::SetTrue, hide = true)]
+    #[allow(dead_code)]
+    enable_h264_compat: bool,
 
     /// H.264 bitrate ceiling in megabits/sec (only with --enable-h264).
     /// Default: automatic from the desktop size and frame rate (12 bits per
@@ -2438,8 +2444,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
         }
         argv.push("--keychain".into());
     }
-    if on("ENABLE_H264", false) {
-        argv.push("--enable-h264".into());
+    if !on("ENABLE_H264", true) {
+        argv.push("--no-h264".into());
     }
     if on("ENABLE_AAC", false) {
         argv.push("--enable-aac".into());
@@ -3320,7 +3326,7 @@ async fn async_main() -> Result<()> {
         );
     }
 
-    // Video-path heads-up. With --enable-h264 the active vs AVC420-fallback cases
+    // Video-path heads-up. With H.264 (the default) the active vs AVC420-fallback cases
     // are logged later (h264.rs, once the client's EGFX caps are known); the only
     // gap is the h264-disabled case, which never reaches that code — so name the
     // legacy path and point at the crisp option here. Answers the common "the
@@ -3328,8 +3334,8 @@ async fn async_main() -> Result<()> {
     if !args.enable_h264 {
         info!(
             "video codec: legacy bitmap path (RemoteFX/QOI/NSCodec/raw, client-negotiated). \
-             For crisp H.264 on capable clients (mstsc, Microsoft Remote Desktop, FreeRDP, \
-             Thincast) pass --enable-h264 (AVC420 over EGFX)."
+             --no-h264 is set; without it capable clients (mstsc, Microsoft Remote Desktop, \
+             FreeRDP, Thincast) get crisp H.264 (AVC420 over EGFX)."
         );
     }
 
@@ -4100,6 +4106,28 @@ mod config_tests {
     }
 
     #[test]
+    fn h264_is_on_unless_turned_off() {
+        let p = write_temp("h1", "ENABLE_H264=0\n");
+        assert!(!args_from_config(&p).unwrap().enable_h264);
+        fs::remove_file(&p).ok();
+        let p = write_temp("h2", "ENABLE_H264=1\n");
+        assert!(args_from_config(&p).unwrap().enable_h264);
+        fs::remove_file(&p).ok();
+        assert!(Args::try_parse_from(["macrdp"]).unwrap().enable_h264);
+        assert!(
+            !Args::try_parse_from(["macrdp", "--no-h264"])
+                .unwrap()
+                .enable_h264
+        );
+        // The old opt-in flag is still accepted.
+        assert!(
+            Args::try_parse_from(["macrdp", "--enable-h264"])
+                .unwrap()
+                .enable_h264
+        );
+    }
+
+    #[test]
     fn adaptive_bitrate_is_on_unless_turned_off() {
         let p = write_temp("ab1", "ENABLE_H264=1\n");
         assert!(!args_from_config(&p).unwrap().no_adaptive_bitrate);
@@ -4267,8 +4295,8 @@ mod config_tests {
         assert_eq!(args.bind.to_string(), "127.0.0.1:3390");
         assert!(args.keychain);
         assert!(!args.virtual_display);
-        assert!(!args.enable_h264);
-        // Adaptive bitrate is on by default.
+        // H.264 and adaptive bitrate are on by default.
+        assert!(args.enable_h264);
         assert!(!args.no_adaptive_bitrate);
         assert!(!args.enable_udp_multitransport);
         assert!(!args.udp_migrate_egfx);

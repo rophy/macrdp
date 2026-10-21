@@ -285,7 +285,7 @@ private struct VideoTab: View {
     var body: some View {
         Form {
             Section {
-                Toggle("H.264 video (EGFX / AVC420)", isOn: model.boolBinding("ENABLE_H264"))
+                Toggle("H.264 video (EGFX / AVC420)", isOn: model.boolBinding("ENABLE_H264", default: true))
                 Text("Streams the screen as H.264 — far less bandwidth than legacy bitmaps. "
                     + "Recommended. Clients without an H.264 decoder fall back automatically.")
                     .font(.caption).foregroundColor(.secondary)
@@ -296,9 +296,9 @@ private struct VideoTab: View {
                     set: { model.setBitrate(String($0)) }), in: 1...50) {
                     Text(model.bitrateMbps.isEmpty ? "Ceiling: automatic" : "Ceiling: \(model.bitrateMbps) Mbps")
                 }
-                .disabled(!model.bool("ENABLE_H264"))
+                .disabled(!model.bool("ENABLE_H264", default: true))
                 Toggle("Adaptive bitrate (lower under congestion)", isOn: model.boolBinding("ADAPTIVE_BITRATE", default: true))
-                    .disabled(!model.bool("ENABLE_H264"))
+                    .disabled(!model.bool("ENABLE_H264", default: true))
                 Text("The ceiling is the maximum. With Adaptive on, the server drops below it "
                     + "under congestion (thin/lossy link) and climbs back when it clears; on a "
                     + "clean link it stays at the ceiling. H.264 only.")

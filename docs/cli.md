@@ -31,7 +31,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   silently ignored) — resize needs the client-resolution
                           #   auto-adopt path, which --hidpi pins off, same as it
                           #   pins the initial connect-time size.
---fps N                   # default 60 with --enable-h264, else 15
+--fps N                   # default 60 with H.264 (default), 15 with --no-h264
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
                           #   client upscales the desktop but draws the pointer
@@ -215,7 +215,8 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   keycode events into a secure field and a private
                           #   lock-state check. See the auto-unlock note in
                           #   known-quirks.md. macOS-only.
---enable-h264             # stream H.264 over EGFX (AVC420) instead of legacy bitmaps
+--no-h264                 # legacy bitmaps only (default: H.264 over EGFX, AVC420, with a
+                          #   legacy fallback; --enable-h264 is a no-op kept for old lines)
 --bitrate N               # H.264 bitrate ceiling in Mbps (default: automatic, 12 bits
                           #   per pixel/s at 30 fps, scaled up for more fps: 22 Mbps at
                           #   1280x720@60; H.264 only). With adaptive
@@ -561,7 +562,7 @@ exiting.
 
 Blank recovery + auto-reconnect (env-tunable, **settable through `config.env`**
 — the matching keys are the same names minus the `MACRDP_` prefix, e.g.
-`BLANK_RECOVERY=0`; on by default with `--enable-h264`).
+`BLANK_RECOVERY=0`; on by default with H.264).
 The mstsc reconnect-blank auto-heal now **reactivates the RDP core in place** —
 on a detected blank the server sends a bare Deactivation–Reactivation (Server
 Deactivate All → new Demand Active) that preserves the EGFX channel/surface, and

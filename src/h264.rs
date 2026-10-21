@@ -1688,7 +1688,7 @@ impl Gfx {
                 udp_keyframe_frames,
                 stretched_keyframe_frames,
                 floor_fps = adaptive_floor_fps,
-                "EGFX adaptive bitrate + IDR backoff + frame-rate floor ENABLED (--adaptive-bitrate) — \
+                "EGFX adaptive bitrate + IDR backoff + frame-rate floor ENABLED (default; --no-adaptive-bitrate turns it off) — \
                  congestion-responsive rate control on both the UDP tunnel and the TCP path"
             );
         }

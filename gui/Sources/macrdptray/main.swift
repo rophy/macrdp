@@ -662,7 +662,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let defaults = """
             BIND="127.0.0.1:3390"
             USE_KEYCHAIN=1
-            ENABLE_H264=0
+            ENABLE_H264=1
             ENABLE_AAC=0
             HIDPI=0
             UNMINIMIZE=0

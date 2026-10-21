@@ -6,7 +6,7 @@
 
 A native RDP server for macOS, written in Rust on top of [IronRDP]. Connect from `mstsc`, the Windows App / Microsoft Remote Desktop, or FreeRDP and drive your Mac — authenticated against your local Mac account (NLA/CredSSP, TLS). What you get:
 
-- **Desktop:** H.264 video (hardware-encoded, opt-in, with adaptive bitrate) or legacy bitmaps; keyboard (non-US layouts auto-detected) and mouse with the real cursor shape; the session follows your client's resolution.
+- **Desktop:** H.264 video (hardware-encoded, adaptive bitrate; on by default) or legacy bitmaps; keyboard (non-US layouts auto-detected) and mouse with the real cursor shape; the session follows your client's resolution.
 - **Clipboard & files:** text, images and rich text both ways; copy files and folders between Mac and Windows.
 - **Audio:** Mac audio to the client; the client's microphone as a real Mac input device *(experimental)*.
 - **Devices from the client:** drives mounted in Finder (read-write), smart cards for macOS apps, the webcam as a real Mac camera, and USB devices *(experimental)*.
@@ -64,8 +64,8 @@ Then connect from a client to `<your-mac-ip>:3390` with your Mac username and pa
 Common flags to try next (full reference: [docs/configuration.md](docs/configuration.md)):
 
 ```bash
-./macrdp --enable-h264                      # H.264 video — crisper AND lighter than the default bitmaps
-./macrdp --enable-h264 --no-adaptive-bitrate --bitrate 8  # fixed bitrate (adaptive rate control is on by default)
+./macrdp --no-h264                         # legacy bitmaps only (H.264 video is the default)
+./macrdp --no-adaptive-bitrate --bitrate 8   # fixed H.264 bitrate (adaptive rate control is the default)
 ./macrdp --bind 0.0.0.0:3390                # accept LAN connections (keep it OFF public IPs)
 ./macrdp --virtual-display --width 2560 --height 1440   # headless second desktop; local screen untouched
 ./macrdp --map-ctrl-to-cmd                  # Windows Ctrl+C/V/X muscle memory drives macOS copy/paste
