@@ -640,6 +640,11 @@ clipboard file copy both ways; idle timeout (`ERRINFO_IDLE_TIMEOUT`). Optional p
 The exit code is the number of failed tests. The video checks only need FreeRDP; they say
 nothing about Windows mstsc.
 
+### Benchmark (`tests/bench/`)
+
+Frame rate, frame gaps, bandwidth and key-to-screen latency measured on a FreeRDP client;
+see `tests/bench/README.md`.
+
 To decrypt a Wireshark capture of a session, run macrdp with `SSLKEYLOGFILE=/path/to/keylog.txt`
 and point Wireshark at that file (Preferences → Protocols → TLS → "(Pre)-Master-Secret log
 filename"). Covers the TCP RDP connection and the reliable-UDP multitransport flow (rustls);
