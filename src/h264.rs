@@ -1486,7 +1486,54 @@ pub struct Gfx {
     /// frames update only the changed tiles, and a quiet screen's text tiles
     /// are sent again with ClearCodec. See `crate::refine`.
     lossless_text: bool,
+    /// The refinement frame that is being ZGFX-compressed and not sent yet.
+    /// Lock order: this, then ctx (released again), then a pipeline.
+    refine_job: Arc<Mutex<Option<RefineJob>>>,
 }
+
+/// A ClearCodec refinement frame taken from the pipeline and not sent yet.
+///
+/// Its tiles show the H.264 frame sent before it, so no other EGFX frame may
+/// go out before it: `submit_bgra` sends it (uncompressed if the compression
+/// is not done) before it encodes the next frame.
+struct RefineJob {
+    /// Pipeline of the connection the frame belongs to
+    handle: GfxServerHandle,
+    channel_id: u32,
+    /// The ZGFX-wrapped, uncompressed PDUs and their names
+    pdus: Arc<Vec<(Vec<u8>, &'static str)>>,
+    frame_id: u32,
+    /// ClearCodec bytes in the frame
+    bytes: usize,
+    /// Pending tiles looked at, and of those sent lossless (for the log)
+    tiles: (usize, usize),
+    /// Tells the compression to stop: the frame went out as it is
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+}
+
+/// A ZGFX-wrapped EGFX PDU, as bytes.
+struct ZgfxMessage {
+    bytes: Vec<u8>,
+    name: &'static str,
+}
+
+impl ironrdp_pdu::Encode for ZgfxMessage {
+    fn encode(&self, dst: &mut ironrdp_pdu::WriteCursor<'_>) -> ironrdp_pdu::EncodeResult<()> {
+        dst.write_slice(&self.bytes);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl ironrdp_dvc::DvcEncode for ZgfxMessage {}
 
 /// AVC420 region rectangles for a frame of `width` x `height`.
 ///
@@ -1804,6 +1851,7 @@ impl Gfx {
             adaptive_seed_rtt_ms,
             reactivate_request: Arc::new(AtomicU32::new(0)),
             lossless_text: false,
+            refine_job: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2378,6 +2426,12 @@ impl Gfx {
             return Ok(true);
         }
 
+        // A refinement frame still being compressed goes out first, as it is:
+        // its tiles show the frame before this one.
+        if self.lossless_text {
+            self.flush_refine_job();
+        }
+
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
         // output; we just count the submission for the drop-to-latest throttle.
         {
@@ -2471,7 +2525,7 @@ impl Gfx {
     /// so it is the picture the client has. The tiles go in chunks of about
     /// `refine::REFINE_CHUNK_BYTES`, one at a time (the next after the client
     /// acknowledged the last one), so that a new H.264 frame waits behind one
-    /// chunk at most.
+    /// chunk at most. ZGFX compression of the chunk runs on a blocking thread.
     pub fn refine_step(&self, frame: &[u8], stride: usize, dims: (u16, u16), color_share: usize) {
         if !self.lossless_text {
             return;
@@ -2509,6 +2563,11 @@ impl Gfx {
             refine.lock().unwrap().give_up();
             return;
         };
+        if self.refine_job.lock().unwrap().is_some() {
+            // The last chunk is not sent yet.
+            refine.lock().unwrap().poll_later(now);
+            return;
+        }
         let (mut pending, first_seq) = {
             let mut r = refine.lock().unwrap();
             if r.due().is_none_or(|d| d > now) {
@@ -2564,10 +2623,9 @@ impl Gfx {
                 bitmap_data,
             })
             .collect();
-        // Queue the frame in the pipeline and send it at once: its tiles show
-        // the last H.264 frame, so it must go out before the next one (the
-        // next one is encoded on this thread, after this returns).
-        let sent = {
+        // Queue the frame in the pipeline and take its PDUs out: from here it
+        // goes out (as it is or compressed) before the next H.264 frame.
+        let taken = {
             let mut server = handle.lock().unwrap();
             let ts_ms =
                 u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
@@ -2575,30 +2633,22 @@ impl Gfx {
                 server.channel_id(),
                 server.send_mixed_frame(surface_id, payload, ts_ms),
             ) {
-                (Some(channel_id), Some(frame_id)) => {
-                    let msgs = server.drain_output();
-                    let wire: usize = msgs.iter().map(|m| m.size()).sum();
-                    let result = encode_dvc_messages(channel_id, msgs, ChannelFlags::SHOW_PROTOCOL)
-                        .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))
-                        .and_then(|messages| {
-                            let sender = self
-                                .sender
-                                .lock()
-                                .unwrap()
-                                .clone()
-                                .ok_or_else(|| anyhow!("server-event sender not set"))?;
-                            sender
-                                .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                                    messages,
-                                }))
-                                .map_err(|_| anyhow!("ServerEvent send failed"))
-                        });
-                    Some((frame_id, wire, result))
-                }
+                (Some(channel_id), Some(frame_id)) => server
+                    .drain_output()
+                    .iter()
+                    .map(|m| {
+                        let mut out = vec![0u8; m.size()];
+                        m.encode(&mut ironrdp_pdu::WriteCursor::new(&mut out))
+                            .map(|()| (out, m.name()))
+                    })
+                    .collect::<Result<Vec<(Vec<u8>, &'static str)>, _>>()
+                    .map_err(|e| warn!(error = %e, "Refine: PDU encode failed"))
+                    .ok()
+                    .map(|pdus| (channel_id, frame_id, pdus)),
                 _ => None,
             }
         };
-        let Some((frame_id, wire, result)) = sent else {
+        let Some((channel_id, frame_id, pdus)) = taken else {
             debug!("Refine: the pipeline did not take the frame");
             refine.lock().unwrap().give_up();
             return;
@@ -2607,15 +2657,122 @@ impl Gfx {
             .lock()
             .unwrap()
             .on_chunk_queued(frame_id, count, Instant::now());
-        match result {
+        debug!(
+            frame_id,
+            tiles = chunk.total,
+            lossless = chunk.picked,
+            rects = count,
+            bytes,
+            encode_ms = format!("{encode_ms:.1}"),
+            "Refine: frame taken, compressing"
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pdus = Arc::new(pdus);
+        *self.refine_job.lock().unwrap() = Some(RefineJob {
+            handle: handle.clone(),
+            channel_id,
+            pdus: pdus.clone(),
+            frame_id,
+            bytes,
+            tiles: (chunk.total, chunk.picked),
+            cancel: cancel.clone(),
+            started: Instant::now(),
+        });
+        // ZGFX takes 10-30 ms per chunk: off the capture loop, so that a new
+        // frame does not wait for it.
+        let gfx = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::with_capacity(pdus.len());
+            for (wrapped, name) in pdus.iter() {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let bytes = refine::compress_wrapped(wrapped).unwrap_or_else(|e| {
+                    warn!(error = %e, "Refine: PDU not compressed");
+                    wrapped.clone()
+                });
+                out.push((bytes, *name));
+            }
+            let mut slot = gfx.refine_job.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|j| j.frame_id == frame_id && Arc::ptr_eq(&j.handle, &handle))
+            {
+                let job = slot.take().expect("checked");
+                // Held while sending: `submit_bgra` cannot send a frame before it.
+                gfx.send_refine_job(&job, Some(out));
+            }
+        });
+    }
+
+    /// Send the refinement frame now, uncompressed, if its compression is not
+    /// done (called before a new frame is encoded).
+    fn flush_refine_job(&self) {
+        let mut slot = self.refine_job.lock().unwrap();
+        if let Some(job) = slot.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            self.send_refine_job(&job, None);
+        }
+    }
+
+    /// Send a refinement frame: `compressed` PDUs if given, else as it is. A
+    /// frame of an older connection, or of a channel that closed after the
+    /// frame was taken, is dropped. The caller holds `refine_job`.
+    fn send_refine_job(&self, job: &RefineJob, compressed: Option<Vec<(Vec<u8>, &'static str)>>) {
+        let current = self
+            .ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.server_handle.clone());
+        if !current.is_some_and(|c| Arc::ptr_eq(&c, &job.handle)) {
+            debug!(
+                frame_id = job.frame_id,
+                "Refine: frame of an older connection dropped"
+            );
+            return;
+        }
+        // Held until the PDUs are queued: the channel cannot close in between.
+        let server = job.handle.lock().unwrap();
+        if !server.is_ready() || server.channel_id() != Some(job.channel_id) {
+            debug!(
+                frame_id = job.frame_id,
+                "Refine: EGFX channel closed, frame dropped"
+            );
+            return;
+        }
+        let was_compressed = compressed.is_some();
+        let pdus = compressed.unwrap_or_else(|| job.pdus.as_ref().clone());
+        let wire: usize = pdus.iter().map(|(b, _)| b.len()).sum();
+        let msgs: Vec<ironrdp_dvc::DvcMessage> = pdus
+            .into_iter()
+            .map(|(bytes, name)| Box::new(ZgfxMessage { bytes, name }) as ironrdp_dvc::DvcMessage)
+            .collect();
+        let sent = encode_dvc_messages(job.channel_id, msgs, ChannelFlags::SHOW_PROTOCOL)
+            .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))
+            .and_then(|messages| {
+                let sender = self
+                    .sender
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| anyhow!("server-event sender not set"))?;
+                sender
+                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages,
+                    }))
+                    .map_err(|_| anyhow!("ServerEvent send failed"))
+            });
+        drop(server);
+        match sent {
             Ok(()) => debug!(
-                frame_id,
-                tiles = chunk.total,
-                lossless = chunk.picked,
-                rects = count,
-                bytes,
+                frame_id = job.frame_id,
+                tiles = job.tiles.0,
+                lossless = job.tiles.1,
+                bytes = job.bytes,
                 wire,
-                encode_ms = format!("{encode_ms:.1}"),
+                compressed = was_compressed,
+                wait_ms = format!("{:.1}", job.started.elapsed().as_secs_f64() * 1000.0),
                 "Refine: sent lossless tiles"
             ),
             Err(e) => warn!(error = ?e, "Refine: frame not sent"),

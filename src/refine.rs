@@ -1,6 +1,6 @@
 //! Lossless refinement of a quiet screen (mixed mode).
 //!
-//! Ported from macrdp-v1 (7f652c1, 349869d), relicensed by the author.
+//! Ported from macrdp-v1 (7f652c1, d8e3936, 349869d), relicensed by the author.
 //!
 //! H.264 AVC420 keeps only a quarter of the chroma, so colored text stays
 //! blurred (MS-RDPEGFX clients show what the decoder gives). Windows hosts send
@@ -11,7 +11,7 @@
 //! so the lossless picture stays until that area changes again.
 //!
 //! This module has the pure parts (tile grid, tile diff, color test, chunking,
-//! ClearCodec sequence numbers) and the
+//! ClearCodec sequence numbers, ZGFX compression of a refine PDU) and the
 //! per-connection state [`Refine`]. `crate::h264` wires it into the EGFX
 //! pipeline.
 
@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
+use ironrdp_graphics::zgfx;
 
 /// Nominal tile size. Tiles are made a little larger so that the screen splits
 /// evenly (no thin edge tiles).
@@ -429,6 +430,72 @@ pub fn stamp_clear_seq(tiles: &mut [(TileRect, Vec<u8>)], first: u8) {
             *seq = first.wrapping_add(i as u8);
         }
     }
+}
+
+/// Largest uncompressed size of one ZGFX segment (MS-RDPEGFX 2.2.5.1).
+const ZGFX_SEGMENT_MAX: usize = 65535;
+/// RDP8 bulk compression type with the PACKET_COMPRESSED flag (2.2.5.2).
+const ZGFX_FLAGS_COMPRESSED: u8 = 0x24;
+/// RDP8 bulk compression type, raw data.
+const ZGFX_FLAGS_RAW: u8 = 0x04;
+
+/// ZGFX-compress one EGFX PDU that the pipeline wrapped uncompressed, with a
+/// new compressor.
+///
+/// The pipeline sends PDUs uncompressed. A PDU compressed with a new
+/// compressor refers only to its own bytes, so the client decodes it correctly
+/// whatever else it put into its ZGFX history before, and in whatever order
+/// the other messages reach it. A PDU larger than one segment goes as a
+/// multipart message whose segments each decompress to at most 65535 bytes
+/// (MS-RDPEGFX 3.1.9.1; FreeRDP refuses a larger segment), sharing the
+/// compressor history in order. A segment that does not get smaller stays raw.
+pub fn compress_wrapped(wrapped: &[u8]) -> Result<Vec<u8>, String> {
+    // The wrapped PDU has raw segments only: a new decompressor unwraps it.
+    let mut pdu = Vec::with_capacity(wrapped.len());
+    zgfx::Decompressor::new()
+        .decompress(wrapped, &mut pdu)
+        .map_err(|e| format!("ZGFX unwrap: {e}"))?;
+    let mut compressor = zgfx::Compressor::new();
+    let mut segments: Vec<(bool, Vec<u8>)> = Vec::new();
+    for chunk in pdu.chunks(ZGFX_SEGMENT_MAX) {
+        let c = compressor
+            .compress(chunk)
+            .map_err(|e| format!("ZGFX compress: {e}"))?;
+        if c.len() < chunk.len() {
+            segments.push((true, c));
+        } else {
+            segments.push((false, chunk.to_vec()));
+        }
+    }
+    let flags = |compressed: bool| {
+        if compressed {
+            ZGFX_FLAGS_COMPRESSED
+        } else {
+            ZGFX_FLAGS_RAW
+        }
+    };
+    if let [(compressed, data)] = segments.as_slice() {
+        // RDP_SEGMENTED_DATA, SEGMENTED_SINGLE
+        let mut out = Vec::with_capacity(data.len() + 2);
+        out.push(0xE0);
+        out.push(flags(*compressed));
+        out.extend_from_slice(data);
+        return Ok(out);
+    }
+    // RDP_SEGMENTED_DATA, SEGMENTED_MULTIPART
+    let count = u16::try_from(segments.len()).map_err(|_| "ZGFX: too many segments")?;
+    let size = u32::try_from(pdu.len()).map_err(|_| "ZGFX: PDU too large")?;
+    let mut out = Vec::with_capacity(7 + segments.iter().map(|(_, d)| d.len() + 5).sum::<usize>());
+    out.push(0xE1);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    for (compressed, data) in &segments {
+        let len = u32::try_from(data.len() + 1).map_err(|_| "ZGFX: segment too large")?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.push(flags(*compressed));
+        out.extend_from_slice(data);
+    }
+    Ok(out)
 }
 
 /// What the next H.264 frame updates on the client (AVC420 regions).
@@ -1023,6 +1090,68 @@ mod tests {
         stamp_clear_seq(&mut tiles, 255);
         assert_eq!(tiles[0].1, vec![0x00, 255, 0xAA]);
         assert_eq!(tiles[1].1, vec![0x00, 0]);
+    }
+
+    #[test]
+    fn compressed_pdu_decodes_after_any_history() {
+        // One segment, exactly one full segment, and multipart messages.
+        for len in [20_000usize, 65_535, 65_536, 150_000] {
+            let pdu: Vec<u8> = (0..len).map(|i| ((i / 7) % 13) as u8).collect();
+            let compressed = compress_wrapped(&zgfx::wrap_uncompressed(&pdu)).unwrap();
+            assert!(
+                compressed.len() < pdu.len() / 4,
+                "{len}: {}",
+                compressed.len()
+            );
+            // A client that already has other data in its history.
+            let mut client = zgfx::Decompressor::new();
+            let mut out = Vec::new();
+            client
+                .decompress(&zgfx::wrap_uncompressed(&[0x55; 3000]), &mut out)
+                .unwrap();
+            out.clear();
+            client.decompress(&compressed, &mut out).unwrap();
+            assert_eq!(out, pdu, "{len}");
+        }
+    }
+
+    #[test]
+    fn multipart_segments_hold_at_most_65535_bytes() {
+        let pdu: Vec<u8> = (0..150_000usize).map(|i| (i % 251) as u8).collect();
+        let c = compress_wrapped(&zgfx::wrap_uncompressed(&pdu)).unwrap();
+        assert_eq!(c[0], 0xE1);
+        let count = u16::from_le_bytes([c[1], c[2]]);
+        assert_eq!(count, 3);
+        assert_eq!(u32::from_le_bytes([c[3], c[4], c[5], c[6]]), 150_000);
+        // Each segment alone decompresses to at most one segment of data.
+        let mut pos = 7;
+        let mut d = zgfx::Decompressor::new();
+        let mut total = 0;
+        for _ in 0..count {
+            let size = u32::from_le_bytes(c[pos..pos + 4].try_into().unwrap()) as usize;
+            let seg = &c[pos + 4..pos + 4 + size];
+            let mut single = vec![0xE0];
+            single.extend_from_slice(seg);
+            let mut out = Vec::new();
+            d.decompress(&single, &mut out).unwrap();
+            assert!(out.len() <= 65_535);
+            total += out.len();
+            pos += 4 + size;
+        }
+        assert_eq!((pos, total), (c.len(), 150_000));
+        // Data that does not compress stays raw.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..1000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 56) as u8
+            })
+            .collect();
+        let c = compress_wrapped(&zgfx::wrap_uncompressed(&noise)).unwrap();
+        assert_eq!(&c[..2], &[0xE0, 0x04]);
+        assert_eq!(&c[2..], &noise[..]);
     }
 
     /// The capture side for a frame `cur` after `prev` (None: no previous frame).
