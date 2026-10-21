@@ -1137,7 +1137,9 @@ mod macos {
             );
             desktop_size.set_letterbox(letterbox);
             if force_full_frame {
-                tracing::warn!(
+                // Every session whose size is not the display's (most clients):
+                // an expected mode, so not a warning.
+                tracing::debug!(
                     requested_w = width,
                     requested_h = height,
                     native_w,

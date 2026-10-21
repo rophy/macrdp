@@ -3607,7 +3607,7 @@ impl Gfx {
                 .min(u64::from(ceiling));
                 ctx.adaptive_target_bps = u32::try_from(target).unwrap_or(ceiling).max(1);
                 ctx.ceiling_bps = ceiling;
-                info!(
+                debug!(
                     w = width,
                     h = height,
                     ceiling_bps = ceiling,
@@ -3658,7 +3658,7 @@ impl Gfx {
                 .name("egfx-ship".into())
                 .spawn(move || gfx.ship_loop(rx, shipped, avc444))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
-            info!(
+            debug!(
                 avc444,
                 "EGFX VideoToolbox encoder initialized + ship thread started"
             );
@@ -4388,7 +4388,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             .filter_map(|raw| raw.parsed().ok().flatten())
             .collect();
         let supports_avc = caps_indicate_avc(&typed);
-        info!(
+        debug!(
             count = pdu.0.len(),
             parsed_count = typed.len(),
             supports_avc,
