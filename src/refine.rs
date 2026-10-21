@@ -595,6 +595,17 @@ pub struct Refine {
     chunk_in_flight: Option<(u32, Instant)>,
     /// Ids of the last refinement frames (their QoE reports are not about H.264)
     clear_ids: VecDeque<u32>,
+    /// Counts surface resets (new surface, ResetGraphics, new encoder, live
+    /// resize): a refinement frame taken before one must not go out after it.
+    resets: u64,
+}
+
+/// What a refinement frame was taken for: the surface and the reset count
+/// (see [`Refine::job_tag`]). It may go out only while both are current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobTag {
+    pub surface_id: u16,
+    pub resets: u64,
 }
 
 impl Default for Refine {
@@ -617,6 +628,7 @@ impl Refine {
             seq: 0,
             chunk_in_flight: None,
             clear_ids: VecDeque::new(),
+            resets: 0,
         }
     }
 
@@ -624,9 +636,10 @@ impl Refine {
     /// over with every tile dirty.
     fn fit(&mut self, width: u32, height: u32) {
         if self.size != (width, height) {
-            let seq = self.seq;
+            let (seq, resets) = (self.seq, self.resets);
             *self = Self::new(width, height);
             self.seq = seq;
+            self.resets = resets;
         }
     }
 
@@ -635,6 +648,7 @@ impl Refine {
     /// that still wait are forgotten.
     pub fn on_new_surface(&mut self, width: u32, height: u32) {
         self.fit(width, height);
+        self.resets += 1;
         self.dirty.mark_all();
         self.pending.clear();
         self.queued.clear();
@@ -646,12 +660,14 @@ impl Refine {
     /// A new encoder starts its time stamps again: frames of the old one that
     /// still wait are forgotten, and the next frame repaints everything.
     pub fn on_new_encoder(&mut self) {
+        self.resets += 1;
         self.queued.clear();
         self.dirty.mark_all();
     }
 
     /// ResetGraphics went out: the client's ClearCodec counter is 0 again.
     pub fn on_reset_graphics(&mut self) {
+        self.resets += 1;
         self.seq = 0;
     }
 
@@ -802,6 +818,20 @@ impl Refine {
             self.pending.union(rest);
         }
         self.due = (!self.pending.is_empty()).then_some(now);
+    }
+
+    /// The surface is about to be reset (live resize): a refinement frame
+    /// taken before must not go out.
+    pub fn drop_jobs(&mut self) {
+        self.resets += 1;
+    }
+
+    /// Tag for a refinement frame taken now for surface `surface_id`.
+    pub fn job_tag(&self, surface_id: u16) -> JobTag {
+        JobTag {
+            surface_id,
+            resets: self.resets,
+        }
     }
 
     /// Sequence number for the first bitmap of the next refinement frame.
@@ -1371,6 +1401,25 @@ mod tests {
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(0, 0), (3, 0)]);
         // A frame with no entry: whole.
         assert!(matches!(r.take_regions(7), Regions::Whole));
+    }
+
+    #[test]
+    fn a_refine_job_is_stale_after_any_surface_reset() {
+        let mut r = Refine::new(128, 64);
+        let tag = r.job_tag(3);
+        assert_eq!(tag, r.job_tag(3));
+        assert_ne!(tag, r.job_tag(4), "another surface");
+        for reset in [
+            Refine::drop_jobs as fn(&mut Refine),
+            Refine::on_reset_graphics,
+            Refine::on_new_encoder,
+            |r: &mut Refine| r.on_new_surface(128, 64),
+            |r: &mut Refine| r.on_new_surface(256, 64),
+        ] {
+            let before = r.job_tag(3);
+            reset(&mut r);
+            assert_ne!(before, r.job_tag(3));
+        }
     }
 
     #[test]

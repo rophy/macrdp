@@ -1510,6 +1510,9 @@ struct RefineJob {
     /// Tells the compression to stop: the frame went out as it is
     cancel: Arc<AtomicBool>,
     started: Instant,
+    /// Surface and reset count when the frame was taken: it is dropped when
+    /// they changed (live resize, new surface, ResetGraphics)
+    tag: refine::JobTag,
 }
 
 /// A ZGFX-wrapped EGFX PDU, as bytes.
@@ -2568,7 +2571,7 @@ impl Gfx {
             refine.lock().unwrap().poll_later(now);
             return;
         }
-        let (mut pending, first_seq) = {
+        let (mut pending, first_seq, tag) = {
             let mut r = refine.lock().unwrap();
             if r.due().is_none_or(|d| d > now) {
                 return;
@@ -2590,7 +2593,7 @@ impl Gfx {
                 r.give_up();
                 return;
             }
-            (r.take_pending(), r.next_seq())
+            (r.take_pending(), r.next_seq(), r.job_tag(surface_id))
         };
         // ClearCodec encoding takes some milliseconds: outside the lock (the
         // frame-ack handler takes it).
@@ -2677,6 +2680,7 @@ impl Gfx {
             tiles: (chunk.total, chunk.picked),
             cancel: cancel.clone(),
             started: Instant::now(),
+            tag,
         });
         // ZGFX takes 10-30 ms per chunk: off the capture loop, so that a new
         // frame does not wait for it.
@@ -2719,16 +2723,26 @@ impl Gfx {
     /// frame of an older connection, or of a channel that closed after the
     /// frame was taken, is dropped. The caller holds `refine_job`.
     fn send_refine_job(&self, job: &RefineJob, compressed: Option<Vec<(Vec<u8>, &'static str)>>) {
-        let current = self
-            .ctx
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|c| c.server_handle.clone());
-        if !current.is_some_and(|c| Arc::ptr_eq(&c, &job.handle)) {
+        let current = self.ctx.lock().unwrap().as_ref().map(|c| {
+            let tag = c
+                .surface_id
+                .map(|sid| c.refine.lock().unwrap().job_tag(sid));
+            (c.server_handle.clone(), tag)
+        });
+        let Some((handle, tag)) = current else {
+            return;
+        };
+        if !Arc::ptr_eq(&handle, &job.handle) {
             debug!(
                 frame_id = job.frame_id,
                 "Refine: frame of an older connection dropped"
+            );
+            return;
+        }
+        if tag != Some(job.tag) {
+            debug!(
+                frame_id = job.frame_id,
+                "Refine: the surface was reset since the frame was taken, frame dropped"
             );
             return;
         }
@@ -3396,6 +3410,8 @@ impl Gfx {
             ctx.need_keyframe = true;
             self.latest_dropped.store(false, Ordering::Relaxed);
             ctx.window.lock().unwrap().reset();
+            // A refinement frame still being compressed is for the old surface.
+            ctx.refine.lock().unwrap().drop_jobs();
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
     }
