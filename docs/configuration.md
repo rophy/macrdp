@@ -418,6 +418,39 @@ ESTABLISHED_MIN_QOE, ESTABLISHED_MAX_WAIT_MS, ESTABLISHED_WALL_REPORTS}` — tol
 brief zero-EDR windows a healthy client produces mid-session; see the blank-recovery
 notes in `docs/known-quirks.md` for the full story and the tuning history.
 
+## Moving from macrdp-v1 (`config.toml`)
+
+macrdp-v1 read a `config.toml`; this server has no TOML file. It takes CLI flags, and the
+LaunchAgent passes `--config config.env` (plain `KEY=value`, see
+`packaging/config.env.example`); flags without a key go into `EXTRA_FLAGS`. One difference
+first: v1 checked the RDP login against its own `username`/`password`, this server checks it
+against a macOS account (PAM), so the client logs in with that account's password.
+
+| v1 `config.toml` key | Flag | `config.env` key | Note |
+|---|---|---|---|
+| `port` (3389) | `--bind 0.0.0.0:<port>` | `BIND` | Default `127.0.0.1:3390` (loopback only) |
+| `username` | `--username` | `USERNAME` | A macOS account name; default the login user |
+| `password` | `--password-file`, `--keychain` or the prompt | `USE_KEYCHAIN=1` | The macOS password of that account, not an RDP-only password (`--skip-auth --password` only for tests) |
+| `width`, `height` | `--width`, `--height` | `EXTRA_FLAGS` | Default: the client's requested size |
+| `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with `--enable-h264`, else 15 |
+| `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default 6; `--adaptive-bitrate` (`ADAPTIVE_BITRATE`) adapts below it |
+| `resolution` / `hidpi_scale` | `--hidpi` | `HIDPI` | Backing (Retina) pixels of the primary display |
+| `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default; `--stretch` fills instead of letterboxing |
+| `encoder` | `--enable-h264` | `ENABLE_H264` | H.264 is VideoToolbox (hardware); without it legacy bitmaps / RemoteFX |
+| `quality` | none | | Use `--bitrate` |
+| `chroma_mode` | none | | AVC420 only (no AVC444) |
+| `lossless_text` | none | | No ClearCodec pass |
+| `ctrl_as_cmd` | `--ctrl-as-cmd` | `CTRL_AS_CMD` | `--map-ctrl-to-cmd` remaps only editing shortcuts |
+| `wifi_keep_awake` | `--no-wifi-keep-awake` to turn off | `WIFI_KEEP_AWAKE=0` | Default on |
+| `idle_timeout_secs` | `--idle-timeout` | `IDLE_TIMEOUT_SECS` | Default 0 (off) |
+| `cert_path`, `key_path` | `--cert`, `--key` | `TLS_CERT`, `TLS_KEY` | Default: self-signed in `--cert-dir` |
+| `log_level` | `RUST_LOG` (env), `-v` | `RUST_LOG` in the plist `EnvironmentVariables` | Log file: `--log-dir` (`LOG_DIR`) |
+| `show_cursor`, `cursor_channel` | none | | The capture leaves the pointer out; it goes as pointer updates (`--cursor-scale` sets its size) |
+| `skip_unchanged` | none | | No key; on a static screen H.264 still sends `--keyframe-interval` keyframes and `--flush-frames` |
+| `[audio] enabled` | none | | Audio goes to a client that asks for it (play here); `--enable-aac` for AAC |
+| `[clipboard]` | `--no-rich-clipboard`, `--no-lazy-paste` | `RICH_CLIPBOARD=0` | Clipboard and file copy are always on; no file size limit (up to 10 000 files per copy) |
+| `--perf` (CLI) | `--stats-endpoint` | `STATS_ENDPOINT` | Live JSON on 127.0.0.1 (`MACRDP_STATS_PORT`) instead of a log summary |
+
 ## Headless mode
 
 `--virtual-display --width W --height H` allocates a headless display via undocumented `CGVirtualDisplay*` private API and serves it over RDP instead of mirroring the Mac's panel. Behaves like plugging in an external monitor — the remote session gets its own desktop at the requested resolution, and you keep using the Mac locally as normal. Add `--make-primary` to give the virtual display the menu bar so new app windows open there.
