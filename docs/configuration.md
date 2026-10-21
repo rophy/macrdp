@@ -443,11 +443,11 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 | `username` | `--username` | `USERNAME` | A macOS account name; default the login user |
 | `password` | `--password-file`, `--keychain` or the prompt | `USE_KEYCHAIN=1` | The macOS password of that account, not an RDP-only password (`--skip-auth --password` only for tests) |
 | `width`, `height` | `--width`, `--height` | `EXTRA_FLAGS` | Default: the client's requested size |
-| `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with `--enable-h264`, else 15 |
-| `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default 6; `--adaptive-bitrate` (`ADAPTIVE_BITRATE`) adapts below it |
+| `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with H.264 (the default), 15 with `--no-h264` |
+| `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default automatic from the session size (22 Mbps at 1280x720@60); adaptive below it by default, `--no-adaptive-bitrate` (`ADAPTIVE_BITRATE=0`) for a fixed rate |
 | `resolution` / `hidpi_scale` | `--hidpi` | `HIDPI` | Backing (Retina) pixels of the primary display |
 | `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default; `--stretch` fills instead of letterboxing |
-| `encoder` | `--enable-h264` | `ENABLE_H264` | H.264 is VideoToolbox (hardware); without it legacy bitmaps / RemoteFX |
+| `encoder` | (default) / `--no-h264` | `ENABLE_H264` | H.264 (VideoToolbox, hardware) is the default; `--no-h264` / `ENABLE_H264=0` serves legacy bitmaps / RemoteFX only |
 | `quality` | none | | Use `--bitrate` |
 | `chroma_mode` | none | | AVC420 only (no AVC444) |
 | `lossless_text` | none | | No ClearCodec pass |

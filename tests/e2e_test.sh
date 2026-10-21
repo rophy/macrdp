@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E smoke test for macrdp
 # Runs from a Linux machine with FreeRDP 3 (H.264 support needed) against a Mac running macrdp, started as
-#   macrdp --enable-h264 --bind 0.0.0.0:<port> --username <user> --password-file <file> [--idle-timeout <secs>]
+#   macrdp --bind 0.0.0.0:<port> --username <user> --password-file <file> [--idle-timeout <secs>]
 #
 # Usage: MACRDP_USER=<user> MACRDP_PASS_FILE=<file> ./tests/e2e_test.sh <host> [port]
 #   or set MACRDP_HOST / MACRDP_PORT instead of arguments (port default: 3390)

@@ -628,7 +628,7 @@ When iterating on the capture/encode path, prefer FreeRDP with `/log-level:DEBUG
 A FreeRDP smoke test that runs from a Linux machine (FreeRDP 3 with H.264, `xvfb-run`;
 `xclip` for the clipboard test) against a running server. Start the server for it with:
 ```bash
-macrdp --enable-h264 --bind 0.0.0.0:3390 --username "$USER" --password-file ~/.macrdp-pw \
+macrdp --bind 0.0.0.0:3390 --username "$USER" --password-file ~/.macrdp-pw \
        --log-dir /tmp/macrdp-e2e --idle-timeout 30       # --idle-timeout only for test 11
 ```
 Then on the Linux machine:
