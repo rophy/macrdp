@@ -120,11 +120,11 @@ Pushing a `v*` tag runs the [release workflow](.github/workflows/release.yml), w
 
 | File | What it is |
 |------|------------|
-| `macrdp-<ver>-aarch64-apple-darwin.tar.gz` | the **bare CLI binary** + `LICENSE`/`README` |
+| `macrdp-<ver>-aarch64-apple-darwin.tar.gz` | the **bare CLI binary** + `install.sh` / `uninstall.sh` (LaunchAgent `com.clintcan.macrdp` running `~/.local/bin/macrdp --config config.env`), `config.env.example`, `LICENSE`/`README` |
 | `macrdp-<ver>-aarch64-apple-darwin-app.zip` | the full **`macrdp.app`**, with the embedded smart-card IFD handler + installer — the only artifact that carries everything `--enable-smartcard-redirection` needs |
 | `SHA256SUMS` | checksums for both |
 
-Both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`). For a Developer-ID-signed + notarized build, or the menu-bar controller app (neither is produced in CI), build locally with [packaging/make-app.sh](packaging/README.md).
+Signing depends on the repository secrets. With `MACOS_P12_BASE64`, `MACOS_P12_PASSWORD` and `MACOS_CODESIGN_IDENTITY` set, the binary and the app are **Developer ID signed** (hardened runtime, identifier `com.clintcan.macrdp`, so TCC grants survive upgrades); with `MACOS_NOTARY_KEY_P8`, `MACOS_NOTARY_KEY_ID` and `MACOS_NOTARY_ISSUER_ID` (an App Store Connect API key) also set, both are **notarized** and the app gets the ticket stapled (a bare binary cannot hold a stapled ticket; Gatekeeper checks it online). Without the secrets both are **ad-hoc signed, not notarized** — open the app once via **right-click → Open** (or `xattr -dr com.apple.quarantine macrdp.app`). The menu-bar controller app is not produced in CI; build it locally (see [packaging/README.md](packaging/README.md)).
 
 ## Documentation
 

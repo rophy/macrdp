@@ -42,6 +42,7 @@ LaunchAgent and edits the same `config.env` — no re-permissioning.
 | `notarize.sh` | Notarize + staple a `.app`/`.dmg`/`.pkg` (used by the build scripts). |
 | `make-dmg.sh` | Wrap signed apps into a signed + notarized distribution DMG (styled icon layout). |
 | `make-icns.sh` | Build `AppIcon.icns` from a square PNG (used by the build scripts). |
+| `release/install.sh`, `release/uninstall.sh`, `release/launchagent.plist.template` | Shipped in the release tarball (bare binary): install the binary to `~/.local/bin`, seed `config.env`, store the Keychain password (prompted), load the LaunchAgent `com.clintcan.macrdp` that runs the binary directly; uninstall keeps config, certificate, Keychain entry and logs. |
 
 ### App icon & DMG styling
 

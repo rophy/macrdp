@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template of the release tarball. install.sh fills __LABEL__, __BIN__, __CONF__ and
+  __HOME__ and writes ~/Library/LaunchAgents/<label>.plist. launchd runs the signed binary
+  directly (no shell), as packaging/launchagent.plist.template does for macrdp.app. The binary
+  writes and rotates ~/Library/Logs/macrdp.log itself, so there is no StandardOutPath.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+        <string>--config</string>
+        <string>__CONF__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/macrdp.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
