@@ -148,7 +148,7 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
 
         let w = rect.size.width.round() as i64;
         let h = rect.size.height.round() as i64;
-        if !(1..=256).contains(&w) || !(1..=256).contains(&h) {
+        if !(1..=MAX_SIDE as i64).contains(&w) || h < 1 {
             return None;
         }
         let w = w as usize;
@@ -166,6 +166,14 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
         if size_inout as usize > buf.len() {
             return None;
         }
+        // An animated cursor comes as one tall strip of frames (see
+        // `strip_frame_height`); send its first frame, as the NSCursor
+        // image of the same cursor shows.
+        let h = if h <= MAX_SIDE {
+            h
+        } else {
+            strip_frame_height(&buf, row_bytes, w, h)?
+        };
 
         // BGRA premult (host-endian little, so memory bytes are B,G,R,A)
         // → RGBA non-premult, tightly packed.
@@ -203,6 +211,30 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
     }
 }
 
+/// Largest cursor side taken from SkyLight (the RDP pointer limit).
+const MAX_SIDE: usize = 256;
+
+/// Frame height of an animated cursor that SkyLight returns as one strip.
+///
+/// For an animated cursor (Chrome's `wait` / `progress`: an arrow with a
+/// spinning disc), `SLSGetGlobalCursorData` gives all frames stacked in one
+/// buffer: 28x600 on a 1x display = 15 frames of 28x40, the first frame in
+/// the first rows. The call gives no frame count, so find it from the
+/// pixels: the frames of one cursor cover the same pixels (alpha > 0) and
+/// differ in colour and in the alpha of edge pixels. Return the smallest
+/// divisor of `h` (at least 2 frames, at most [`MAX_SIDE`] rows) for which
+/// each row covers the same pixels as the matching row of the first frame.
+/// `None` when no such height exists.
+fn strip_frame_height(buf: &[u8], row_bytes: usize, w: usize, h: usize) -> Option<usize> {
+    if buf.len() < h * row_bytes {
+        return None;
+    }
+    let covered = |row: usize, x: usize| buf[row * row_bytes + x * 4 + 3] != 0;
+    (1..=MAX_SIDE.min(h / 2))
+        .filter(|&fh| h.is_multiple_of(fh))
+        .find(|&fh| (fh..h).all(|row| (0..w).all(|x| covered(row, x) == covered(row % fh, x))))
+}
+
 fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
     match a {
         0 => (0, 0, 0),
@@ -214,5 +246,53 @@ fn un_premultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
             let b = ((b as u32 * 255 + a_u / 2) / a_u).min(255) as u8;
             (r, g, b)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A strip of `frames` frames of `w`x`fh` BGRA pixels. Each frame covers
+    /// the same triangle; colour and edge alpha change per frame.
+    fn strip(w: usize, fh: usize, frames: usize, row_bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; row_bytes * fh * frames];
+        for f in 0..frames {
+            for y in 0..fh {
+                for x in 0..w.min(y + 1) {
+                    let p = (f * fh + y) * row_bytes + x * 4;
+                    let edge = x == y.min(w - 1);
+                    buf[p..p + 4].copy_from_slice(&[
+                        f as u8 * 9,
+                        0,
+                        0,
+                        if edge { 40 + f as u8 } else { 255 },
+                    ]);
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn strip_of_wait_cursor_frames_gives_the_frame_height() {
+        // Chrome `cursor: wait` on a 1x display: 28x600, 15 frames of 28x40.
+        let buf = strip(28, 40, 15, 112);
+        assert_eq!(strip_frame_height(&buf, 112, 28, 600), Some(40));
+        // Padded rows (row_bytes > w * 4) and a Retina-size strip.
+        let buf = strip(56, 80, 15, 240);
+        assert_eq!(strip_frame_height(&buf, 240, 56, 1200), Some(80));
+    }
+
+    #[test]
+    fn tall_image_without_repeated_frames_is_refused() {
+        // One 28x300 shape (not a strip): no frame height fits.
+        let buf = strip(28, 300, 1, 112);
+        assert_eq!(strip_frame_height(&buf, 112, 28, 300), None);
+        // Frames above the pointer limit: refused.
+        let buf = strip(28, 300, 2, 112);
+        assert_eq!(strip_frame_height(&buf, 112, 28, 600), None);
+        // Short buffer: refused, no panic.
+        assert_eq!(strip_frame_height(&buf[..100], 112, 28, 600), None);
     }
 }
