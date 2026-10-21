@@ -3487,16 +3487,23 @@ impl Gfx {
     /// so the next frame is a keyframe, and the capture loop sends its newest
     /// frame again in case the screen is still.
     fn on_stray_views(&self, pts: &[i64]) {
-        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
-            ctx.need_keyframe = true;
-        }
-        self.latest_dropped.store(true, Ordering::Relaxed);
+        self.request_keyframe();
         warn!(
             ?pts,
             "EGFX AVC444 auxiliary view not sent (its main view was dropped by the encoder, or \
              went alone after the wait): the next frame is a keyframe; frames already encoded \
              against it show wrong pixels until then"
         );
+    }
+
+    /// The client's decoder missed a picture: the next frame is a keyframe,
+    /// and the capture loop sends its newest frame again in case the screen
+    /// is still. Takes ctx: never call with a pipeline locked.
+    fn request_keyframe(&self) {
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.need_keyframe = true;
+        }
+        self.latest_dropped.store(true, Ordering::Relaxed);
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
@@ -3943,6 +3950,9 @@ impl Gfx {
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
             // Messages in queue order: AVC444 frames are drained one by one.
             let mut dvc_out: Vec<ironrdp_dvc::DvcMessage> = Vec::new();
+            // An AVC444 frame went without its picture: the client's decoder
+            // misses it, so the next frame must be a keyframe.
+            let mut lost_picture = false;
 
             for (frame, frame_regions) in frames.iter().zip(regions) {
                 let f = frame.main();
@@ -3984,28 +3994,47 @@ impl Gfx {
                         // Queue an empty luma-only frame for the frame id and
                         // accounting, then put our WireToSurface1 in its place
                         // (see `avc444_wire_to_surface`). The frame's three
-                        // PDUs are the last ones queued.
+                        // PDUs are the last ones queued. This needs the
+                        // pipeline in `CompressionMode::Never` (the default,
+                        // never changed here): a ZGFX-compressed placeholder
+                        // would not be found, and the compressor history would
+                        // hold bytes the client never got.
                         let sent =
                             server.send_avc444_frame(surface_id, &[], &region, None, None, ts_ms);
                         if sent.is_some() {
                             let mut msgs = server.drain_output();
                             let n = msgs.len();
-                            match avc444_wire_to_surface(
-                                surface_id,
-                                &payload,
-                                chroma.as_deref(),
-                                &region,
+                            let placeholder =
+                                (n >= 3 && is_wire_to_surface1(&msgs[n - 2])).then_some(n - 2);
+                            match (
+                                avc444_wire_to_surface(
+                                    surface_id,
+                                    &payload,
+                                    chroma.as_deref(),
+                                    &region,
+                                ),
+                                placeholder,
                             ) {
-                                Ok(bytes) if n >= 3 && is_wire_to_surface1(&msgs[n - 2]) => {
-                                    msgs[n - 2] = Box::new(ZgfxMessage {
+                                (Ok(bytes), Some(i)) => {
+                                    msgs[i] = Box::new(ZgfxMessage {
                                         bytes,
                                         name: "WireToSurface1Pdu",
                                     });
                                 }
-                                other => warn!(
-                                    error = ?other.err(),
-                                    "EGFX AVC444 frame left without its picture"
-                                ),
+                                (res, i) => {
+                                    // Never send the placeholder (an empty
+                                    // stream whose destination leaves the
+                                    // surface): the frame goes empty.
+                                    if let Some(i) = i {
+                                        msgs.remove(i);
+                                    }
+                                    lost_picture = true;
+                                    warn!(
+                                        error = ?res.err(),
+                                        placeholder_found = i.is_some(),
+                                        "EGFX AVC444 frame sent without its picture; next frame is a keyframe"
+                                    );
+                                }
                             }
                             dvc_out.extend(msgs);
                         }
@@ -4056,6 +4085,9 @@ impl Gfx {
             dvc_out.extend(server.drain_output());
             let out = (dvc_out, egfx_channel_id);
             drop(server);
+            if lost_picture {
+                self.request_keyframe();
+            }
             if let Some(r) = refine.as_ref() {
                 let now = Instant::now();
                 let mut r = r.lock().unwrap();
