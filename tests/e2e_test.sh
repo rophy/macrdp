@@ -283,8 +283,7 @@ else
         R=$!
         sleep 6
         # Mac -> client: a file on the Mac pasteboard, read through the client clipboard.
-        printf "%s\n" "echo \"m-$CLIP_TOKEN\" >/tmp/macrdp-e2e-clip.txt" \
-            "osascript -e \"set the clipboard to (POSIX file \\\"/tmp/macrdp-e2e-clip.txt\\\")\"" | mac
+        printf "%s\n" "echo \"m-$CLIP_TOKEN\" >/tmp/macrdp-e2e-clip.txt" "$MAC_WRITE_SCRIPT" | mac
         sleep 3
         F=$(timeout 5 xclip -o -selection clipboard -t text/uri-list 2>/dev/null \
             | tr -d "\r" | sed -n "s|^file://||p" | head -1)
@@ -298,6 +297,18 @@ else
         echo "CLIENT2MAC $(head -1 "$LOGDIR/clip/mac.out")"
         kill $R 2>/dev/null; wait $R 2>/dev/null
     '
+    # Mac side of Mac -> client: put the file on the pasteboard. Not AppleScript "set the clipboard
+    # to (POSIX file ...)": that left the pasteboard empty (no types, exit code 0) in about 1 of 40
+    # writes on an idle Mac and in 2 of 10 test runs with a session showing motion.
+    MAC_WRITE_SCRIPT=$(cat <<'MACSH'
+osascript -l JavaScript <<'JS'
+ObjC.import("AppKit");
+var pb = $.NSPasteboard.generalPasteboard;
+pb.clearContents;
+pb.writeObjects($([$.NSURL.fileURLWithPath("/tmp/macrdp-e2e-clip.txt")]));
+JS
+MACSH
+)
     # Mac side of client -> Mac: print the first file on the pasteboard. The server pastes
     # Windows files lazily (an empty placeholder file that it fills when a reader asks through
     # NSFileCoordinator, as Finder does on Cmd-V), so a plain cat would read the placeholder.
@@ -319,6 +330,7 @@ MACSH
 )
     CLIP_OUT=$(XFREERDP="$XFREERDP" ADDR="$ADDR" USER="$USER" PASS="$PASS" LOGDIR="$LOGDIR" \
         CLIP_TOKEN="$CLIP_TOKEN" MACRDP_MAC_SHELL="$MACRDP_MAC_SHELL" MAC_READ_SCRIPT="$MAC_READ_SCRIPT" \
+        MAC_WRITE_SCRIPT="$MAC_WRITE_SCRIPT" \
         timeout 60 xvfb-run -a bash -c "$CLIP_SCRIPT" 2>/dev/null) || true
     # Clean up on the Mac, also after a timeout: remove the test file and leave the
     # pasteboard holding an empty string (the test replaced its contents).
