@@ -1643,9 +1643,14 @@ impl ViewPairing {
 /// edge tile). Tiles start at multiples of 32, so only the right edge of an
 /// odd-width frame loses its last column.
 ///
-/// Unlike [`avc420_regions`], the frame edge is exact: the WireToSurface1 of
-/// an AVC444 frame is written by [`avc444_wire_to_surface`], whose
-/// destination rectangle is exclusive too.
+/// The whole frame is exact (the WireToSurface1 of an AVC444 frame is written
+/// by [`avc444_wire_to_surface`], whose destination rectangle is exclusive
+/// too). Tiles stop one row above the frame bottom, as the AVC420 tiles do:
+/// FreeRDP 3.30 corrupted its heap (abort in `free()` when the session ended,
+/// 3 of 3 runs on two machines) with several AVC444 rectangles of which one
+/// reached the bottom edge, and not with one rectangle (whole frame, a single
+/// strip at the bottom) or with the tiles one row short (6 of 6 runs clean).
+/// The last row is painted by the next keyframe, which goes whole.
 fn avc444_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
     let right_edge = width & !1;
     let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
@@ -1662,7 +1667,7 @@ fn avc444_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Regio
             .into_iter()
             .map(|r| {
                 let right = (r.x + r.w).min(right_edge);
-                let bottom = (r.y + r.h).min(height);
+                let bottom = (r.y + r.h).min(height.saturating_sub(1));
                 region(r.x, r.y, right, bottom)
             })
             .filter(|r| r.right > r.left && r.bottom > r.top)
@@ -6670,8 +6675,9 @@ mod tests {
         assert_eq!(f(false, None).main().pts, 0);
     }
 
-    /// AVC444 rectangles: exclusive edges, even widths, the frame edge exact
-    /// (an odd-width frame loses its last column).
+    /// AVC444 rectangles: exclusive edges, even widths, the whole frame exact
+    /// (an odd-width frame loses its last column), tiles one row short of the
+    /// bottom.
     #[test]
     fn avc444_regions_are_exclusive_and_even() {
         let r = avc444_regions(&Regions::Whole, 1280, 720);
@@ -6687,7 +6693,8 @@ mod tests {
         let r = avc444_regions(&Regions::Tiles(grid), 1280, 720);
         assert!(r.iter().all(|r| (r.right - r.left) % 2 == 0));
         assert_eq!(r.iter().map(|r| r.right).max(), Some(1280));
-        assert_eq!(r.iter().map(|r| r.bottom).max(), Some(720));
+        // Tiles stop one row above the bottom edge (FreeRDP heap corruption).
+        assert_eq!(r.iter().map(|r| r.bottom).max(), Some(719));
         let mut grid = refine::TileGrid::new(1281, 721);
         grid.mark_all();
         let r = avc444_regions(&Regions::Tiles(grid), 1281, 721);
@@ -6695,7 +6702,7 @@ mod tests {
             .iter()
             .all(|r| (r.right - r.left) % 2 == 0 && r.right > r.left));
         assert_eq!(r.iter().map(|r| r.right).max(), Some(1280));
-        assert_eq!(r.iter().map(|r| r.bottom).max(), Some(721));
+        assert_eq!(r.iter().map(|r| r.bottom).max(), Some(720));
     }
 
     /// The WireToSurface1 we write decodes as an AVC444 command whose
