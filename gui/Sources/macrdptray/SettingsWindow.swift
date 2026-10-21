@@ -293,7 +293,7 @@ private struct VideoTab: View {
             Section("Bitrate") {
                 Stepper(value: Binding(
                     get: { Int(model.bitrateMbps) ?? 22 },
-                    set: { model.setBitrate(String($0)) }), in: 1...50) {
+                    set: { model.setBitrate(String($0)) }), in: 1...240) {
                     Text(model.bitrateMbps.isEmpty ? "Ceiling: automatic" : "Ceiling: \(model.bitrateMbps) Mbps")
                 }
                 .disabled(!model.bool("ENABLE_H264", default: true))

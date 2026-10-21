@@ -384,15 +384,14 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   gracefully — including a no-ack distress fallback so a
                           #   fully choked client (acks silent) still registers.
                           #   Under congestion it also stretches the periodic IDR
-                          #   (where one runs: a UDP tunnel, or --keyframe-interval
-                          #   > 0 on TCP) to avoid injecting a big keyframe
+                          #   (UDP tunnel only) to avoid injecting a big keyframe
                           #   into a congested pipe. So --bitrate is a CEILING, not a
                           #   fixed target: set it high (e.g. 8) and it backs off
                           #   only when the link strains.
                           #   P2b frame-rate floor: once bitrate is pinned at the floor
                           #   AND still congested (quality cuts exhausted), it caps the
-                          #   effective fps (default 10) to shed packet load — on BOTH
-                          #   transports, never to zero (the client needs trailing frames
+                          #   effective fps (default 10) to shed packet load — on the
+                          #   UDP tunnel only (not on TCP), never to zero (the client needs trailing frames
                           #   to present/ack). Video degrades to choppy-but-steady-and-in-
                           #   sync instead of freezing; fps + bitrate recover when clear.
                           #   RTT-seeded start (2026-07-05): when the kernel-measured

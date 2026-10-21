@@ -446,7 +446,7 @@ struct Args {
     #[allow(dead_code)]
     enable_h264_compat: bool,
 
-    /// H.264 bitrate ceiling in megabits/sec (only with --enable-h264).
+    /// H.264 bitrate ceiling in megabits/sec (H.264 only).
     /// Default: automatic from the desktop size and frame rate (12 bits per
     /// pixel per second at 30 fps, scaled up for a higher rate: 22 Mbps for
     /// 1280x720 at 60 fps), so motion is not capped on a good link. Adaptive
@@ -455,8 +455,8 @@ struct Args {
     #[arg(long)]
     bitrate: Option<u32>,
 
-    /// H.264 periodic keyframe (IDR) interval in seconds (only with
-    /// --enable-h264). Default 0 = no periodic keyframe while the video runs
+    /// H.264 periodic keyframe (IDR) interval in seconds (H.264
+    /// only). Default 0 = no periodic keyframe while the video runs
     /// over TCP: TCP delivers every frame, and an IDR is ~50x a P-frame (about
     /// 290 KB at 720p), so a 2 s interval spent ~0.3 Mbps on a screen with only
     /// a blinking caret. Keyframes are still forced when the client needs one
@@ -468,7 +468,7 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     keyframe_interval: f32,
 
-    /// Force on-change H.264 keyframes (only with --enable-h264). OFF by
+    /// Force on-change H.264 keyframes (H.264 only). OFF by
     /// default. When enabled, a keyframe (IDR) is forced when a lot of the
     /// screen changes at once — a window raised to front, a scroll, an app
     /// launch — and briefly after a mouse click, so large updates render
@@ -489,7 +489,7 @@ struct Args {
     no_keyframe_on_change_compat: bool,
 
     /// Dirty-area threshold (percent of the frame) that triggers an on-change
-    /// keyframe (only with --enable-h264 + on-change keyframes). Lower catches
+    /// keyframe (H.264 + on-change keyframes only). Lower catches
     /// smaller updates (more IDRs); higher is more conservative. Default 20.
     #[arg(long, default_value_t = 20)]
     keyframe_change_pct: u64,
@@ -505,7 +505,7 @@ struct Args {
     keyframe_click_window_ms: u64,
 
     /// Max H.264 frames in the encode/ship pipeline before the capture loop
-    /// drops to the latest frame (only with --enable-h264). Bounds interactive
+    /// drops to the latest frame (H.264 only). Bounds interactive
     /// latency under sustained load: lower drops-to-latest sooner (snappier
     /// typing/window-switching during bursts) at the cost of more frame-skips;
     /// higher buffers more (smoother video) but lets a backlog build up. This
@@ -516,7 +516,7 @@ struct Args {
     h264_frames_in_flight: u32,
 
     /// Number of trailing "flush" frames re-sent after the last on-screen change
-    /// (only with --enable-h264). ScreenCaptureKit stops delivering frames on a
+    /// (H.264 only). ScreenCaptureKit stops delivering frames on a
     /// static screen, so the last change before a pause (e.g. the final
     /// keystroke) would otherwise sit in mstsc's ~2-frame AVC420 presentation
     /// buffer until the next change or periodic keyframe — the "typing follows
@@ -695,16 +695,17 @@ struct Args {
     udp_migrate_egfx: bool,
 
     /// Turn off congestion-responsive H.264 bitrate (on by default; config key
-    /// ADAPTIVE_BITRATE=0). On BOTH the TCP path and the UDP tunnel (only with
-    /// --enable-h264): an AIMD controller reads
-    /// the standing queue delay (each frame's ship→ack round trip minus the
+    /// ADAPTIVE_BITRATE=0; H.264 only). Over TCP: an EGFX frame window (frames of
+    /// one base round trip + 1, at least 3) and a bitrate level of 100/80/50/30/15 %
+    /// of the ceiling that follows the median queueing delay of the frames (no
+    /// frame-rate floor, no IDR backoff). On the UDP tunnel: an AIMD controller
+    /// reads the standing queue delay (each frame's ship→ack round trip minus the
     /// windowed-minimum RTT, EWMA-smoothed) plus reliable-tunnel retransmits, and
-    /// moves the VideoToolbox bitrate within [floor, --bitrate] — so --bitrate is a
-    /// ceiling. A long but clean link (VPN/ZeroTier) keeps full quality; a thin one
-    /// degrades gracefully instead of freezing. Under sustained congestion it also
-    /// stretches the periodic keyframe (where one runs) and, once the bitrate is at its floor, caps
-    /// the frame rate (default 10 fps, never zero). A link whose measured RTT at
-    /// connect is >= MACRDP_ADAPTIVE_SEED_RTT_MS (50) starts at ceiling/3. Tunables:
+    /// moves the VideoToolbox bitrate within [floor, --bitrate]; under sustained
+    /// congestion it also stretches the periodic keyframe and, once the bitrate is
+    /// at its floor, caps the frame rate (default 10 fps, never zero). In both,
+    /// --bitrate is a ceiling. A link whose measured RTT at connect is >=
+    /// MACRDP_ADAPTIVE_SEED_RTT_MS (50) starts at about a third. Tunables:
     /// MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,DECREASE,INTERVAL_MS,RETX_TOLERANCE},
     /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,EWMA_ALPHA,FLOOR_FPS}. macOS-only build; see
     /// docs/cli.md.
@@ -2721,6 +2722,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
         .with_context(|| format!("config file {} produced invalid settings", path.display()))
 }
 
+/// Upper bound of the automatic ceiling: 240 Mbps, the H.264 level 5.2 MaxBR
+/// (VideoToolbox also takes the value as an i32).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const AUTO_BITRATE_MAX: u64 = 240_000_000;
+
 /// Automatic H.264 bitrate ceiling (bits/s) for a `width` x `height` desktop at
 /// `fps`: 12 bits per pixel per second at 30 fps, scaled up for a higher frame
 /// rate (not down for a lower one). 1280x720 at 60 fps: ~22 Mbps, what macrdp-v1
@@ -2728,11 +2734,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
 /// twice this, but its encoder stays below it, while this one spends the whole
 /// target: 48 Mbps at a 44 Mbps ceiling, for the same 56-57 fps). The adaptive
 /// controller backs off from it when the link queues.
+/// At most `AUTO_BITRATE_MAX`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn auto_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
     let per_second = u64::from(width) * u64::from(height) * 12;
     let scaled = per_second * u64::from(fps.max(30)) / 30;
-    u32::try_from(scaled).unwrap_or(u32::MAX).max(1_000_000)
+    u32::try_from(scaled.clamp(1_000_000, AUTO_BITRATE_MAX)).unwrap_or(1_000_000)
 }
 
 async fn async_main() -> Result<()> {
@@ -3427,6 +3434,9 @@ async fn async_main() -> Result<()> {
             !args.no_adaptive_bitrate,
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
+            args.bitrate
+                .is_none()
+                .then(|| (u32::from(width), u32::from(height))),
         )
     });
 
@@ -4149,9 +4159,9 @@ mod config_tests {
         // 30 fps and lower use the 30 fps value.
         assert_eq!(auto_bitrate_bps(1280, 720, 30), 11_059_200);
         assert_eq!(auto_bitrate_bps(1280, 720, 15), 11_059_200);
-        // Never below 1 Mbps, never overflows.
+        // Never below 1 Mbps, never above 240 Mbps (fits VideoToolbox's i32).
         assert_eq!(auto_bitrate_bps(16, 16, 60), 1_000_000);
-        assert_eq!(auto_bitrate_bps(8192, 8192, 240), u32::MAX);
+        assert_eq!(auto_bitrate_bps(8192, 8192, 240), 240_000_000);
     }
 
     #[test]

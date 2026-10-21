@@ -310,6 +310,9 @@ struct ConnectionContext {
     /// last sampled value of the shared cumulative-retransmit loss counter, so the
     /// controller works on per-interval deltas. See [`Gfx::adaptive_bitrate_step`].
     adaptive_target_bps: u32,
+    /// Bitrate ceiling of this connection: `--bitrate`, or automatic from the
+    /// session size (set in `setup_locked`, see `Gfx::session_ceiling`).
+    ceiling_bps: u32,
     adaptive_last_control: Instant,
     adaptive_last_retransmits: u64,
     /// P2a IDR-backoff state: true while the periodic keyframe is suppressed
@@ -1296,6 +1299,9 @@ pub struct Gfx {
     desktop_size: crate::capture::SharedDesktopSize,
     fps: u32,
     bitrate_bps: u32,
+    /// `Some(display size)` when `--bitrate` was not given: the ceiling then
+    /// follows each session's size (`Gfx::session_ceiling`).
+    auto_ceiling_source: Option<(u32, u32)>,
     /// Periodic keyframe (IDR) interval in seconds on TCP (from
     /// `--keyframe-interval`; 0 = none, the default). Converted to a frame count
     /// by `crate::videotoolbox::keyframe_frames`.
@@ -1476,6 +1482,7 @@ impl Gfx {
         adaptive_bitrate: bool,
         congestion_retransmits: Arc<AtomicU64>,
         link_rtt_ms: Arc<AtomicU32>,
+        auto_ceiling_source: Option<(u32, u32)>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
@@ -1698,6 +1705,7 @@ impl Gfx {
             desktop_size,
             fps,
             bitrate_bps,
+            auto_ceiling_source,
             keyframe_secs,
             max_in_flight,
             frame_interval: Duration::from_secs_f64(1.0 / f64::from(fps.max(1))),
@@ -2327,6 +2335,22 @@ impl Gfx {
         self.latest_dropped.load(Ordering::Relaxed)
     }
 
+    /// Bitrate ceiling for a session of `dims`: `--bitrate` when given, else
+    /// automatic from the session size, or from the display size when the
+    /// session is larger (an upscaled picture has no more detail; as macrdp-v1).
+    fn session_ceiling(&self, dims: (u16, u16)) -> u32 {
+        let Some((sw, sh)) = self.auto_ceiling_source else {
+            return self.bitrate_bps;
+        };
+        let (w, h) = (u32::from(dims.0), u32::from(dims.1));
+        let (w, h) = if u64::from(w) * u64::from(h) > u64::from(sw) * u64::from(sh) && sw * sh > 0 {
+            (sw, sh)
+        } else {
+            (w, h)
+        };
+        crate::auto_bitrate_bps(w, h, self.fps)
+    }
+
     /// The periodic-keyframe interval (frames) for the transport EGFX is on.
     fn periodic_keyframe_frames(&self, on_udp: bool) -> u32 {
         if on_udp {
@@ -2392,7 +2416,7 @@ impl Gfx {
             return actions;
         }
         let on_udp = self.egfx_on_udp.load(Ordering::Relaxed);
-        let ceiling = self.bitrate_bps.max(1);
+        let ceiling = ctx.ceiling_bps.max(1);
         let now = Instant::now();
         // Cold-start guard: arm the warmup window the first time acks flow, then
         // ignore the ack-lag signal until it elapses (the connect-time startup
@@ -2582,15 +2606,10 @@ impl Gfx {
         // insurance, deferrable until the link clears (Restore then forces one
         // clean recovery IDR). (Originally UDP-only because the frame-count
         // signal false-positived on TCP; that calculus changed with the signal.)
-        // No periodic IDR on this transport (TCP, default): nothing to suppress,
-        // and no recovery IDR is needed after congestion (TCP loses no frame).
-        let periodic_active = on_udp || self.keyframe_secs > 0.0;
-        let backoff = if periodic_active {
-            idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off)
-        } else {
-            IdrBackoff::Hold
-        };
-        match backoff {
+        // This controller runs only on the UDP tunnel (TCP returns early to
+        // `tcp_bitrate_step`, which has no IDR backoff), where a periodic IDR
+        // always runs.
+        match idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off) {
             IdrBackoff::Stretch => {
                 ctx.idr_backed_off = true;
                 actions.keyframe_frames = Some(self.stretched_keyframe_frames);
@@ -2701,6 +2720,23 @@ impl Gfx {
         // encoder (re)build can never disagree with an existing surface.
         let (width, height) = ctx.dims;
         if ctx.encoder.is_none() {
+            // Automatic ceiling: follow this session's size (client size, resize).
+            let ceiling = self.session_ceiling(ctx.dims);
+            if ceiling != ctx.ceiling_bps {
+                let old = ctx.ceiling_bps.max(1);
+                let target = (u64::from(ctx.adaptive_target_bps) * u64::from(ceiling)
+                    / u64::from(old))
+                .min(u64::from(ceiling));
+                ctx.adaptive_target_bps = u32::try_from(target).unwrap_or(ceiling).max(1);
+                ctx.ceiling_bps = ceiling;
+                info!(
+                    w = width,
+                    h = height,
+                    ceiling_bps = ceiling,
+                    target_bps = ctx.adaptive_target_bps,
+                    "EGFX bitrate ceiling set for the session size"
+                );
+            }
             // Pass actual dims; VideoToolbox pads to 16-px macroblocks
             // internally and encodes the crop in the SPS, so the client
             // decodes back to actual dims.
@@ -2744,8 +2780,9 @@ impl Gfx {
             s.connected.store(true, Ordering::Relaxed);
             s.width.store(u32::from(w), Ordering::Relaxed);
             s.height.store(u32::from(h), Ordering::Relaxed);
-            s.ceiling_bps.store(self.bitrate_bps, Ordering::Relaxed);
-            s.bitrate_bps.store(self.bitrate_bps, Ordering::Relaxed);
+            s.ceiling_bps.store(ctx.ceiling_bps, Ordering::Relaxed);
+            s.bitrate_bps
+                .store(ctx.adaptive_target_bps, Ordering::Relaxed);
             s.fps.store(self.fps, Ordering::Relaxed);
             s.adaptive.store(self.adaptive_enabled, Ordering::Relaxed);
         }
@@ -3237,6 +3274,7 @@ impl GfxServerFactory for Gfx {
             last_throttle_ship: Instant::now(),
             demigrated: false,
             adaptive_target_bps: initial_target_bps,
+            ceiling_bps: self.bitrate_bps,
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
             idr_backed_off: false,
@@ -5331,6 +5369,7 @@ mod tests {
             true,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
+            None,
         );
         assert!(gfx.build_server_with_handle().is_some());
         gfx
@@ -5349,7 +5388,27 @@ mod tests {
             true,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
+            Some((1280, 720)),
         )
+    }
+
+    #[test]
+    fn auto_ceiling_follows_the_session_size() {
+        let gfx = gfx_with_keyframe(0.0);
+        // Smaller session: its own size.
+        assert_eq!(
+            gfx.session_ceiling((1024, 768)),
+            crate::auto_bitrate_bps(1024, 768, 60)
+        );
+        // Larger session (upscaled picture): the display size.
+        assert_eq!(
+            gfx.session_ceiling((2560, 1440)),
+            crate::auto_bitrate_bps(1280, 720, 60)
+        );
+        // An explicit --bitrate is kept for every size.
+        let mut fixed = gfx_with_keyframe(0.0);
+        fixed.auto_ceiling_source = None;
+        assert_eq!(fixed.session_ceiling((2560, 1440)), 6_000_000);
     }
 
     #[test]
