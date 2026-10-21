@@ -1620,6 +1620,14 @@ mod macos {
                                         }
                                     }
                                 } else {
+                                    if self.gfx.is_some() {
+                                        // The kept capture buffer could not be
+                                        // locked: the held frame is lost (the
+                                        // next screen change sends a new one).
+                                        tracing::warn!(
+                                            "EGFX held frame dropped: kept capture buffer not readable"
+                                        );
+                                    }
                                     self.held_frame = false;
                                 }
                                 continue;
