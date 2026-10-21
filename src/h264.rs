@@ -665,7 +665,7 @@ struct BlankRecoveryParams {
     /// for the full count. Safe to be prompt because the reactivation heal is
     /// non-destructive: an occasional early fire costs a brief re-handshake, not
     /// a dropped session. A connection that has reported any nonzero
-    /// decode+render time also needs one of the `lapse_tiers`.
+    /// decode+render time also needs the `lapse`.
     /// `MACRDP_BLANK_RECOVERY_MAX_WAIT_MS`, default 4000.
     blank_max_wait: Duration,
     /// Minimum all-zero QoE reports for the wall-clock fast-path (above). Its
@@ -675,25 +675,25 @@ struct BlankRecoveryParams {
     /// rendering session has already presented and disarmed via
     /// `qoe_render_seen`, ~1-2 s on LAN) is conclusive on a trustworthy-RTT
     /// link (for a connection with no nonzero report so far; see
-    /// `lapse_tiers` for the others). Raise it
+    /// `lapse` for the others). Raise it
     /// (`MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS`) if a
     /// slow-to-first-present client trips a spurious (cheap) reactivation.
     blank_min_reports: u64,
-    /// Lapse tiers for the wall-clock fast path: `(zeros in a row, time since
-    /// the last nonzero report)`. A connection with 1-2 nonzero reports (not
-    /// latched) is a fast-path blank only once one tier holds. Found
-    /// 2026-10-21 on Windows 10 mstsc FS 1920x1080: a healthy session can have
-    /// only 1-2 nonzero reports in its first 4 s, interleaved with zeros, so a
-    /// single zero is no evidence. Before the latch, 167 recorded healthy fresh
-    /// connects (AVC420, AVC444, static desktop, window) had at most 13 zeros in
-    /// a row 3.6 s after a nonzero report, and at most 5.7 s after one with 3 or
-    /// more zeros in a row (fewer zeros: up to 19 s on a static desktop). A
-    /// frozen start (one stray nonzero, then zero on every report) is caught by
-    /// the count path at about 4.4 s on a moving screen (~5.7 reports/s;
-    /// measured live), by `(12, 6 s)` at about 6 s at 2-4 reports/s, and by
-    /// `(4, 10 s)` at about 13 s on a static screen (~0.3 reports/s). Times are
+    /// Lapse for the wall-clock fast path: `(zeros in a row, time since the
+    /// last nonzero report)`. A connection with 1-2 nonzero reports (not
+    /// latched) is a fast-path blank only once both hold. Windows 10 mstsc FS
+    /// 1920x1080 (2026-10-21): a healthy session reports `timeDiffEDR == 0` on
+    /// 30-75 % of its QoE reports, also on large frames, so only a long run of
+    /// zeros is evidence; time alone is not (on a static page the reports are
+    /// sparse: a healthy session had 4 zeros over 9 s after a nonzero report,
+    /// and a `(4, 10 s)` tier reactivated it). Before the latch, 168 recorded
+    /// healthy fresh connects had at most 13 zeros in a row. A frozen start
+    /// with one stray nonzero report is caught by the count path at about
+    /// 4.4 s on a moving screen (~5.7 reports/s, measured), by this lapse at
+    /// about 6.4 s at 2.5 reports/s, and at about 53 s on a static screen
+    /// (~0.3 reports/s; the count path alone: about 80 s). The time is
     /// RTT-scaled like `blank_max_wait`. No env knob.
-    lapse_tiers: [(u64, Duration); 2],
+    lapse: (u64, Duration),
     /// Reconnect-storm guard: if this many CONSECUTIVE connections all ended in
     /// a blank-recovery drop (no connection in between ever presented a frame),
     /// stop dropping — the client is truly stuck (mstsc retains surfaces for
@@ -1076,15 +1076,13 @@ fn should_blank_recover(
     // One zero report is enough only for a connection that has not reported
     // a single nonzero decode+render time (the connect-time blank is zero from
     // the first report). A connection with some nonzero reports must also show
-    // a lapse (`lapse_tiers`): enough zeros in a row, long enough after its last
+    // a lapse (`lapse`): enough zeros in a row, long enough after its last
     // nonzero report (2026-10-21, Windows 10 mstsc FS 1920x1080: a healthy
     // session had only 2 nonzero reports in its first 4 s, `1,0,0,0,0,23,0,0,
     // 0,0`, missed the 3-report latch and was reactivated, then dropped by the
     // heal-confirmation deadline, while its picture moved the whole time).
     let lapsed = qoe.nonzero_since_reset() == 0
-        || p.lapse_tiers
-            .iter()
-            .any(|&(zeros, wait)| qoe.zero_streak >= zeros && since_last_nonzero >= wait);
+        || (qoe.zero_streak >= p.lapse.0 && since_last_nonzero >= p.lapse.1);
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
         || post_attempt_unconfirmed
@@ -1133,9 +1131,7 @@ fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParam
         established_max_wait: p.established_max_wait.mul_f64(mult),
         // mul_f64 of zero stays zero, so "0 = disabled" survives scaling.
         heal_confirm_deadline: p.heal_confirm_deadline.mul_f64(mult),
-        lapse_tiers: p
-            .lapse_tiers
-            .map(|(zeros, wait)| (zeros, wait.mul_f64(mult))),
+        lapse: (p.lapse.0, p.lapse.1.mul_f64(mult)),
         ..*p
     }
 }
@@ -2036,7 +2032,7 @@ impl Gfx {
             max_rtt_ms: env_u32_zero_ok("MACRDP_BLANK_RECOVERY_MAX_RTT_MS", 80),
             blank_max_wait: watchdog_ms("MACRDP_BLANK_RECOVERY_MAX_WAIT_MS", 4000),
             blank_min_reports: u64::from(env_u32("MACRDP_BLANK_RECOVERY_MIN_WALL_REPORTS", 1)),
-            lapse_tiers: [(12, Duration::from_secs(6)), (4, Duration::from_secs(10))],
+            lapse: (16, Duration::from_secs(6)),
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
@@ -5232,8 +5228,8 @@ mod tests {
             // 3 for the tests (the production default is a more aggressive 1);
             // the wall-clock test asserts against this value.
             blank_min_reports: 3,
-            // Production values; the lapse tests assert against them.
-            lapse_tiers: [(12, ms(6000)), (4, ms(10_000))],
+            // Production value; the lapse tests assert against it.
+            lapse: (16, ms(6000)),
             reactivate: false,
         }
     }
@@ -6198,7 +6194,7 @@ mod tests {
         (4811, 0),
         (5305, 17),
     ];
-    /// x46s-08, AVC444, static desktop: of all 167 recorded healthy connects,
+    /// x46s-08, AVC444, static desktop: of all 168 recorded healthy connects,
     /// the longest pre-latch time after a nonzero report with 4 or more zeros
     /// in a row (5.7 s, 10 zeros).
     const HEALTHY_X46S_08: [(u64, u16); 21] = [
@@ -6236,7 +6232,7 @@ mod tests {
     ];
 
     /// h48-09, AVC420, moving: 13 zeros in a row, the 3rd nonzero report (the
-    /// latch) 3.6 s after the 2nd. The closest healthy case to `(12, 6 s)`.
+    /// latch) 3.6 s after the 2nd: the longest pre-latch zero run recorded.
     const HEALTHY_H48_09: [(u64, u16); 19] = [
         (131, 4),
         (487, 6),
@@ -6259,6 +6255,22 @@ mod tests {
         (5114, 22),
     ];
 
+    /// kb49b, AVC420, static key-log page (typing test passed): 2 nonzero
+    /// reports, then 4 zeros over 9 s.
+    const HEALTHY_KB49B: [(u64, u16); 11] = [
+        (301, 0),
+        (475, 0),
+        (680, 5),
+        (878, 0),
+        (1467, 0),
+        (2881, 0),
+        (3070, 18),
+        (3322, 0),
+        (3524, 0),
+        (3750, 0),
+        (12_212, 0),
+    ];
+
     /// A frozen start (legacy hold off, frz46-02): zero on every report, one
     /// report every ~175 ms. `first` replaces the first reports.
     fn frozen_start(first: &[u16], interval_ms: u64, count: u64) -> Vec<(u64, u16)> {
@@ -6277,6 +6289,9 @@ mod tests {
         assert_eq!(replay_first_fire(&HEALTHY_X46S_08, 10_042), None);
         assert_eq!(replay_first_fire(&HEALTHY_X46S_01, 20_864), None);
         assert_eq!(replay_first_fire(&HEALTHY_H48_09, 5114), None);
+        // The static key-log page: no more reports for 9 s after the last
+        // zero; a (4 zeros, 10 s) rule reactivated it live at 13.4 s.
+        assert_eq!(replay_first_fire(&HEALTHY_KB49B, 30_000), None);
     }
 
     #[test]
@@ -6291,15 +6306,17 @@ mod tests {
         // row) is first.
         let stray = replay_first_fire(&frozen_start(&[1], 175, 200), 30_000).unwrap();
         assert!((4000..=4500).contains(&stray), "{stray}");
-        // At 2.5 reports/s the count path would need ~9.7 s: `(12, 6 s)`.
+        // At 2.5 reports/s the count path would need ~9.7 s; the lapse
+        // (16 zeros, 6 s) fires at the 16th zero.
         let stray = replay_first_fire(&frozen_start(&[1], 400, 100), 30_000).unwrap();
-        assert!((6000..=6500).contains(&stray), "{stray}");
+        assert!((6500..=7000).contains(&stray), "{stray}");
         // Presents twice, then freezes before 4 s.
         let twice = replay_first_fire(&frozen_start(&[12, 7], 400, 100), 30_000).unwrap();
-        assert!((6000..=6700).contains(&twice), "{twice}");
-        // Static screen, one report every ~3.3 s: `(4, 10 s)` at the 4th zero.
-        let stat = replay_first_fire(&frozen_start(&[1], 3300, 20), 60_000).unwrap();
-        assert!((13_000..=13_500).contains(&stat), "{stat}");
+        assert!((6900..=7400).contains(&twice), "{twice}");
+        // Static screen, one report every ~3.3 s: the 16th zero (~53 s), not
+        // the 24th of the count path (~79 s).
+        let stat = replay_first_fire(&frozen_start(&[1], 3300, 40), 120_000).unwrap();
+        assert!((52_900..=53_500).contains(&stat), "{stat}");
     }
 
     #[test]
