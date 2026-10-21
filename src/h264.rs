@@ -3975,10 +3975,11 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
-            ctx.refine
-                .lock()
-                .unwrap()
-                .on_ack(frame_id, ctx.acks_suspended);
+            let refine_frame = {
+                let mut r = ctx.refine.lock().unwrap();
+                r.on_ack(frame_id, ctx.acks_suspended);
+                r.is_refine_frame(frame_id)
+            };
             ctx.window
                 .lock()
                 .unwrap()
@@ -3987,8 +3988,10 @@ impl GraphicsPipelineHandler for GfxHandler {
             // The client sends FrameAcknowledge after it DECODES a frame, so this
             // is the floor of its decode backlog. Only advance on a real ack (not
             // the suspend sentinel), and mark that we've seen at least one ack so
-            // `submit_bgra` doesn't false-drop during cold start.
-            if !ctx.acks_suspended {
+            // `submit_bgra` doesn't false-drop during cold start. An ack of a
+            // lossless refinement frame does not count: the blank detector
+            // reads an advance as "the client decodes our H.264 frames".
+            if !ctx.acks_suspended && !refine_frame {
                 ctx.last_acked_frame_id
                     .store(u64::from(frame_id), Ordering::Relaxed);
                 ctx.egfx_acks_seen = true;
