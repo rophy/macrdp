@@ -2065,6 +2065,8 @@ impl Gfx {
                             // client's reference is stale) — arm it now while we
                             // still hold ctx.
                             ctx.need_keyframe = true;
+                            // The client may drop frames in flight across it.
+                            ctx.window.lock().unwrap().reset();
                         }
                         if action == BlankAction::Drop {
                             // Count the drop toward the storm guard now (arming
@@ -2178,7 +2180,7 @@ impl Gfx {
             {
                 let (in_flight, target) = {
                     let mut w = ctx.window.lock().unwrap();
-                    (w.in_flight(), w.target(self.frame_interval, now))
+                    (w.in_flight(now), w.target(self.frame_interval, now))
                 };
                 if in_flight >= target {
                     trace!(
@@ -2813,6 +2815,7 @@ impl Gfx {
             Some(ctx) if Arc::ptr_eq(&ctx.server_handle, server_handle) => {
                 ctx.surface_id = Some(new_sid);
                 ctx.need_keyframe = true;
+                ctx.window.lock().unwrap().reset();
                 info!(
                     new_surface_id = new_sid,
                     w = width,
@@ -2866,6 +2869,7 @@ impl Gfx {
             ctx.surface_id = None;
             ctx.need_keyframe = true;
             self.latest_dropped.store(false, Ordering::Relaxed);
+            ctx.window.lock().unwrap().reset();
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
     }
@@ -3345,6 +3349,8 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.is_ready = true;
                 ctx.egfx_ever_ready = true;
                 ctx.need_keyframe = true;
+                // A (re)negotiated pipeline: older frames may never be acknowledged.
+                ctx.window.lock().unwrap().reset();
                 info!(?negotiated, "EGFX channel ready (H.264 active)");
             } else {
                 ctx.is_ready = false;
@@ -3551,6 +3557,8 @@ impl GraphicsPipelineHandler for GfxHandler {
             ctx.encoder = None;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
+            // Frames sent on the closed channel are never acknowledged.
+            ctx.window.lock().unwrap().reset();
         } else {
             debug!("EGFX on_close: graphics channel closed (no active context)");
         }

@@ -94,22 +94,15 @@ pub struct FrameWindow {
 }
 
 impl FrameWindow {
-    /// Forget everything (new connection or new channel). Here each connection
-    /// gets a new window, so only the tests use it.
-    #[cfg(test)]
+    /// Forget everything: a new or reopened EGFX channel, a new surface (resize),
+    /// or a reactivation, where the client may never acknowledge older frames.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
     /// A frame with `frame_id` was put on the wire.
     pub fn on_sent(&mut self, frame_id: u32, now: Instant) {
-        while self
-            .sent
-            .front()
-            .is_some_and(|&(_, t, _)| now.duration_since(t) > SENT_TIMEOUT)
-        {
-            self.sent.pop_front();
-        }
+        self.prune(now);
         // A frame sent while others are still in flight is part of a stream
         // too: on a choked link the window spaces frames more than
         // `STREAM_GAP` apart, and without samples the bitrate never steps down.
@@ -281,8 +274,23 @@ impl FrameWindow {
         self.base_rtt
     }
 
-    /// Frames sent and not acknowledged (or forgotten) yet.
-    pub fn in_flight(&self) -> u32 {
+    /// Forget frames sent more than `SENT_TIMEOUT` ago without an
+    /// acknowledgement.
+    fn prune(&mut self, now: Instant) {
+        while self
+            .sent
+            .front()
+            .is_some_and(|&(_, t, _)| now.saturating_duration_since(t) > SENT_TIMEOUT)
+        {
+            self.sent.pop_front();
+        }
+    }
+
+    /// Frames sent and not acknowledged yet. Frames older than `SENT_TIMEOUT`
+    /// are forgotten here too: when the window is full no frame is sent, so
+    /// `on_sent` would never drop them and the window would stay full.
+    pub fn in_flight(&mut self, now: Instant) -> u32 {
+        self.prune(now);
         u32::try_from(self.sent.len()).unwrap_or(u32::MAX)
     }
 
@@ -588,16 +596,46 @@ mod tests {
     }
 
     #[test]
+    fn a_full_window_without_acks_frees_itself() {
+        let mut w = FrameWindow::default();
+        let t0 = Instant::now();
+        round_trip(&mut w, 0, t0, ms(10));
+        // The client stops acknowledging: the window fills, nothing more is sent.
+        for id in 1..=3 {
+            w.on_sent(id, t0 + ms(20 + u64::from(id) * 16));
+        }
+        let now = t0 + ms(100);
+        assert!(w.in_flight(now) >= w.target(FRAME_60, now));
+        // No frame is sent while it is full; after SENT_TIMEOUT it is free again.
+        let later = t0 + ms(100) + SENT_TIMEOUT;
+        assert_eq!(w.in_flight(later), 0);
+        assert!(w.in_flight(later) < w.target(FRAME_60, later));
+    }
+
+    #[test]
+    fn reset_frees_the_window() {
+        let mut w = FrameWindow::default();
+        let t0 = Instant::now();
+        for id in 0..5 {
+            w.on_sent(id, t0 + ms(u64::from(id) * 16));
+        }
+        assert_eq!(w.in_flight(t0 + ms(100)), 5);
+        w.reset();
+        assert_eq!(w.in_flight(t0 + ms(100)), 0);
+        assert_eq!(w.target(FRAME_60, t0 + ms(100)), MIN_WINDOW);
+    }
+
+    #[test]
     fn in_flight_counts_unacknowledged_frames() {
         let mut w = FrameWindow::default();
         let t0 = Instant::now();
         w.on_sent(0, t0);
         w.on_sent(1, t0 + ms(16));
         w.on_sent(2, t0 + ms(33));
-        assert_eq!(w.in_flight(), 3);
+        assert_eq!(w.in_flight(t0 + ms(34)), 3);
         w.on_ack(1, 0, t0 + ms(40));
-        assert_eq!(w.in_flight(), 1);
+        assert_eq!(w.in_flight(t0 + ms(41)), 1);
         w.on_ack(2, SUSPEND_QUEUE_DEPTH, t0 + ms(50));
-        assert_eq!(w.in_flight(), 0);
+        assert_eq!(w.in_flight(t0 + ms(51)), 0);
     }
 }
