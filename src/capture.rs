@@ -906,7 +906,7 @@ mod macos {
 
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
-    use screencapturekit::cv::CVPixelBufferLockFlags;
+    use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags, CVPixelBufferLockGuard};
     use screencapturekit::prelude::{
         PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
     };
@@ -920,6 +920,19 @@ mod macos {
     /// How often the capture loop reads the cursor shape (~15 Hz), also while
     /// the screen is static (the loop then waits at most this long for a sample).
     const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(66);
+
+    /// Lock the kept capture buffer (`last_frame`) to read its pixels.
+    fn lock_kept(kept: &Option<CVPixelBuffer>) -> Option<CVPixelBufferLockGuard<'_>> {
+        kept.as_ref().and_then(|pb| pb.lock_read_only().ok())
+    }
+
+    /// The kept capture buffer for the encoder (see `Gfx::submit_bgra`).
+    fn kept_pixel_buffer(
+        kept: &Option<CVPixelBuffer>,
+    ) -> Option<crate::videotoolbox::CapturePixelBuffer> {
+        kept.as_ref()
+            .map(|pb| crate::videotoolbox::CapturePixelBuffer(pb.as_ptr().cast_const()))
+    }
 
     pub struct ScreenCaptureUpdates {
         stream: AsyncSCStream,
@@ -976,9 +989,11 @@ mod macos {
         /// `flush_frames` times to push it through within a couple of frame
         /// intervals. Stays 0 (no-op) on the legacy bitmap path.
         flush_remaining: u32,
-        /// Last BGRA frame submitted to EGFX, reused across frames (no per-frame
-        /// realloc) and re-encoded as cheap skip-P-frames during a flush burst.
-        last_frame: Vec<u8>,
+        /// Last BGRA frame submitted to EGFX: its capture buffer, kept (a
+        /// reference, no copy; SCK does not reuse it while it is kept). It is
+        /// re-encoded as cheap skip-P-frames during a flush burst, refined
+        /// (lossless text) and compared with the next frame.
+        last_frame: Option<CVPixelBuffer>,
         last_stride: usize,
         /// Size in pixels of `last_frame`.
         last_dims: (u16, u16),
@@ -1191,9 +1206,10 @@ mod macos {
                 .with_preserves_aspect_ratio(letterbox)
                 // The H.264 encoder keeps the capture buffers it encodes (no
                 // copy, see `Gfx::submit_bgra`): next to the frames queued
-                // for this loop and the one in hand, up to
-                // `--h264-frames-in-flight` more stay in use. The default
-                // pool of 3 would make SCK skip frames; 8 is the SCK maximum.
+                // for this loop, the one in hand and the kept last frame
+                // (`last_frame`), up to `--h264-frames-in-flight` more stay in
+                // use. The default pool of 3 would make SCK skip frames; 8 is
+                // the SCK maximum.
                 .with_queue_depth(8);
 
             let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
@@ -1260,7 +1276,7 @@ mod macos {
                 frame_interval,
                 flush_frames,
                 flush_remaining: 0,
-                last_frame: Vec::new(),
+                last_frame: None,
                 last_stride: 0,
                 last_dims: (0, 0),
                 refine_color_share,
@@ -1508,14 +1524,14 @@ mod macos {
                 // followed by a newer one) is re-submitted too, so the newest
                 // picture reaches the client when the screen goes static.
                 let resend_latest = self.gfx.as_ref().is_some_and(|g| g.latest_dropped())
-                    && !self.last_frame.is_empty();
+                    && self.last_frame.is_some();
                 let other_pending = self.flush_remaining > 0
                     || self.pending_resize.has_pending()
                     || self.held_frame
                     || resend_latest;
                 // Lossless text refinement waits for a quiet screen: it runs only
                 // when none of the above is pending (they come first).
-                let refine_at = if other_pending || self.last_frame.is_empty() {
+                let refine_at = if other_pending || self.last_frame.is_none() {
                     None
                 } else {
                     self.gfx
@@ -1528,9 +1544,11 @@ mod macos {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
                         Err(_) => {
-                            if let Some(gfx) = self.gfx.as_ref() {
+                            if let (Some(gfx), Some(last)) =
+                                (self.gfx.as_ref(), lock_kept(&self.last_frame))
+                            {
                                 gfx.refine_step(
-                                    &self.last_frame,
+                                    last.as_slice(),
                                     self.last_stride,
                                     self.last_dims,
                                     self.refine_color_share,
@@ -1545,14 +1563,16 @@ mod macos {
                         Ok(None) => return Ok(None),
                         Err(_) => {
                             if self.held_frame {
-                                if let Some(gfx) = self.gfx.as_ref() {
+                                if let (Some(gfx), Some(last)) =
+                                    (self.gfx.as_ref(), lock_kept(&self.last_frame))
+                                {
                                     match gfx.submit_bgra(
-                                        &self.last_frame,
+                                        last.as_slice(),
                                         self.last_stride,
                                         true,
                                         None,
                                         self.held_dims,
-                                        None,
+                                        kept_pixel_buffer(&self.last_frame),
                                     ) {
                                         Ok(true) => {
                                             self.held_frame = false;
@@ -1571,7 +1591,7 @@ mod macos {
                                             let (w, h) = self.held_dims;
                                             for (sx, sy, sw, sh) in split_strips(0, 0, w, h) {
                                                 if let Some(update) = rect_update(
-                                                    &self.last_frame,
+                                                    last.as_slice(),
                                                     self.last_stride,
                                                     sx,
                                                     sy,
@@ -1599,19 +1619,19 @@ mod macos {
                             if self.flush_remaining > 0 || resend_latest {
                                 let mut dropped = false;
                                 if let Some(gfx) = self.gfx.as_ref() {
-                                    if !self.last_frame.is_empty() {
+                                    if let Some(last) = lock_kept(&self.last_frame) {
                                         // The same frame again: no tile changed.
                                         let same = crate::refine::TileGrid::new(
                                             u32::from(self.last_dims.0),
                                             u32::from(self.last_dims.1),
                                         );
                                         if let Err(e) = gfx.submit_bgra(
-                                            &self.last_frame,
+                                            last.as_slice(),
                                             self.last_stride,
                                             false,
                                             Some(&same),
                                             self.last_dims,
-                                            None,
+                                            kept_pixel_buffer(&self.last_frame),
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
@@ -1760,21 +1780,24 @@ mod macos {
                         false
                     };
                     // Lossless text refinement: find the tiles that changed
-                    // while updating the copy of the last frame, in one pass
-                    // (`last_frame` is then this frame, whatever `submit_bgra`
-                    // answers; see `crate::refine::diff_copy`).
+                    // against the kept last frame (`last_frame` is then this
+                    // frame, whatever `submit_bgra` answers; see
+                    // `crate::refine::diff_frames`).
                     let changed = gfx.changed_tiles_wanted().map(|skip| {
                         let prev_ok = self.last_stride == stride_bytes
                             && self.last_dims == (pb_width, pb_height);
-                        let g = crate::refine::diff_copy(
-                            &mut self.last_frame,
-                            src,
-                            stride_bytes,
-                            u32::from(pb_width),
-                            u32::from(pb_height),
-                            prev_ok,
-                            Some(&skip),
-                        );
+                        let g = {
+                            let prev = lock_kept(&self.last_frame).filter(|_| prev_ok);
+                            crate::refine::diff_frames(
+                                prev.as_ref().map(|p| p.as_slice()),
+                                src,
+                                stride_bytes,
+                                u32::from(pb_width),
+                                u32::from(pb_height),
+                                Some(&skip),
+                            )
+                        };
+                        self.last_frame = Some(pixel_buffer.clone());
                         self.last_stride = stride_bytes;
                         self.last_dims = (pb_width, pb_height);
                         g
@@ -1800,14 +1823,12 @@ mod macos {
                                     "first EGFX frame shipped — suppress gate now armed"
                                 );
                             }
-                            // Stash this frame and arm the flush burst so that,
+                            // Keep this frame and arm the flush burst so that,
                             // once SCK goes idle after this change, we re-submit
                             // it enough times to drain mstsc's presentation
-                            // buffer. Reuse the buffer to avoid a per-frame
-                            // realloc; clear keeps the capacity.
+                            // buffer.
                             if changed.is_none() {
-                                self.last_frame.clear();
-                                self.last_frame.extend_from_slice(src);
+                                self.last_frame = Some(pixel_buffer.clone());
                                 self.last_stride = stride_bytes;
                                 self.last_dims = (pb_width, pb_height);
                             }
@@ -1821,8 +1842,7 @@ mod macos {
                         // no other frame may come (see `held_frame`).
                         Ok(false) if gfx.hold_legacy(self.capture_started) => {
                             if changed.is_none() {
-                                self.last_frame.clear();
-                                self.last_frame.extend_from_slice(src);
+                                self.last_frame = Some(pixel_buffer.clone());
                                 self.last_stride = stride_bytes;
                                 self.last_dims = (pb_width, pb_height);
                             }

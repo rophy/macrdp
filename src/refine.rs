@@ -174,87 +174,11 @@ impl TileGrid {
         self.set.fill(true);
     }
 
-    /// Mark the tiles in which `cur` differs from `last` (two BGRA frames of
-    /// this grid's size with the same `stride`) and make `last` a copy of
-    /// `cur`, in one pass over `cur`: each row of `cur` is read once into a
-    /// small row buffer, compared with the row of `last`, and copied into
-    /// `last` only when it differs. The capture loop keeps a copy of the last
-    /// frame anyway, so the compare adds little to that copy (a copy followed
-    /// by a second compare pass cost ~0.7 ms per 1280x960 frame). Alpha counts
-    /// too: the cost of a tile marked for nothing is one tile in the next
-    /// H.264 region. With no usable `last` (another length, a bad stride)
-    /// everything is copied and marked.
-    /// Tiles set in `skip` (a grid of the same size) are not compared and
-    /// not marked.
-    pub fn mark_changed_copy(
-        &mut self,
-        last: &mut Vec<u8>,
-        cur: &[u8],
-        stride: usize,
-        skip: Option<&TileGrid>,
-    ) {
-        let row_bytes = self.width as usize * 4;
-        let usable = self.width > 0
-            && self.height > 0
-            && stride >= row_bytes
-            && last.len() == cur.len()
-            && cur.len() >= stride * (self.height as usize - 1) + row_bytes;
-        if !usable {
-            last.clear();
-            last.extend_from_slice(cur);
-            self.mark_all();
-            return;
-        }
-        let col_bytes: Vec<(usize, usize)> = (0..self.cols)
-            .map(|c| (self.x_edge(c) as usize * 4, self.x_edge(c + 1) as usize * 4))
-            .collect();
-        let len = cur.len();
-        let mut row_buf = vec![0u8; stride];
-        // Skipped tiles count as marked while comparing, and are unmarked at
-        // the end.
-        let skip = skip.filter(|s| s.set.len() == self.set.len());
-        if let Some(s) = skip {
-            for (t, &k) in self.set.iter_mut().zip(&s.set) {
-                *t |= k;
-            }
-        }
-        for row in 0..self.rows {
-            let (y0, y1) = (self.y_edge(row) as usize, self.y_edge(row + 1) as usize);
-            let first = (row * self.cols) as usize;
-            let tiles = &mut self.set[first..first + self.cols as usize];
-            let mut all = tiles.iter().all(|&t| t);
-            for y in y0..y1 {
-                let (s0, s1) = (y * stride, ((y + 1) * stride).min(len));
-                if all {
-                    last[s0..s1].copy_from_slice(&cur[s0..s1]);
-                    continue;
-                }
-                let b = &mut row_buf[..s1 - s0];
-                b.copy_from_slice(&cur[s0..s1]);
-                let a = &mut last[s0..s1];
-                if *a == *b {
-                    continue;
-                }
-                for (c, &(x0, x1)) in col_bytes.iter().enumerate() {
-                    if !tiles[c] && a[x0..x1] != b[x0..x1] {
-                        tiles[c] = true;
-                    }
-                }
-                a.copy_from_slice(b);
-                all = tiles.iter().all(|&t| t);
-            }
-        }
-        if let Some(s) = skip {
-            for (t, &k) in self.set.iter_mut().zip(&s.set) {
-                *t &= !k;
-            }
-        }
-    }
-
     /// Mark the tiles in which `cur` differs from `prev` (two BGRA frames of
-    /// this grid's size with the same `stride`). Frames that are too short
-    /// mark everything.
-    #[cfg(test)]
+    /// this grid's size with the same `stride`), reading both in place (no
+    /// copy). A row of tiles that is all marked is not read any more. Alpha
+    /// counts too: the cost of a tile marked for nothing is one tile in the
+    /// next H.264 region. Frames that are too short mark everything.
     pub fn mark_changed(&mut self, prev: &[u8], cur: &[u8], stride: usize) {
         let row_bytes = self.width as usize * 4;
         let usable = self.width > 0
@@ -396,26 +320,38 @@ impl TileGrid {
 }
 
 /// The tiles in which the captured frame `cur` (`width` x `height` pixels,
-/// `stride` bytes per row) differs from `last`, the copy of the frame captured
-/// before it; `last` becomes a copy of `cur` (see
-/// [`TileGrid::mark_changed_copy`]). `prev_ok` says that `last` is a frame of
-/// the same size and stride; else all tiles count as changed.
+/// `stride` bytes per row) differs from `prev`, the frame captured before it.
+/// The capture loop keeps that frame's capture buffer (no copy), so both are
+/// read in place. `None` (no usable previous frame: none yet, or another size
+/// or stride) marks all tiles.
 ///
-/// Tiles set in `skip` are not compared (see [`Refine::compare_skip`]).
-pub fn diff_copy(
-    last: &mut Vec<u8>,
+/// Tiles set in `skip` are not compared and not marked (see
+/// [`Refine::compare_skip`]).
+pub fn diff_frames(
+    prev: Option<&[u8]>,
     cur: &[u8],
     stride: usize,
     width: u32,
     height: u32,
-    prev_ok: bool,
     skip: Option<&TileGrid>,
 ) -> TileGrid {
     let mut g = TileGrid::new(width, height);
-    if !prev_ok {
-        last.clear();
+    let Some(prev) = prev else {
+        g.mark_all();
+        return g;
+    };
+    // Skipped tiles count as marked while comparing (so their rows can end
+    // early), and are unmarked at the end.
+    let skip = skip.filter(|s| s.set.len() == g.set.len());
+    if let Some(s) = skip {
+        g.set.copy_from_slice(&s.set);
     }
-    g.mark_changed_copy(last, cur, stride, skip);
+    g.mark_changed(prev, cur, stride);
+    if let Some(s) = skip {
+        for (t, &k) in g.set.iter_mut().zip(&s.set) {
+            *t &= !k;
+        }
+    }
     g
 }
 
@@ -746,7 +682,7 @@ impl Refine {
         self.seq = 0;
     }
 
-    /// A captured frame changed the tiles `changed` (see [`diff_copy`]; None:
+    /// A captured frame changed the tiles `changed` (see [`diff_frames`]; None:
     /// all, a grid of another size: all): those tiles go into the next
     /// encoded frame.
     pub fn on_captured(&mut self, changed: Option<&TileGrid>) {
@@ -1043,25 +979,16 @@ mod tests {
         g.clear();
         g.mark_changed(&prev[..100], &cur, stride);
         assert!(g.is_full());
-        // `diff_copy`: the same tiles, and `last` becomes `cur` (padding too).
-        let mut last = prev.clone();
-        let g = diff_copy(&mut last, &cur, stride, w, h, true, None);
+        // `diff_frames`: the same tiles, also with padding changes.
+        let g = diff_frames(Some(&prev), &cur, stride, w, h, None);
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(1, 0)]);
-        assert_eq!(last, cur);
-        let mut last = prev.clone();
         cur[5 * stride + 64 * 4 + 3] = 7; // padding only, besides the pixel
-        let g = diff_copy(&mut last, &cur, stride, w, h, true, None);
+        let g = diff_frames(Some(&prev), &cur, stride, w, h, None);
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(1, 0)]);
-        assert_eq!(last, cur);
-        // No usable previous frame, or another length: everything, full copy.
-        let mut last = prev.clone();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, false, None).is_full());
-        assert_eq!(last, cur);
-        let mut last = prev[..100].to_vec();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, true, None).is_full());
-        assert_eq!(last, cur);
-        let mut last = cur.clone();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, true, None).is_empty());
+        // No previous frame, or a short one: everything.
+        assert!(diff_frames(None, &cur, stride, w, h, None).is_full());
+        assert!(diff_frames(Some(&prev[..100]), &cur, stride, w, h, None).is_full());
+        assert!(diff_frames(Some(&cur), &cur, stride, w, h, None).is_empty());
     }
 
     #[test]
@@ -1385,7 +1312,7 @@ mod tests {
         match prev {
             None => r.on_captured(None),
             Some(p) => {
-                let g = diff_copy(&mut p.to_vec(), cur, w as usize * 4, w, h, true, None);
+                let g = diff_frames(Some(p), cur, w as usize * 4, w, h, None);
                 r.on_captured(Some(&g));
             }
         }
@@ -1516,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_tiles_are_copied_but_not_compared() {
+    fn skipped_tiles_are_not_compared() {
         let (w, h) = (128u32, 64u32);
         let stride = 512;
         let prev = frame(w, h, 0);
@@ -1527,15 +1454,11 @@ mod tests {
         let mut one = frame(w, h, 0);
         one[(40 * 128 + 100) * 4] = 1;
         skip.mark_changed(&prev, &one, stride); // skip tile (3, 1)
-        let mut last = prev.clone();
-        let g = diff_copy(&mut last, &cur, stride, w, h, true, Some(&skip));
+        let g = diff_frames(Some(&prev), &cur, stride, w, h, Some(&skip));
         assert_eq!(g.tiles().collect::<Vec<_>>(), [(0, 0)]);
-        assert_eq!(last, cur, "skipped tiles are copied too");
-        // Every tile skipped: nothing compared, all copied.
+        // Every tile skipped: nothing compared, nothing marked.
         skip.mark_all();
-        let mut last = prev.clone();
-        assert!(diff_copy(&mut last, &cur, stride, w, h, true, Some(&skip)).is_empty());
-        assert_eq!(last, cur);
+        assert!(diff_frames(Some(&prev), &cur, stride, w, h, Some(&skip)).is_empty());
     }
 
     #[test]
