@@ -1054,12 +1054,21 @@ fn should_blank_recover(
     // zero reports with nonzero ones (see `should_latch_presented_clean`).
     // After an attempt the count path and the heal-confirmation deadline
     // decide; both need more than one stray zero.
+    // The fast path also needs a connection that has not reported a single
+    // nonzero decode+render time (2026-10-21, Windows 10 mstsc FS 1920x1080):
+    // the connect-time blank is zero from frame one, but a healthy mstsc can
+    // have only 1-2 nonzero reports in its first 4 s (AVC444: about 11 QoE
+    // reports in 4 s, 60 % zero), so it missed the 3-report latch and was
+    // reactivated, then dropped by the heal-confirmation deadline, while its
+    // picture moved the whole time. Such a connection is still covered by the
+    // count path (its longest zero run on a healthy mstsc was 12 of 24).
     let blank_evidence = qoe.zero_streak >= count_threshold
         || established_blackout
         || post_attempt_unconfirmed
         || (attempts == 0
             && since_connect >= p.blank_max_wait
             && qoe.zero_streak >= p.blank_min_reports
+            && qoe.nonzero_since_reset() == 0
             && !established);
     blank_evidence
         && !presenting_now
@@ -5979,10 +5988,11 @@ mod tests {
             ..blank_params()
         };
         let mut q = qoe_from(&MSTSC_FS_HEALTHY);
-        // Before the change (latch on a run of 3): no latch, last report 0,
-        // 4 s in → the fast path fired on this healthy session.
+        // Without the latch (it was a run of 3 before 848f5fd): last report 0,
+        // 4 s in. The fast path fired on this healthy session then; it now
+        // holds because the session has nonzero reports.
         assert!(!q.presented_clean);
-        assert!(should_blank_recover(
+        assert!(!should_blank_recover(
             q,
             true,
             false,
@@ -5997,6 +6007,61 @@ mod tests {
         q.presented_clean = should_latch_presented_clean(&q, 0, p.min_render_reports);
         assert!(!should_blank_recover(
             q,
+            true,
+            false,
+            ms(4000),
+            ms(0),
+            ms(60_000),
+            0,
+            false,
+            &p
+        ));
+    }
+
+    /// Windows 10 mstsc, FS 1920x1080, AVC444, moving picture (live
+    /// 2026-10-21, run x45-09): the QoE reports of the first 4 s. Only 2 are
+    /// nonzero, so the 3-report latch did not set.
+    const MSTSC_FS_AVC444_FIRST_4S: [u16; 10] = [1, 0, 0, 0, 0, 23, 0, 0, 0, 0];
+
+    #[test]
+    fn wall_clock_fast_path_needs_a_never_presented_connection() {
+        let p = BlankRecoveryParams {
+            blank_max_wait: ms(4000),
+            blank_min_reports: 1,
+            ..blank_params()
+        };
+        let q = qoe_from(&MSTSC_FS_AVC444_FIRST_4S);
+        assert!(!should_latch_presented_clean(&q, 0, p.min_render_reports));
+        // Live, this healthy session was reactivated at 4.0 s and dropped
+        // 8 s later; now the fast path holds.
+        assert!(!should_blank_recover(
+            q,
+            true,
+            false,
+            ms(4000),
+            ms(0),
+            ms(60_000),
+            0,
+            false,
+            &p
+        ));
+        // The count path still covers it if it goes all zero later.
+        let mut later = MSTSC_FS_AVC444_FIRST_4S.to_vec();
+        later.extend([0; 120]);
+        assert!(should_blank_recover(
+            qoe_from(&later),
+            true,
+            false,
+            ms(30_000),
+            ms(0),
+            ms(60_000),
+            0,
+            false,
+            &p
+        ));
+        // A connect-time blank (zero from the first report) still fires at 4 s.
+        assert!(should_blank_recover(
+            qoe_from(&[0; 10]),
             true,
             false,
             ms(4000),
