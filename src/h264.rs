@@ -2534,7 +2534,16 @@ impl Gfx {
             return;
         }
         let now = Instant::now();
-        let Some((refine, handle, surface_id, ready, pipeline_empty, h264_in_flight, epoch)) = ({
+        let Some((
+            refine,
+            handle,
+            surface_id,
+            ready,
+            pipeline_empty,
+            h264_in_flight,
+            epoch,
+            acks_suspended,
+        )) = ({
             let guard = self.ctx.lock().unwrap();
             guard.as_ref().map(|ctx| {
                 let ready = ctx.is_ready
@@ -2557,9 +2566,11 @@ impl Gfx {
                     pipeline_empty,
                     h264_in_flight,
                     ctx.epoch,
+                    ctx.acks_suspended,
                 )
             })
-        }) else {
+        })
+        else {
             return;
         };
         let Some(surface_id) = surface_id.filter(|_| ready) else {
@@ -2575,6 +2586,11 @@ impl Gfx {
             let mut r = refine.lock().unwrap();
             if r.due().is_none_or(|d| d > now) {
                 return;
+            }
+            if acks_suspended {
+                // The client suspended acknowledgements: none comes for the
+                // last chunk, so do not wait for it (1 s per chunk otherwise).
+                r.on_ack(0, true);
             }
             match r.gate(true, pipeline_empty, h264_in_flight, now) {
                 RefineGate::Go => {}
