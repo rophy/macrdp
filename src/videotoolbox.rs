@@ -307,17 +307,10 @@ impl Encoder {
         if pixel_buffer.is_null() {
             bail!("encode_pixel_buffer: null pixel buffer");
         }
-        // The capture buffer carries the display's color space (an ICC
-        // profile). With it VideoToolbox color-matches the display RGB to
-        // BT.709 and the mid-tones come out darker (gray 117 -> 106 in
-        // mstsc). Remove it: the pixels are encoded as they are, as the
-        // CPU conversion (`bgra_to_nv12_full_range`) does.
-        // SAFETY: a valid CVPixelBuffer from the caller; VT retains it for
-        // the encode, the caller keeps its own reference.
-        unsafe {
-            ffi::CVBufferRemoveAttachment(pixel_buffer, ffi::kCVImageBufferCGColorSpaceKey);
-            ffi::CVBufferRemoveAttachment(pixel_buffer, ffi::kCVImageBufferICCProfileKey);
-        }
+        // SAFETY: a valid CVPixelBuffer from the caller.
+        unsafe { ffi::strip_color_attachments(pixel_buffer) };
+        // SAFETY: as above; VT retains it for the encode, the caller keeps
+        // its own reference.
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
         unsafe { ffi::submit(&self.inner, pixel_buffer, pts, self.fps, force_keyframe) }
@@ -483,6 +476,10 @@ mod ffi {
         pub(super) static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
         pub(super) static kCVImageBufferCGColorSpaceKey: CFStringRef;
         pub(super) static kCVImageBufferICCProfileKey: CFStringRef;
+        pub(super) static kCVImageBufferColorPrimariesKey: CFStringRef;
+        pub(super) static kCVImageBufferTransferFunctionKey: CFStringRef;
+        pub(super) static kCVImageBufferYCbCrMatrixKey: CFStringRef;
+        pub(super) static kCVImageBufferGammaLevelKey: CFStringRef;
         pub(super) fn CVBufferRemoveAttachment(buffer: CVPixelBufferRef, key: CFStringRef);
         pub(super) static kCFBooleanFalse: CFBooleanRef;
 
@@ -769,6 +766,33 @@ mod ffi {
             kVTCompressionPropertyKey_MaxKeyFrameInterval,
             keyframe_frames.max(1) as i32,
         )
+    }
+
+    /// Remove the color space attachments of a capture buffer, so that
+    /// VideoToolbox does no color matching on it.
+    ///
+    /// The capture buffer carries the display's color space (on the test Mac
+    /// only a CGColorSpace, the display's ICC profile). With it VideoToolbox
+    /// color-matches the display RGB to the session's BT.709 and the
+    /// mid-tones come out darker (gray 117 -> 106 in mstsc). Other displays
+    /// (Display P3 panels) may tag the buffer with primaries, a transfer
+    /// function or a gamma level instead; all of them are removed. The
+    /// pixels are then encoded as they are, as the CPU conversion
+    /// (`bgra_to_nv12_full_range`) does.
+    ///
+    /// # Safety
+    /// `pixel_buffer` is a valid CVPixelBuffer.
+    pub(super) unsafe fn strip_color_attachments(pixel_buffer: CVPixelBufferRef) {
+        for key in [
+            kCVImageBufferCGColorSpaceKey,
+            kCVImageBufferICCProfileKey,
+            kCVImageBufferColorPrimariesKey,
+            kCVImageBufferTransferFunctionKey,
+            kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferGammaLevelKey,
+        ] {
+            CVBufferRemoveAttachment(pixel_buffer, key);
+        }
     }
 
     /// `{kCVPixelBufferPixelFormatTypeKey: format}`, the source image buffer
@@ -2114,6 +2138,29 @@ mod tests {
             std::slice::from_raw_parts_mut(base, stride * usize::from(h)).fill(0x80);
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
         }
+        // Tag it as a P3 capture would be; the encode removes every tag.
+        #[link(name = "CoreVideo", kind = "framework")]
+        extern "C" {
+            fn CVBufferSetAttachment(b: *const c_void, k: *const c_void, v: *const c_void, m: u32);
+            fn CVBufferGetAttachment(
+                b: *const c_void,
+                k: *const c_void,
+                m: *mut u32,
+            ) -> *const c_void;
+        }
+        let keys = unsafe {
+            use super::ffi::*;
+            [
+                kCVImageBufferColorPrimariesKey,
+                kCVImageBufferTransferFunctionKey,
+                kCVImageBufferYCbCrMatrixKey,
+            ]
+        };
+        let value = unsafe { super::ffi::kCVImageBufferYCbCrMatrix_ITU_R_709_2 };
+        for k in keys {
+            unsafe { CVBufferSetAttachment(pbuf, k, value, 1) };
+            assert!(!unsafe { CVBufferGetAttachment(pbuf, k, std::ptr::null_mut()) }.is_null());
+        }
         let pb = CapturePixelBuffer(pbuf);
         let result = (|| {
             let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, false)?;
@@ -2124,6 +2171,10 @@ mod tests {
             assert_eq!(frames.len(), 2);
             assert!(frames[0].is_keyframe && !frames[0].parameter_sets.is_empty());
             assert_eq!(frames.iter().map(|f| f.pts).collect::<Vec<_>>(), [0, 1]);
+            for k in keys {
+                let v = unsafe { CVBufferGetAttachment(pbuf, k, std::ptr::null_mut()) };
+                assert!(v.is_null(), "color attachment left on the buffer");
+            }
             let mut avc444 = Encoder::new(w, h, 30, 4_000_000, 5.0, true)?;
             assert!(avc444.encode_pixel_buffer(pb.0, false).is_err());
             Ok(())
