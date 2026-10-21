@@ -43,6 +43,8 @@ mod multitransport;
 mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
+mod refine;
+#[cfg(target_os = "macos")]
 mod runloop_thread;
 mod session;
 mod shield;
@@ -590,6 +592,15 @@ struct Args {
     /// moment by 50-150 ms. Costs about 10 small packets per second.
     #[arg(long = "no-wifi-keep-awake", action = clap::ArgAction::SetTrue)]
     no_wifi_keep_awake: bool,
+
+    /// Do not send text losslessly (H.264 only). By default each H.264 frame
+    /// updates only the 32-pixel tiles that changed, and 200 ms after the
+    /// screen stops changing, the changed tiles with few colors (text, UI)
+    /// are sent again with ClearCodec, which is lossless: H.264 (4:2:0) blurs
+    /// colored text. Costs a burst of data and some CPU after each change.
+    /// Config key: LOSSLESS_TEXT=0.
+    #[arg(long = "no-lossless-text", action = clap::ArgAction::SetTrue)]
+    no_lossless_text: bool,
 
     /// Disconnect the client after this many seconds without keyboard or
     /// mouse input (0 = off, the default). The client is told why
@@ -2520,6 +2531,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if !on("WIFI_KEEP_AWAKE", true) {
         argv.push("--no-wifi-keep-awake".into());
     }
+    if !on("LOSSLESS_TEXT", true) {
+        argv.push("--no-lossless-text".into());
+    }
     if let Some(secs) = cfg.get("IDLE_TIMEOUT_SECS") {
         if !secs.is_empty() {
             argv.push("--idle-timeout".into());
@@ -3516,6 +3530,7 @@ async fn async_main() -> Result<()> {
                 .is_none()
                 .then(|| (u32::from(width), u32::from(height))),
         )
+        .with_lossless_text(!args.no_lossless_text)
     });
 
     // On-change keyframes are off by default; --keyframe-on-change opts in.
@@ -4450,6 +4465,19 @@ mod config_tests {
         let args = args_from_config(&path).unwrap();
         fs::remove_file(&path).ok();
         assert!(args.no_wifi_keep_awake);
+    }
+
+    /// Lossless text is on unless LOSSLESS_TEXT=0.
+    #[test]
+    fn lossless_text_config_key() {
+        let path = write_temp("lt-default", "USE_KEYCHAIN=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(!args.no_lossless_text);
+        let path = write_temp("lt-off", "LOSSLESS_TEXT=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.no_lossless_text);
     }
 
     /// IDLE_TIMEOUT_SECS sets --idle-timeout; off by default.

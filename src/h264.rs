@@ -59,8 +59,11 @@ use ironrdp_egfx::pdu::{
     CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
     CapabilitySet, PixelFormat,
 };
-use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
+use ironrdp_egfx::server::{
+    GraphicsPipelineHandler, GraphicsPipelineServer, MixedTilePayload, QoeMetrics, Surface,
+};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
     ServerEventSender,
@@ -71,6 +74,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::bitrate_level::BitrateLevel;
 use crate::frame_window::FrameWindow;
+use crate::refine::{self, Refine, RefineGate, Regions};
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
@@ -389,6 +393,10 @@ struct ConnectionContext {
     /// lines.
     legacy_hold_logged: bool,
     legacy_hold_expired_logged: bool,
+    /// Lossless refinement state (see `crate::refine`; used with
+    /// `Gfx::lossless_text`). A leaf mutex like `window`: never held while
+    /// taking another lock.
+    refine: Arc<Mutex<Refine>>,
 }
 
 impl ConnectionContext {
@@ -1474,6 +1482,48 @@ pub struct Gfx {
     /// deactivation–reactivation. Shared across `Gfx` clones (the capture loop
     /// holds one).
     reactivate_request: Arc<AtomicU32>,
+    /// Lossless text refinement (`--no-lossless-text` turns it off): H.264
+    /// frames update only the changed tiles, and a quiet screen's text tiles
+    /// are sent again with ClearCodec. See `crate::refine`.
+    lossless_text: bool,
+}
+
+/// AVC420 region rectangles for a frame of `width` x `height`.
+///
+/// The pinned `ironrdp-egfx` takes `Avc420Region` edges as inclusive and
+/// writes them unchanged, while MS-RDPEGFX 2.2.4.4.1 reads `regionRects` as
+/// RDPGFX_RECT16 with exclusive right and bottom (upstream fixed this later,
+/// e0727394). The tile rectangles are therefore given with exclusive edges.
+/// At the right or bottom edge of the frame the value stays `width - 1` /
+/// `height - 1`, as the whole-frame region always had: the pipeline adds one
+/// to the largest edge for the WireToSurface1 destination, which must stay
+/// within the surface.
+fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
+    let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
+        left,
+        top,
+        right,
+        bottom,
+        quantization_parameter: 22,
+        quality: 100,
+    };
+    match regions {
+        Regions::Tiles(grid) if grid.size() == (u32::from(width), u32::from(height)) => grid
+            .rects()
+            .into_iter()
+            .map(|r| {
+                let right = (r.x + r.w).min(width.saturating_sub(1));
+                let bottom = (r.y + r.h).min(height.saturating_sub(1));
+                region(r.x, r.y, right, bottom)
+            })
+            .collect(),
+        _ => vec![region(
+            0,
+            0,
+            width.saturating_sub(1),
+            height.saturating_sub(1),
+        )],
+    }
 }
 
 impl Gfx {
@@ -1753,7 +1803,33 @@ impl Gfx {
             link_rtt_ms,
             adaptive_seed_rtt_ms,
             reactivate_request: Arc::new(AtomicU32::new(0)),
+            lossless_text: false,
         }
+    }
+
+    /// Whether `submit_bgra` wants the tiles the next frame changed (lossless
+    /// text refinement is on and they can matter; see
+    /// `Refine::wants_changed_tiles`).
+    pub fn wants_changed_tiles(&self) -> bool {
+        if !self.lossless_text {
+            return false;
+        }
+        let guard = self.ctx.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|c| c.is_ready)
+            .is_some_and(|c| c.refine.lock().unwrap().wants_changed_tiles())
+    }
+
+    /// Turn lossless text refinement on or off (see `crate::refine`).
+    pub fn with_lossless_text(mut self, on: bool) -> Self {
+        info!(
+            on,
+            "EGFX lossless text refinement (ClearCodec after {} ms quiet; --no-lossless-text turns it off)",
+            refine::REFINE_DELAY.as_millis()
+        );
+        self.lossless_text = on;
+        self
     }
 
     /// Proactively de-migrate EGFX off the reliable UDP tunnel back onto TCP when
@@ -1853,7 +1929,32 @@ impl Gfx {
         hold
     }
 
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+    ///
+    /// `changed` is the tiles in which this frame differs from the one given
+    /// before (`crate::refine::diff_frames`), for lossless refinement; `None`
+    /// counts as all changed. `dims` is the size of `bgra` in pixels.
+    pub fn submit_bgra(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        changed: Option<&refine::TileGrid>,
+        dims: (u16, u16),
+    ) -> Result<bool> {
+        // Lossless refinement: the tiles this frame changed stay marked until
+        // a frame is encoded, also when this one is dropped below.
+        let refine = if self.lossless_text {
+            let guard = self.ctx.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|c| c.is_ready)
+                .map(|c| c.refine.clone())
+        } else {
+            None
+        };
+        if let Some(r) = &refine {
+            r.lock().unwrap().on_captured(changed);
+        }
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -2315,11 +2416,210 @@ impl Gfx {
                     }
                 }
             }
+            // Lossless refinement: the frame updates only the changed tiles
+            // and those still shown from H.264. A frame that changes nothing on
+            // the client is not encoded (the client already shows it).
+            let regions = if self.lossless_text {
+                let mut r = ctx.refine.lock().unwrap();
+                match r.regions(force_keyframe || dims != ctx.dims) {
+                    Some(regions) => Some(regions),
+                    None => {
+                        r.on_unchanged();
+                        self.latest_dropped.store(false, Ordering::Relaxed);
+                        trace!("EGFX frame changes no tile; not encoded");
+                        return Ok(true);
+                    }
+                }
+            } else {
+                None
+            };
+            let pts = encoder.next_pts();
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            if let Some(regions) = regions {
+                ctx.refine.lock().unwrap().on_encoded(pts, regions);
+            }
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
             self.latest_dropped.store(false, Ordering::Relaxed);
         }
         Ok(true)
+    }
+
+    /// When the capture loop should call [`Self::refine_step`] (None: no
+    /// refinement to do). While encoded frames are still on their way, the
+    /// loop checks every `poll` (their shipping sets the quiet time).
+    pub fn refine_due(&self, poll: Duration) -> Option<Instant> {
+        if !self.lossless_text {
+            return None;
+        }
+        let guard = self.ctx.lock().unwrap();
+        let ctx = guard.as_ref().filter(|c| c.is_ready)?;
+        let due = ctx.refine.lock().unwrap().due();
+        let in_pipeline =
+            ctx.submitted.load(Ordering::Relaxed) > ctx.shipped.load(Ordering::Relaxed);
+        match (due, in_pipeline) {
+            (Some(d), _) => Some(d),
+            (None, true) => Some(Instant::now() + poll),
+            (None, false) => None,
+        }
+    }
+
+    /// The screen is quiet: send the tiles that the client shows from H.264
+    /// and that have few colors (text, UI) again with ClearCodec (lossless).
+    ///
+    /// `frame` is the last frame given to `submit_bgra` (`dims` pixels,
+    /// `stride` bytes per row); it is used only when that frame was encoded,
+    /// so it is the picture the client has. The tiles go in chunks of about
+    /// `refine::REFINE_CHUNK_BYTES`, one at a time (the next after the client
+    /// acknowledged the last one), so that a new H.264 frame waits behind one
+    /// chunk at most.
+    pub fn refine_step(&self, frame: &[u8], stride: usize, dims: (u16, u16), color_share: usize) {
+        if !self.lossless_text {
+            return;
+        }
+        let now = Instant::now();
+        let Some((refine, handle, surface_id, ready, pipeline_empty, h264_in_flight, epoch)) = ({
+            let guard = self.ctx.lock().unwrap();
+            guard.as_ref().map(|ctx| {
+                let ready = ctx.is_ready
+                    && ctx.encoder.is_some()
+                    && ctx.dims == dims
+                    && !self.egfx_on_lossy.load(Ordering::Relaxed);
+                let pipeline_empty = ctx.submitted.load(Ordering::Relaxed)
+                    == ctx.shipped.load(Ordering::Relaxed)
+                    && !self.latest_dropped.load(Ordering::Relaxed);
+                let h264_in_flight = if ctx.egfx_acks_seen && !ctx.acks_suspended {
+                    ctx.window.lock().unwrap().in_flight(now)
+                } else {
+                    0
+                };
+                (
+                    ctx.refine.clone(),
+                    ctx.server_handle.clone(),
+                    ctx.surface_id,
+                    ready,
+                    pipeline_empty,
+                    h264_in_flight,
+                    ctx.epoch,
+                )
+            })
+        }) else {
+            return;
+        };
+        let Some(surface_id) = surface_id.filter(|_| ready) else {
+            refine.lock().unwrap().give_up();
+            return;
+        };
+        let (mut pending, first_seq) = {
+            let mut r = refine.lock().unwrap();
+            if r.due().is_none_or(|d| d > now) {
+                return;
+            }
+            match r.gate(true, pipeline_empty, h264_in_flight, now) {
+                RefineGate::Go => {}
+                RefineGate::Wait => {
+                    r.poll_later(now);
+                    return;
+                }
+                RefineGate::Idle => return,
+                RefineGate::GiveUp => {
+                    r.give_up();
+                    return;
+                }
+            }
+            let need = stride * (usize::from(dims.1).saturating_sub(1)) + usize::from(dims.0) * 4;
+            if frame.len() < need || stride < usize::from(dims.0) * 4 {
+                r.give_up();
+                return;
+            }
+            (r.take_pending(), r.next_seq())
+        };
+        // ClearCodec encoding takes some milliseconds: outside the lock (the
+        // frame-ack handler takes it).
+        let chunk = refine::take_refine_chunk(&mut pending, frame, stride, color_share);
+        refine
+            .lock()
+            .unwrap()
+            .return_pending(&pending, Instant::now());
+        let encode_ms = now.elapsed().as_secs_f64() * 1000.0;
+        if chunk.tiles.is_empty() {
+            trace!(
+                tiles = chunk.total,
+                "Refine: no text-like tile in this chunk"
+            );
+            return;
+        }
+        let mut tiles = chunk.tiles;
+        refine::stamp_clear_seq(&mut tiles, first_seq);
+        let count = tiles.len();
+        let bytes: usize = tiles.iter().map(|(_, d)| d.len()).sum();
+        let payload: Vec<MixedTilePayload> = tiles
+            .into_iter()
+            .map(|(r, bitmap_data)| MixedTilePayload::ClearCodec {
+                destination: ExclusiveRectangle {
+                    left: r.x,
+                    top: r.y,
+                    right: r.x + r.w,
+                    bottom: r.y + r.h,
+                },
+                bitmap_data,
+            })
+            .collect();
+        // Queue the frame in the pipeline and send it at once: its tiles show
+        // the last H.264 frame, so it must go out before the next one (the
+        // next one is encoded on this thread, after this returns).
+        let sent = {
+            let mut server = handle.lock().unwrap();
+            let ts_ms =
+                u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+            match (
+                server.channel_id(),
+                server.send_mixed_frame(surface_id, payload, ts_ms),
+            ) {
+                (Some(channel_id), Some(frame_id)) => {
+                    let msgs = server.drain_output();
+                    let wire: usize = msgs.iter().map(|m| m.size()).sum();
+                    let result = encode_dvc_messages(channel_id, msgs, ChannelFlags::SHOW_PROTOCOL)
+                        .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))
+                        .and_then(|messages| {
+                            let sender = self
+                                .sender
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .ok_or_else(|| anyhow!("server-event sender not set"))?;
+                            sender
+                                .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                                    messages,
+                                }))
+                                .map_err(|_| anyhow!("ServerEvent send failed"))
+                        });
+                    Some((frame_id, wire, result))
+                }
+                _ => None,
+            }
+        };
+        let Some((frame_id, wire, result)) = sent else {
+            debug!("Refine: the pipeline did not take the frame");
+            refine.lock().unwrap().give_up();
+            return;
+        };
+        refine
+            .lock()
+            .unwrap()
+            .on_chunk_queued(frame_id, count, Instant::now());
+        match result {
+            Ok(()) => debug!(
+                frame_id,
+                tiles = chunk.total,
+                lossless = chunk.picked,
+                rects = count,
+                bytes,
+                wire,
+                encode_ms = format!("{encode_ms:.1}"),
+                "Refine: sent lossless tiles"
+            ),
+            Err(e) => warn!(error = ?e, "Refine: frame not sent"),
+        }
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
@@ -2708,6 +3008,8 @@ impl Gfx {
                 flags: MonitorFlags::PRIMARY,
             };
             server.resize_with_monitors(width, height, vec![monitor]);
+            // ResetGraphics: the client's ClearCodec sequence starts at 0 again.
+            ctx.refine.lock().unwrap().on_reset_graphics();
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the
@@ -2725,6 +3027,10 @@ impl Gfx {
                 return Err(anyhow!("EGFX: map_surface_to_output failed"));
             }
             ctx.surface_id = Some(sid);
+            ctx.refine
+                .lock()
+                .unwrap()
+                .on_new_surface(u32::from(width), u32::from(height));
             info!(
                 surface_id = sid,
                 w = width,
@@ -2775,6 +3081,7 @@ impl Gfx {
                 .take_receiver()
                 .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
             ctx.encoder = Some(encoder);
+            ctx.refine.lock().unwrap().on_new_encoder();
             // The new encoder has the TCP periodic-keyframe interval.
             ctx.keyframe_on_udp = false;
             if let Some(enc) = ctx.encoder.as_ref() {
@@ -2874,6 +3181,10 @@ impl Gfx {
                 ctx.surface_id = Some(new_sid);
                 ctx.need_keyframe = true;
                 ctx.window.lock().unwrap().reset();
+                ctx.refine
+                    .lock()
+                    .unwrap()
+                    .on_new_surface(u32::from(width), u32::from(height));
                 info!(
                     new_surface_id = new_sid,
                     w = width,
@@ -3052,7 +3363,17 @@ impl Gfx {
             // few seconds" stall, far more likely once acks ride the UDP tunnel).
             // Cloning the `server_handle` Arc and releasing `ctx` first keeps the
             // lock order consistent (server_handle is never nested under ctx).
-            let (surface_id, width, height, epoch, server_handle, last_shipped, ship_times, window) = {
+            let (
+                surface_id,
+                width,
+                height,
+                epoch,
+                server_handle,
+                last_shipped,
+                ship_times,
+                window,
+                refine,
+            ) = {
                 let mut guard = self.ctx.lock().unwrap();
                 let ctx = guard
                     .as_mut()
@@ -3077,8 +3398,19 @@ impl Gfx {
                     ctx.last_shipped_frame_id.clone(),
                     ctx.ship_times.clone(),
                     ctx.window.clone(),
+                    self.lossless_text.then(|| ctx.refine.clone()),
                 )
             };
+            // Regions of each frame (lossless refinement: the tiles it updates).
+            let regions: Vec<Option<Regions>> = frames
+                .iter()
+                .map(|f| {
+                    refine
+                        .as_ref()
+                        .map(|r| r.lock().unwrap().take_regions(f.pts))
+                })
+                .collect();
+            let mut shipped_regions: Vec<Regions> = Vec::new();
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
             let mut server = server_handle.lock().unwrap();
@@ -3086,18 +3418,16 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            for f in frames {
-                // Region = full actual frame, inclusive bounds. QP 22 /
-                // quality 100 are first-light defaults; tuned in M3. Rebuilt
-                // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
-                };
+            for (f, frame_regions) in frames.iter().zip(regions) {
+                // Region = full actual frame, inclusive bounds (or, with
+                // lossless refinement, the tiles this frame updates; see
+                // `avc420_regions`). QP 22 / quality 100 are first-light
+                // defaults; tuned in M3.
+                let region = avc420_regions(
+                    frame_regions.as_ref().unwrap_or(&Regions::Whole),
+                    width,
+                    height,
+                );
                 let payload = self.frame_payload(f);
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
@@ -3110,7 +3440,7 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                let sent = server.send_avc420_frame(surface_id, &payload, &region, ts_ms);
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -3120,6 +3450,9 @@ impl Gfx {
                     ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
                         (u64::from(frame_id), Instant::now());
                     window.lock().unwrap().on_sent(frame_id, Instant::now());
+                    if let Some(r) = frame_regions {
+                        shipped_regions.push(r);
+                    }
                 }
                 match sent {
                     Some(frame_id) if f.is_keyframe => debug!(
@@ -3144,7 +3477,16 @@ impl Gfx {
                     ),
                 }
             }
-            (server.drain_output(), egfx_channel_id)
+            let out = (server.drain_output(), egfx_channel_id);
+            drop(server);
+            if let Some(r) = refine.as_ref() {
+                let now = Instant::now();
+                let mut r = r.lock().unwrap();
+                for regions in &shipped_regions {
+                    r.on_shipped(regions, now);
+                }
+            }
+            out
         };
 
         if dvc_messages.is_empty() {
@@ -3315,6 +3657,7 @@ impl GfxServerFactory for Gfx {
             egfx_ever_ready: false,
             legacy_hold_logged: false,
             legacy_hold_expired_logged: false,
+            refine: Arc::new(Mutex::new(Refine::default())),
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -3442,6 +3785,10 @@ impl GraphicsPipelineHandler for GfxHandler {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
             ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+            ctx.refine
+                .lock()
+                .unwrap()
+                .on_ack(frame_id, ctx.acks_suspended);
             ctx.window
                 .lock()
                 .unwrap()
@@ -3531,6 +3878,11 @@ impl GraphicsPipelineHandler for GfxHandler {
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
         trace!(?metrics, "EGFX on_qoe_metrics");
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            // A lossless refinement frame has no H.264 to decode: its report
+            // says nothing about the blank presentation the detector looks for.
+            if ctx.refine.lock().unwrap().is_refine_frame(metrics.frame_id) {
+                return;
+            }
             let was = ctx.qoe;
             ctx.qoe.record(metrics.time_diff_dr);
             if metrics.time_diff_dr > 0 {

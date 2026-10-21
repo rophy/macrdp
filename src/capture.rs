@@ -976,6 +976,13 @@ mod macos {
         /// realloc) and re-encoded as cheap skip-P-frames during a flush burst.
         last_frame: Vec<u8>,
         last_stride: usize,
+        /// Size in pixels of `last_frame`.
+        last_dims: (u16, u16),
+        /// The frame before `last_frame` (lossless text refinement compares
+        /// the two; the buffers swap on each frame).
+        prev_frame: Vec<u8>,
+        /// Color limit for lossless text refinement (see `crate::refine`).
+        refine_color_share: usize,
         /// When this capture stream started (one per activation): the legacy
         /// hold of `Gfx::hold_legacy` is measured from here.
         capture_started: Instant,
@@ -1199,6 +1206,7 @@ mod macos {
             // which can make a native-size pointer look small. Clamped to a
             // sane band; the hotspot stays accurate at any value.
             let cursor_scale = cursor_scale_multiplier.clamp(0.1, 8.0);
+            let refine_color_share = crate::refine::COLOR_SHARE;
             tracing::debug!(
                 native_w,
                 native_h,
@@ -1239,6 +1247,9 @@ mod macos {
                 flush_remaining: 0,
                 last_frame: Vec::new(),
                 last_stride: 0,
+                last_dims: (0, 0),
+                prev_frame: Vec::new(),
+                refine_color_share,
                 capture_started: Instant::now(),
                 held_frame: false,
                 held_dims: (0, 0),
@@ -1485,19 +1496,50 @@ mod macos {
                 // picture reaches the client when the screen goes static.
                 let resend_latest = self.gfx.as_ref().is_some_and(|g| g.latest_dropped())
                     && !self.last_frame.is_empty();
-                let sample = if self.flush_remaining > 0
+                let other_pending = self.flush_remaining > 0
                     || self.pending_resize.has_pending()
                     || self.held_frame
-                    || resend_latest
-                {
+                    || resend_latest;
+                // Lossless text refinement waits for a quiet screen: it runs only
+                // when none of the above is pending (they come first).
+                let refine_at = if other_pending || self.last_frame.is_empty() {
+                    None
+                } else {
+                    self.gfx
+                        .as_ref()
+                        .and_then(|g| g.refine_due(self.frame_interval))
+                };
+                let sample = if let Some(at) = refine_at {
+                    let wait = at.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(wait, self.stream.next()).await {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => return Ok(None),
+                        Err(_) => {
+                            if let Some(gfx) = self.gfx.as_ref() {
+                                gfx.refine_step(
+                                    &self.last_frame,
+                                    self.last_stride,
+                                    self.last_dims,
+                                    self.refine_color_share,
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                } else if other_pending {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
                         Err(_) => {
                             if self.held_frame {
                                 if let Some(gfx) = self.gfx.as_ref() {
-                                    match gfx.submit_bgra(&self.last_frame, self.last_stride, true)
-                                    {
+                                    match gfx.submit_bgra(
+                                        &self.last_frame,
+                                        self.last_stride,
+                                        true,
+                                        None,
+                                        self.held_dims,
+                                    ) {
                                         Ok(true) => {
                                             self.held_frame = false;
                                             self.seeded = true;
@@ -1544,10 +1586,17 @@ mod macos {
                                 let mut dropped = false;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if !self.last_frame.is_empty() {
+                                        // The same frame again: no tile changed.
+                                        let same = crate::refine::TileGrid::new(
+                                            u32::from(self.last_dims.0),
+                                            u32::from(self.last_dims.1),
+                                        );
                                         if let Err(e) = gfx.submit_bgra(
                                             &self.last_frame,
                                             self.last_stride,
                                             false,
+                                            Some(&same),
+                                            self.last_dims,
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
@@ -1690,7 +1739,34 @@ mod macos {
                     } else {
                         false
                     };
-                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
+                    // Lossless text refinement: copy this frame first (`last_frame`
+                    // is then this frame, whatever `submit_bgra` answers) and
+                    // compare the copy with the frame before it, in normal
+                    // memory (see `crate::refine::diff_frames`).
+                    let changed = gfx.wants_changed_tiles().then(|| {
+                        let prev_ok = self.last_stride == stride_bytes
+                            && self.last_dims == (pb_width, pb_height);
+                        std::mem::swap(&mut self.prev_frame, &mut self.last_frame);
+                        self.last_frame.clear();
+                        self.last_frame.extend_from_slice(src);
+                        self.last_stride = stride_bytes;
+                        self.last_dims = (pb_width, pb_height);
+                        crate::refine::diff_frames(
+                            &self.prev_frame,
+                            &self.last_frame,
+                            stride_bytes,
+                            u32::from(pb_width),
+                            u32::from(pb_height),
+                            prev_ok,
+                        )
+                    });
+                    match gfx.submit_bgra(
+                        src,
+                        stride_bytes,
+                        big_change || resume_keyframe,
+                        changed.as_ref(),
+                        (pb_width, pb_height),
+                    ) {
                         Ok(true) => {
                             self.held_frame = false;
                             self.seeded = true;
@@ -1707,9 +1783,12 @@ mod macos {
                             // it enough times to drain mstsc's presentation
                             // buffer. Reuse the buffer to avoid a per-frame
                             // realloc; clear keeps the capacity.
-                            self.last_frame.clear();
-                            self.last_frame.extend_from_slice(src);
-                            self.last_stride = stride_bytes;
+                            if changed.is_none() {
+                                self.last_frame.clear();
+                                self.last_frame.extend_from_slice(src);
+                                self.last_stride = stride_bytes;
+                                self.last_dims = (pb_width, pb_height);
+                            }
                             self.flush_remaining = self.flush_frames;
                             continue;
                         }
@@ -1719,9 +1798,12 @@ mod macos {
                         // see `hold_legacy_for_egfx`). Keep it: on a static screen
                         // no other frame may come (see `held_frame`).
                         Ok(false) if gfx.hold_legacy(self.capture_started) => {
-                            self.last_frame.clear();
-                            self.last_frame.extend_from_slice(src);
-                            self.last_stride = stride_bytes;
+                            if changed.is_none() {
+                                self.last_frame.clear();
+                                self.last_frame.extend_from_slice(src);
+                                self.last_stride = stride_bytes;
+                                self.last_dims = (pb_width, pb_height);
+                            }
                             self.held_dims = (pb_width, pb_height);
                             self.held_frame = true;
                             continue;

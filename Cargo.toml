@@ -59,6 +59,8 @@ ironrdp-rdpsnd = "0.9"
 ironrdp-rdpdr = "0.7"
 # EGFX / H.264 video pipeline (gated at runtime by --enable-h264).
 ironrdp-egfx = "0.3"
+# ClearCodec encoder and ZGFX for the lossless text refinement (src/refine.rs).
+ironrdp-graphics = "0.9"
 ironrdp-dvc = "0.8"
 ironrdp-svc = "0.8"
 nfsserve = "0.11.0"

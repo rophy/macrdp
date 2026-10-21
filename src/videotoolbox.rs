@@ -159,6 +159,12 @@ impl Encoder {
     /// Returns immediately; encoded output arrives asynchronously via
     /// `drain()`. VT calls our output callback on its own thread, so
     /// the channel decouples producer and consumer cleanly.
+    /// Presentation time stamp the next `encode_bgra` gives its frame
+    /// (`EncodedFrame::pts`).
+    pub fn next_pts(&self) -> i64 {
+        self.next_pts
+    }
+
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
         let expected = stride
             .checked_mul(self.height.into())
