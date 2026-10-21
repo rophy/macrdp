@@ -125,15 +125,38 @@ impl Avc444Planes {
         }
     }
 
-    /// Write the main view (B1: Y; B2/B3: U and V at even rows and columns,
-    /// interleaved as NV12 CbCr) into `y` (stride `y_stride`, `height()` rows)
-    /// and `cbcr` (stride `c_stride`, `height() / 2` rows).
+    /// Write the main view into `y` (stride `y_stride`, `height()` rows) and
+    /// `cbcr` (stride `c_stride`, `height() / 2` rows): B1 is Y; B2/B3 (NV12
+    /// CbCr) is the rounded average of each 2x2 block of U and V, as a plain
+    /// 4:2:0 picture has.
+    ///
+    /// Not the even-row, even-column sample: the clients rebuild that sample
+    /// from the average. FreeRDP's 4:4:4 to RGB step
+    /// (`general_YUV444ToRGB_DOUBLE_ROW`, `sse41_filter`) replaces it with
+    /// `4 * main - (the 3 other samples of the block)` when that differs by 30
+    /// or more, and FreeRDP's own encoder sends the average
+    /// (`general_YUV444SplitToYUV420`, "use averaging"). A point sample
+    /// there turned a colour edge wrong (one pixel of four per edge block).
     pub fn fill_main(&self, y: &mut [u8], y_stride: usize, cbcr: &mut [u8], c_stride: usize) {
         let w = self.width;
         for (row, src) in self.y444.chunks_exact(w).enumerate() {
             y[row * y_stride..row * y_stride + w].copy_from_slice(src);
         }
-        self.fill_cbcr(cbcr, c_stride, 0);
+        for row in 0..self.height / 2 {
+            let (top, bot) = (2 * row * w, (2 * row + 1) * w);
+            let (u0, u1) = (&self.u444[top..top + w], &self.u444[bot..bot + w]);
+            let (v0, v1) = (&self.v444[top..top + w], &self.v444[bot..bot + w]);
+            let dst = &mut cbcr[row * c_stride..row * c_stride + w];
+            let avg = |a: &[u8], b: &[u8], x: usize| {
+                let sum =
+                    u16::from(a[x]) + u16::from(a[x + 1]) + u16::from(b[x]) + u16::from(b[x + 1]);
+                ((sum + 2) / 4) as u8
+            };
+            for (x, d) in dst.chunks_exact_mut(2).enumerate() {
+                d[0] = avg(u0, u1, 2 * x);
+                d[1] = avg(v0, v1, 2 * x);
+            }
+        }
     }
 
     /// Write the auxiliary view into `y` / `cbcr` (as [`Self::fill_main`]):
@@ -155,20 +178,15 @@ impl Avc444Planes {
                 dst.fill(128);
             }
         }
-        self.fill_cbcr(cbcr, c_stride, 1);
-    }
-
-    /// NV12 CbCr from U and V at even rows and the columns `2x + odd`.
-    fn fill_cbcr(&self, cbcr: &mut [u8], c_stride: usize, odd: usize) {
-        let w = self.width;
-        for row in 0..self.height / 2 {
+        // B6/B7: U and V at even rows and odd columns.
+        for row in 0..h / 2 {
             let src = 2 * row * w;
             let u = &self.u444[src..src + w];
             let v = &self.v444[src..src + w];
             let dst = &mut cbcr[row * c_stride..row * c_stride + w];
             for (x, d) in dst.chunks_exact_mut(2).enumerate() {
-                d[0] = u[2 * x + odd];
-                d[1] = v[2 * x + odd];
+                d[0] = u[2 * x + 1];
+                d[1] = v[2 * x + 1];
             }
         }
     }
@@ -657,7 +675,22 @@ mod tests {
             (py, pu, pv)
         };
         let (py, pu, pv) = planar(&my, &mc);
-        assert_eq!((py, pu, pv), (ry.clone(), ru.clone(), rv.clone()));
+        assert_eq!(py, ry);
+        // Main-view chroma: the rounded 2x2 average (the reference split
+        // point-samples it).
+        let avg = |p: &[u8], r: usize, x: usize| {
+            let s = u16::from(p[2 * r * w + 2 * x])
+                + u16::from(p[2 * r * w + 2 * x + 1])
+                + u16::from(p[(2 * r + 1) * w + 2 * x])
+                + u16::from(p[(2 * r + 1) * w + 2 * x + 1]);
+            ((s + 2) / 4) as u8
+        };
+        for r in 0..hh {
+            for x in 0..hw {
+                assert_eq!(pu[r * hw + x], avg(&src_u, r, x), "U ({x},{r})");
+                assert_eq!(pv[r * hw + x], avg(&src_v, r, x), "V ({x},{r})");
+            }
+        }
         let (qy, qu, qv) = planar(&ay, &ac);
         assert_eq!(qy, ray[..w * h].to_vec());
         assert_eq!((qu, qv), (rau.clone(), rav.clone()));
@@ -671,6 +704,47 @@ mod tests {
         );
         combine_chroma_v1_to_yuv444(&ray, &rau, &rav, w, hw, hw, &mut du, &mut dv, w, w, w, h);
         assert_eq!((dy, du, dv), (src_y, src_u, src_v));
+    }
+
+    /// FreeRDP's 4:4:4 to RGB step (`general_YUV444ToRGB_DOUBLE_ROW`, same
+    /// rule in its SSE path) rebuilds the even-row, even-column chroma sample
+    /// from the main view as `4 * main - (other 3)` when that differs by 30
+    /// or more. With the averaged main view a strong colour edge comes back
+    /// within rounding and a weak one keeps the 4:2:0 error (below 30); a
+    /// point sample is turned further off (blue on white: 0 instead of 90).
+    fn freerdp_rebuild(main: u8, others: [u8; 3]) -> u8 {
+        let sub: i32 = others.iter().map(|&o| i32::from(o)).sum();
+        let out = (4 * i32::from(main) - sub).clamp(0, 255) as u8;
+        if out.abs_diff(main) < 30 {
+            main
+        } else {
+            out
+        }
+    }
+
+    #[test]
+    fn averaged_main_chroma_survives_the_freerdp_rebuild() {
+        // Blue text on white, the edge in one 2x2 block: one sample 90, the
+        // others 128 (and the reverse).
+        // (sample, other three, error with the average, error with a point sample)
+        for (u00, rest, avg_err, point_err) in [
+            (90u8, 128u8, 29u8, 90u8),
+            (200, 128, 0, 55),
+            (128, 40, 0, 127),
+            (0, 255, 0, 0),
+        ] {
+            let mut p = Avc444Planes::new(16, 16);
+            {
+                let (_, u, _) = p.yuv444_mut();
+                u.fill(rest);
+                u[0] = u00;
+            }
+            let (mut y, mut c) = (vec![0u8; 16 * 16], vec![0u8; 16 * 8]);
+            p.fill_main(&mut y, 16, &mut c, 16);
+            let got = freerdp_rebuild(c[0], [rest; 3]).abs_diff(u00);
+            assert_eq!(got, avg_err, "u00 {u00} rest {rest}");
+            assert_eq!(freerdp_rebuild(u00, [rest; 3]).abs_diff(u00), point_err);
+        }
     }
 
     #[test]
