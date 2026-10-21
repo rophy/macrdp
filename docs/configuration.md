@@ -43,10 +43,10 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --max-client-size WxH     Cap the resolution a client can request on the
                           auto-adopt path (e.g. 2560x1440). A request above the
                           cap is clamped per-dimension and the session is served
-                          at the clamped size. Defense-in-depth resource bound:
-                          without it an authenticated client can request up to
-                          the protocol maximum 8192x8192 — a ~256 MB framebuffer
-                          per frame. Each dimension must be in [200, 8192]. No
+                          at the clamped size. Default 3840x2160: a larger H.264
+                          picture is above level 5.2, which decoders take (FreeRDP
+                          showed a broken picture at 5120x2880). Each dimension
+                          must be in [200, 8192]. No
                           effect with --no-client-resolution or an explicit
                           --width/--height/--hidpi/--virtual-display (those pin
                           the size). Config key: MAX_CLIENT_SIZE.
@@ -463,7 +463,7 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 | `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with H.264 (the default), 15 with `--no-h264` |
 | `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default automatic from the session size (22 Mbps at 1280x720@60); adaptive below it by default, `--no-adaptive-bitrate` (`ADAPTIVE_BITRATE=0`) for a fixed rate |
 | `resolution` / `hidpi_scale` | `--hidpi` | `HIDPI` | Backing (Retina) pixels of the primary display |
-| `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default; `--stretch` fills instead of letterboxing |
+| `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default, up to 3840x2160 as in v1; `--stretch` fills instead of letterboxing |
 | `encoder` | (default) / `--no-h264` | `ENABLE_H264` | H.264 (VideoToolbox, hardware) is the default; `--no-h264` / `ENABLE_H264=0` serves legacy bitmaps / RemoteFX only |
 | `quality` | none | | Use `--bitrate` |
 | `chroma_mode` | `--avc444` | `AVC444=1` | Default AVC420 (as v1); AVC444 only to clients that negotiate it |
