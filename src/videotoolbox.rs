@@ -74,6 +74,8 @@ pub struct Encoder {
     /// the client feeds both views to one H.264 decoder (FreeRDP
     /// `avc444_decompress`), so they must be one stream. `None` for AVC420.
     avc444: Option<Box<crate::avc444::Avc444Planes>>,
+    /// Interleaved 4:4:4 scratch of the AVC444 color conversion.
+    yuv_scratch: Vec<u8>,
 }
 
 /// Periodic keyframe (IDR) interval in frames for `keyframe_secs` seconds at
@@ -150,6 +152,7 @@ impl Encoder {
             fps,
             full_range,
             avc444,
+            yuv_scratch: Vec::new(),
         })
     }
 
@@ -233,22 +236,28 @@ impl Encoder {
                 usize::from(self.width),
                 usize::from(self.height),
                 planes,
+                &mut self.yuv_scratch,
             );
-            planes.split();
             let (w, h) = (planes.width(), planes.height());
-            let main = planes.main();
-            ffi::encode_yuv420(&self.inner, w, h, main, pts, self.fps, force_keyframe)?;
-            // The auxiliary view follows its main view; a forced keyframe is
-            // the main view, so the periodic keyframes stay on main views too.
-            let aux = planes.aux();
-            return ffi::encode_yuv420(
+            ffi::encode_nv12(
                 &self.inner,
                 w,
                 h,
-                aux,
+                pts,
+                self.fps,
+                force_keyframe,
+                |y, ys, c, cs| planes.fill_main(y, ys, c, cs),
+            )?;
+            // The auxiliary view follows its main view; a forced keyframe is
+            // the main view, so the periodic keyframes stay on main views too.
+            return ffi::encode_nv12(
+                &self.inner,
+                w,
+                h,
                 pts.wrapping_add(1),
                 self.fps,
                 false,
+                |y, ys, c, cs| planes.fill_aux(y, ys, c, cs),
             );
         }
         let pts = self.next_pts;
@@ -831,6 +840,7 @@ mod ffi {
     const K_VIMAGE_NO_FLAGS: u32 = 0;
     const K_VIMAGE_ARGB8888: u32 = 0; // vImageARGBType::kvImageARGB8888
     const K_VIMAGE_420YP8_CBCR8: u32 = 4; // vImageYpCbCrType::kvImage420Yp8_CbCr8
+    const K_VIMAGE_444CRYPCB8: u32 = 6; // vImageYpCbCrType::kvImage444CrYpCb8 ('v308')
 
     #[link(name = "Accelerate", kind = "framework")]
     extern "C" {
@@ -852,6 +862,20 @@ mod ffi {
             permute_map: *const u8,
             flags: u32,
         ) -> isize;
+        fn vImageConvert_ARGB8888To444CrYpCb8(
+            src: *const VImageBuffer,
+            dest: *const VImageBuffer,
+            info: *const VImageArgbToYpCbCr,
+            permute_map: *const u8,
+            flags: u32,
+        ) -> isize;
+        fn vImageConvert_RGB888toPlanar8(
+            rgb_src: *const VImageBuffer,
+            red_dest: *const VImageBuffer,
+            green_dest: *const VImageBuffer,
+            blue_dest: *const VImageBuffer,
+            flags: u32,
+        ) -> isize;
     }
 
     /// The conversion descriptor (709 + full-range, ARGB8888 -> NV12). Constant,
@@ -859,7 +883,20 @@ mod ffi {
     /// threads. `None` if generation failed (then callers fall back to scalar).
     fn vimage_conv_info() -> Option<&'static VImageArgbToYpCbCr> {
         static INFO: std::sync::OnceLock<Option<VImageArgbToYpCbCr>> = std::sync::OnceLock::new();
-        INFO.get_or_init(|| {
+        INFO.get_or_init(|| vimage_generate(K_VIMAGE_420YP8_CBCR8))
+            .as_ref()
+    }
+
+    /// The same descriptor for BGRA -> interleaved 4:4:4 Cr Y Cb (AVC444).
+    fn vimage_conv_info_444() -> Option<&'static VImageArgbToYpCbCr> {
+        static INFO: std::sync::OnceLock<Option<VImageArgbToYpCbCr>> = std::sync::OnceLock::new();
+        INFO.get_or_init(|| vimage_generate(K_VIMAGE_444CRYPCB8))
+            .as_ref()
+    }
+
+    /// BT.709 full-range conversion descriptor from ARGB8888 to `out_type`.
+    fn vimage_generate(out_type: u32) -> Option<VImageArgbToYpCbCr> {
+        {
             let range = VImageYpCbCrPixelRange {
                 yp_bias: 0,
                 cbcr_bias: 128,
@@ -877,13 +914,82 @@ mod ffi {
                     &range,
                     &mut info,
                     K_VIMAGE_ARGB8888,
-                    K_VIMAGE_420YP8_CBCR8,
+                    out_type,
                     K_VIMAGE_NO_FLAGS,
                 )
             };
             (err == 0).then_some(info)
-        })
-        .as_ref()
+        }
+    }
+
+    /// BGRA -> full-range BT.709 YUV444 planes with vImage: one conversion to
+    /// interleaved Cr Y Cb (`scratch`, 3 bytes per pixel, resized here), then
+    /// one split into the planes. About 3x cheaper than three
+    /// `vImageMatrixMultiply` passes (one per plane). `Err` if vImage cannot
+    /// do this frame; callers fall back to the scalar path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bgra_to_yuv444_planar_v308(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        scratch: &mut Vec<u8>,
+        y_plane: &mut [u8],
+        cb_plane: &mut [u8],
+        cr_plane: &mut [u8],
+        plane_stride: usize,
+    ) -> Result<()> {
+        let info =
+            vimage_conv_info_444().ok_or_else(|| anyhow!("vImage 444 conv-info unavailable"))?;
+        if y_plane.len() < plane_stride * height
+            || cb_plane.len() < plane_stride * height
+            || cr_plane.len() < plane_stride * height
+            || plane_stride < width
+            || bgra.len() < src_stride * height
+        {
+            bail!("YUV444 planes too small");
+        }
+        scratch.resize(width * 3 * height, 0);
+        let src = VImageBuffer {
+            data: bgra.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: src_stride,
+        };
+        let packed = VImageBuffer {
+            data: scratch.as_mut_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: width * 3,
+        };
+        let plane = |p: &mut [u8]| VImageBuffer {
+            data: p.as_mut_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: plane_stride,
+        };
+        let (cr, y, cb) = (plane(cr_plane), plane(y_plane), plane(cb_plane));
+        // Source is BGRA; vImage's ARGB8888 is A,R,G,B (see the NV12 path).
+        let permute: [u8; 4] = [3, 2, 1, 0];
+        let err = unsafe {
+            vImageConvert_ARGB8888To444CrYpCb8(
+                &src,
+                &packed,
+                info,
+                permute.as_ptr(),
+                K_VIMAGE_NO_FLAGS,
+            )
+        };
+        if err != 0 {
+            bail!("vImageConvert_ARGB8888To444CrYpCb8 failed: {err}");
+        }
+        // 'v308' byte order is Cr, Y, Cb: the "R", "G", "B" of RGB888.
+        let err =
+            unsafe { vImageConvert_RGB888toPlanar8(&packed, &cr, &y, &cb, K_VIMAGE_NO_FLAGS) };
+        if err != 0 {
+            bail!("vImageConvert_RGB888toPlanar8 failed: {err}");
+        }
+        Ok(())
     }
 
     /// vImage equivalent of `bgra_to_nv12_full_range`. `Err` if vImage isn't
@@ -982,6 +1088,7 @@ mod ffi {
         }
     }
 
+    #[cfg(test)]
     extern "C" {
         /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
         /// per output plane. The matrix is `int16_t[4]` in source byte order; we
@@ -1005,22 +1112,30 @@ mod ffi {
     /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
     /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
     /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
+    #[cfg(test)]
     const DIVISOR: i32 = 16384; // 2^14
 
     // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
+    #[cfg(test)]
     const Y_MATRIX: [i16; 4] = [1183, 11718, 3483, 0]; // 0.0722, 0.7152, 0.2126, 0
+    #[cfg(test)]
     const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
 
     // Cb plane coefficients + 128*Q14 bias to recenter.
+    #[cfg(test)]
     const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
+    #[cfg(test)]
     const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     // Cr plane.
+    #[cfg(test)]
     const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
+    #[cfg(test)]
     const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
     /// `vImageMatrixMultiply_ARGB8888ToPlanar8` calls (one per plane).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_vimage(
         bgra: &[u8],
@@ -1078,36 +1193,30 @@ mod ffi {
         width: usize,
         height: usize,
         planes: &mut crate::avc444::Avc444Planes,
+        scratch: &mut Vec<u8>,
     ) {
         let pw = planes.width();
         let (y, u, v) = planes.yuv444_mut();
-        if bgra_to_yuv444_planar_vimage(bgra, stride, width, height, y, pw, u, pw, v, pw).is_err() {
+        if bgra_to_yuv444_planar_v308(bgra, stride, width, height, scratch, y, u, v, pw).is_err() {
             bgra_to_yuv444_planar_scalar(bgra, stride, width, height, y, pw, u, pw, v, pw);
         }
         planes.pad_edges(width, height);
     }
 
-    /// Submit one planar YUV420 picture (`width` x `height`, Y stride `width`,
-    /// U/V stride `width / 2`) as a full-range NV12 frame. Used for the two
-    /// AVC444 views; the auxiliary view carries chroma samples in its Y
-    /// plane, so the buffer must be full range (`420f`) to keep 0-255.
-    pub(super) fn encode_yuv420(
+    /// Submit one full-range NV12 (`420f`) picture of `width` x `height` that
+    /// `fill` writes into the pixel buffer: `fill(y, y_stride, cbcr,
+    /// cbcr_stride)`. Used for the two AVC444 views; the auxiliary view
+    /// carries chroma samples in its Y plane, so the buffer must be full range
+    /// to keep 0-255.
+    pub(super) fn encode_nv12(
         guard: &SessionGuard,
         width: usize,
         height: usize,
-        planes: (&[u8], &[u8], &[u8]),
         pts: i64,
         fps: u32,
         force_keyframe: bool,
+        fill: impl FnOnce(&mut [u8], usize, &mut [u8], usize),
     ) -> Result<()> {
-        let (src_y, src_u, src_v) = planes;
-        let half_w = width / 2;
-        if src_y.len() < width * height
-            || src_u.len() < half_w * (height / 2)
-            || src_v.len() < half_w * (height / 2)
-        {
-            bail!("YUV420 planes too small for {width}x{height}");
-        }
         let mut pbuf: CVPixelBufferRef = ptr::null();
         let status = unsafe {
             CVPixelBufferCreate(
@@ -1130,19 +1239,7 @@ mod ffi {
             let c_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
             let y_plane = std::slice::from_raw_parts_mut(y_base, y_stride * height);
             let c_plane = std::slice::from_raw_parts_mut(c_base, c_stride * (height / 2));
-            for row in 0..height {
-                y_plane[row * y_stride..row * y_stride + width]
-                    .copy_from_slice(&src_y[row * width..(row + 1) * width]);
-            }
-            for row in 0..height / 2 {
-                let dst = &mut c_plane[row * c_stride..row * c_stride + half_w * 2];
-                let u = &src_u[row * half_w..(row + 1) * half_w];
-                let v = &src_v[row * half_w..(row + 1) * half_w];
-                for ((d, &cb), &cr) in dst.chunks_exact_mut(2).zip(u).zip(v) {
-                    d[0] = cb;
-                    d[1] = cr;
-                }
-            }
+            fill(y_plane, y_stride, c_plane, c_stride);
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
             submit(guard, pbuf, pts, fps, force_keyframe)
         };
@@ -1904,5 +2001,56 @@ mod tests {
         let sps = &frames[0].parameter_sets[0];
         assert_eq!(sps[0] & 0x1f, 7, "first parameter set is the SPS");
         Ok(())
+    }
+
+    /// The vImage 4:4:4 conversion (AVC444) matches the scalar BT.709
+    /// full-range reference within rounding.
+    #[test]
+    fn v308_yuv444_matches_scalar() {
+        use super::ffi::{bgra_to_yuv444_planar_scalar, bgra_to_yuv444_planar_v308};
+        let (w, h) = (37usize, 11usize);
+        let stride = w * 4 + 12;
+        let mut bgra = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = &mut bgra[y * stride + x * 4..][..4];
+                p[0] = (x * 7 + y * 3) as u8;
+                p[1] = (x * 13 + 50) as u8;
+                p[2] = (y * 23 + x) as u8;
+                p[3] = 0xff;
+            }
+        }
+        let ps = w + 3;
+        let (mut ys, mut us, mut vs) = (vec![0u8; ps * h], vec![0u8; ps * h], vec![0u8; ps * h]);
+        let (mut yv, mut uv, mut vv) = (vec![0u8; ps * h], vec![0u8; ps * h], vec![0u8; ps * h]);
+        bgra_to_yuv444_planar_scalar(&bgra, stride, w, h, &mut ys, ps, &mut us, ps, &mut vs, ps);
+        let mut scratch = Vec::new();
+        bgra_to_yuv444_planar_v308(
+            &bgra,
+            stride,
+            w,
+            h,
+            &mut scratch,
+            &mut yv,
+            &mut uv,
+            &mut vv,
+            ps,
+        )
+        .expect("vImage 4:4:4 conversion");
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * ps + x;
+                for (a, b, n) in [
+                    (ys[i], yv[i], "Y"),
+                    (us[i], uv[i], "Cb"),
+                    (vs[i], vv[i], "Cr"),
+                ] {
+                    assert!(
+                        (i32::from(a) - i32::from(b)).abs() <= 2,
+                        "{n} at ({x},{y}): scalar {a} vImage {b}"
+                    );
+                }
+            }
+        }
     }
 }

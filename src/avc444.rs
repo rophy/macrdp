@@ -7,13 +7,13 @@
 //! full-resolution YUV444 frame for display.
 //!
 //! - [`split_yuv444_to_yuv420_v1`] does the *encoder* side — full-res YUV444 →
-//!   main + auxiliary YUV420.
+//!   main + auxiliary YUV420 (planar; the reference of the tests).
 //! - [`combine_luma_to_yuv444`] / [`combine_chroma_v1_to_yuv444`] do the
 //!   *decoder* side (tests only). Both must be applied (luma first, then
 //!   chroma) to fully reconstruct YUV444.
-//! - [`Avc444Planes`] holds the buffers of one frame for the encoder
-//!   (`videotoolbox.rs`): the YUV444 picture padded to whole macroblocks and
-//!   the two views made from it.
+//! - [`Avc444Planes`] holds the YUV444 picture of one frame for the encoder
+//!   (`videotoolbox.rs`), padded to whole macroblocks, and writes the two views
+//!   into its NV12 buffers. The split above is its reference (tests).
 //!
 //! The combine functions are ported essentially verbatim from FreeRDP's
 //! `general_LumaToYUV444` / `general_ChromaV1ToYUV444`
@@ -41,6 +41,7 @@
 /// `padHeigth = height + 16 - height % 16`. Adds 16 when already aligned, which
 /// is intentional padding margin — B4/B5 packing only writes through `height`
 /// odd rows, so the over-allocation is just unused space.
+#[cfg(test)]
 pub fn padded_aux_height(height: usize) -> usize {
     height - height % 16 + 16
 }
@@ -51,9 +52,11 @@ pub fn align16(v: usize) -> usize {
 }
 
 /// One AVC444 frame on the encoder side: the full-range YUV444 picture at the
-/// size rounded up to whole macroblocks, and its main and auxiliary YUV420
-/// views (Y stride = width, U/V stride = width / 2). Allocated once per
-/// encoder and reused for every frame.
+/// size rounded up to whole macroblocks, from which the main and auxiliary
+/// views are written straight into the encoder's NV12 buffers
+/// ([`Avc444Planes::fill_main`], [`Avc444Planes::fill_aux`]; the same layout as
+/// [`split_yuv444_to_yuv420_v1`], without the planar copies). Allocated once
+/// per encoder and reused for every frame.
 ///
 /// The size is padded to multiples of 16 because the auxiliary view packs the
 /// odd chroma rows in 16-row blocks (B4/B5): with a height that is a multiple
@@ -65,12 +68,6 @@ pub struct Avc444Planes {
     y444: Vec<u8>,
     u444: Vec<u8>,
     v444: Vec<u8>,
-    main_y: Vec<u8>,
-    main_u: Vec<u8>,
-    main_v: Vec<u8>,
-    aux_y: Vec<u8>,
-    aux_u: Vec<u8>,
-    aux_v: Vec<u8>,
 }
 
 impl Avc444Planes {
@@ -79,19 +76,12 @@ impl Avc444Planes {
         let width = align16(src_width.max(1));
         let height = align16(src_height.max(1));
         let full = width * height;
-        let quarter = (width / 2) * (height / 2);
         Self {
             width,
             height,
             y444: vec![0; full],
             u444: vec![128; full],
             v444: vec![128; full],
-            main_y: vec![0; full],
-            main_u: vec![128; quarter],
-            main_v: vec![128; quarter],
-            aux_y: vec![128; width * padded_aux_height(height)],
-            aux_u: vec![128; quarter],
-            aux_v: vec![128; quarter],
         }
     }
 
@@ -135,52 +125,59 @@ impl Avc444Planes {
         }
     }
 
-    /// Make the main and auxiliary views from the YUV444 planes
-    /// ([`split_yuv444_to_yuv420_v1`]).
-    pub fn split(&mut self) {
+    /// Write the main view (B1: Y; B2/B3: U and V at even rows and columns,
+    /// interleaved as NV12 CbCr) into `y` (stride `y_stride`, `height()` rows)
+    /// and `cbcr` (stride `c_stride`, `height() / 2` rows).
+    pub fn fill_main(&self, y: &mut [u8], y_stride: usize, cbcr: &mut [u8], c_stride: usize) {
+        let w = self.width;
+        for (row, src) in self.y444.chunks_exact(w).enumerate() {
+            y[row * y_stride..row * y_stride + w].copy_from_slice(src);
+        }
+        self.fill_cbcr(cbcr, c_stride, 0);
+    }
+
+    /// Write the auxiliary view into `y` / `cbcr` (as [`Self::fill_main`]):
+    /// B4/B5, the odd rows of U then V in 8-row strips of each 16-row block,
+    /// as luma; B6/B7, U and V at even rows and odd columns, as chroma.
+    pub fn fill_aux(&self, y: &mut [u8], y_stride: usize, cbcr: &mut [u8], c_stride: usize) {
         let (w, h) = (self.width, self.height);
-        split_yuv444_to_yuv420_v1(
-            &self.y444,
-            &self.u444,
-            &self.v444,
-            w,
-            w,
-            w,
-            &mut self.main_y,
-            &mut self.main_u,
-            &mut self.main_v,
-            w,
-            w / 2,
-            w / 2,
-            &mut self.aux_y,
-            &mut self.aux_u,
-            &mut self.aux_v,
-            w,
-            w / 2,
-            w / 2,
-            w,
-            h,
-        );
+        for row in 0..h {
+            let (plane, k) = if row % 16 < 8 {
+                (&self.u444, 8 * (row / 16) + row % 16)
+            } else {
+                (&self.v444, 8 * (row / 16) + row % 16 - 8)
+            };
+            let pos = 2 * k + 1;
+            let dst = &mut y[row * y_stride..row * y_stride + w];
+            if pos < h {
+                dst.copy_from_slice(&plane[pos * w..(pos + 1) * w]);
+            } else {
+                dst.fill(128);
+            }
+        }
+        self.fill_cbcr(cbcr, c_stride, 1);
     }
 
-    /// Main view: Y, U, V.
-    pub fn main(&self) -> (&[u8], &[u8], &[u8]) {
-        (&self.main_y, &self.main_u, &self.main_v)
-    }
-
-    /// Auxiliary view: Y (the first `height()` rows are the picture), U, V.
-    pub fn aux(&self) -> (&[u8], &[u8], &[u8]) {
-        (
-            &self.aux_y[..self.width * self.height],
-            &self.aux_u,
-            &self.aux_v,
-        )
+    /// NV12 CbCr from U and V at even rows and the columns `2x + odd`.
+    fn fill_cbcr(&self, cbcr: &mut [u8], c_stride: usize, odd: usize) {
+        let w = self.width;
+        for row in 0..self.height / 2 {
+            let src = 2 * row * w;
+            let u = &self.u444[src..src + w];
+            let v = &self.v444[src..src + w];
+            let dst = &mut cbcr[row * c_stride..row * c_stride + w];
+            for (x, d) in dst.chunks_exact_mut(2).enumerate() {
+                d[0] = u[2 * x + odd];
+                d[1] = v[2 * x + odd];
+            }
+        }
     }
 }
 
 /// Split a full-resolution YUV444 frame into main + auxiliary YUV420 frames per
 /// [MS-RDPEGFX] §3.3.8.3.2 v1. All slices are tightly packed with the given
 /// strides; the caller is responsible for sizing them per the contract above.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn split_yuv444_to_yuv420_v1(
     src_y: &[u8],
@@ -615,10 +612,11 @@ mod tests {
         }
     }
 
-    /// With a 16-aligned height every packed auxiliary row lies inside the
-    /// encoded picture, and the views decode back to the source exactly.
+    /// The views written into NV12 buffers equal the planar views of
+    /// `split_yuv444_to_yuv420_v1` (the spec reference), and decode back to
+    /// the source exactly.
     #[test]
-    fn split_views_fit_the_encoded_picture() {
+    fn filled_views_match_the_reference_split() {
         let (w, h) = (64usize, 48usize);
         let mut p = Avc444Planes::new(w, h);
         let (src_y, src_u, src_v) = synthetic_yuv444(w, h);
@@ -628,35 +626,51 @@ mod tests {
             u.copy_from_slice(&src_u);
             v.copy_from_slice(&src_v);
         }
-        p.split();
-        // Rows beyond the picture keep the fill value: nothing was packed there.
-        assert!(p.aux_y[w * h..].iter().all(|&b| b == 128));
-        let (my, mu, mv) = p.main();
-        let (ay, au, av) = p.aux();
-        assert_eq!(ay.len(), w * h);
+        // NV12 with row padding, as CVPixelBuffer gives it.
+        let (ys, cs) = (w + 8, w + 8);
+        let mut my = vec![0u8; ys * h];
+        let mut mc = vec![0u8; cs * h / 2];
+        let mut ay = vec![0u8; ys * h];
+        let mut ac = vec![0u8; cs * h / 2];
+        p.fill_main(&mut my, ys, &mut mc, cs);
+        p.fill_aux(&mut ay, ys, &mut ac, cs);
+        let (hw, hh) = (w / 2, h / 2);
+        let (mut ry, mut ru, mut rv) = (vec![0u8; w * h], vec![0u8; hw * hh], vec![0u8; hw * hh]);
+        let mut ray = vec![0u8; w * padded_aux_height(h)];
+        let (mut rau, mut rav) = (vec![0u8; hw * hh], vec![0u8; hw * hh]);
+        split_yuv444_to_yuv420_v1(
+            &src_y, &src_u, &src_v, w, w, w, &mut ry, &mut ru, &mut rv, w, hw, hw, &mut ray,
+            &mut rau, &mut rav, w, hw, hw, w, h,
+        );
+        let planar = |y: &[u8], c: &[u8]| {
+            let mut py = vec![0u8; w * h];
+            let (mut pu, mut pv) = (vec![0u8; hw * hh], vec![0u8; hw * hh]);
+            for r in 0..h {
+                py[r * w..(r + 1) * w].copy_from_slice(&y[r * ys..r * ys + w]);
+            }
+            for r in 0..hh {
+                for x in 0..hw {
+                    pu[r * hw + x] = c[r * cs + 2 * x];
+                    pv[r * hw + x] = c[r * cs + 2 * x + 1];
+                }
+            }
+            (py, pu, pv)
+        };
+        let (py, pu, pv) = planar(&my, &mc);
+        assert_eq!((py, pu, pv), (ry.clone(), ru.clone(), rv.clone()));
+        let (qy, qu, qv) = planar(&ay, &ac);
+        assert_eq!(qy, ray[..w * h].to_vec());
+        assert_eq!((qu, qv), (rau.clone(), rav.clone()));
+        // Rows beyond the picture in the reference are untouched: nothing packed there.
+        assert!(ray[w * h..].iter().all(|&b| b == 0));
         let mut dy = vec![0u8; w * h];
         let mut du = vec![0u8; w * h];
         let mut dv = vec![0u8; w * h];
         combine_luma_to_yuv444(
-            my,
-            mu,
-            mv,
-            w,
-            w / 2,
-            w / 2,
-            &mut dy,
-            &mut du,
-            &mut dv,
-            w,
-            w,
-            w,
-            w,
-            h,
+            &ry, &ru, &rv, w, hw, hw, &mut dy, &mut du, &mut dv, w, w, w, w, h,
         );
-        combine_chroma_v1_to_yuv444(ay, au, av, w, w / 2, w / 2, &mut du, &mut dv, w, w, w, h);
-        assert_eq!(dy, src_y);
-        assert_eq!(du, src_u);
-        assert_eq!(dv, src_v);
+        combine_chroma_v1_to_yuv444(&ray, &rau, &rav, w, hw, hw, &mut du, &mut dv, w, w, w, h);
+        assert_eq!((dy, du, dv), (src_y, src_u, src_v));
     }
 
     #[test]
