@@ -75,7 +75,7 @@ use tracing::{debug, info, trace, warn};
 use crate::bitrate_level::BitrateLevel;
 use crate::frame_window::FrameWindow;
 use crate::refine::{self, Refine, RefineGate, Regions};
-use crate::videotoolbox::{EncodedFrame, Encoder};
+use crate::videotoolbox::{CapturePixelBuffer, EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
 /// backpressure gate while the client's frame-ack lag is over the threshold.
@@ -2266,6 +2266,8 @@ impl Gfx {
     /// `changed` is the tiles in which this frame differs from the one given
     /// before (`crate::refine::diff_copy`), for lossless refinement; `None`
     /// counts as all changed. `dims` is the size of `bgra` in pixels.
+    /// `pixel_buffer` is the capture buffer behind `bgra`, if there is one:
+    /// AVC420 then encodes from it without a copy.
     pub fn submit_bgra(
         &self,
         bgra: &[u8],
@@ -2273,6 +2275,7 @@ impl Gfx {
         request_keyframe: bool,
         changed: Option<&refine::TileGrid>,
         dims: (u16, u16),
+        pixel_buffer: Option<CapturePixelBuffer>,
     ) -> Result<bool> {
         // Lossless refinement: the tiles this frame changed stay marked until
         // a frame is encoded, also when this one is dropped below.
@@ -2782,7 +2785,14 @@ impl Gfx {
                 None
             };
             let pts = encoder.next_pts();
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            match pixel_buffer {
+                // AVC420 at the encoder size: VideoToolbox takes the capture
+                // buffer as it is (no copy, no CPU color conversion).
+                Some(pb) if !encoder.is_avc444() && encoder.dims() == dims => {
+                    encoder.encode_pixel_buffer(pb.0, force_keyframe)?
+                }
+                _ => encoder.encode_bgra(bgra, stride, force_keyframe)?,
+            }
             if let Some(regions) = regions {
                 ctx.refine.lock().unwrap().on_encoded(pts, regions);
             }

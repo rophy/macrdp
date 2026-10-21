@@ -43,6 +43,12 @@ pub struct EncodedFrame {
     pub parameter_sets: Vec<Vec<u8>>,
 }
 
+/// A capture `CVPixelBufferRef` (32-bit BGRA) that holds the same pixels as
+/// the BGRA slice given with it; see [`Encoder::encode_pixel_buffer`]. It is
+/// valid while the caller holds the capture sample.
+#[derive(Clone, Copy, Debug)]
+pub struct CapturePixelBuffer(pub *const c_void);
+
 pub struct Encoder {
     inner: ffi::SessionGuard,
     /// VideoToolbox output channel. `Option` because the push pipeline
@@ -140,8 +146,14 @@ impl Encoder {
         };
         let views = if avc444.is_some() { 2 } else { 1 };
         let keyframe_frames = keyframe_frames(fps, keyframe_secs).saturating_mul(views);
-        let session =
-            ffi::create_session(session_w, session_h, bitrate_bps, keyframe_frames, tx_ptr)?;
+        let session = ffi::create_session(
+            session_w,
+            session_h,
+            bitrate_bps,
+            keyframe_frames,
+            tx_ptr,
+            full_range,
+        )?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -276,6 +288,44 @@ impl Encoder {
             force_keyframe,
             self.full_range,
         )
+    }
+
+    /// Submit the capture buffer itself (a `CVPixelBufferRef` of
+    /// `kCVPixelFormatType_32BGRA`, the size of this encoder) without a copy
+    /// or a CPU color conversion: VideoToolbox converts it to the session's
+    /// source format (full-range NV12, see `ffi::create_session`) and keeps a
+    /// reference until the frame is encoded. AVC420 only; for AVC444 (and for
+    /// a frame of another size) use [`Encoder::encode_bgra`].
+    pub fn encode_pixel_buffer(
+        &mut self,
+        pixel_buffer: *const c_void,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        if self.avc444.is_some() {
+            bail!("encode_pixel_buffer: AVC444 needs encode_bgra");
+        }
+        if pixel_buffer.is_null() {
+            bail!("encode_pixel_buffer: null pixel buffer");
+        }
+        // The capture buffer carries the display's color space (an ICC
+        // profile). With it VideoToolbox color-matches the display RGB to
+        // BT.709 and the mid-tones come out darker (gray 117 -> 106 in
+        // mstsc). Remove it: the pixels are encoded as they are, as the
+        // CPU conversion (`bgra_to_nv12_full_range`) does.
+        // SAFETY: a valid CVPixelBuffer from the caller; VT retains it for
+        // the encode, the caller keeps its own reference.
+        unsafe {
+            ffi::CVBufferRemoveAttachment(pixel_buffer, ffi::kCVImageBufferCGColorSpaceKey);
+            ffi::CVBufferRemoveAttachment(pixel_buffer, ffi::kCVImageBufferICCProfileKey);
+        }
+        let pts = self.next_pts;
+        self.next_pts = self.next_pts.wrapping_add(1);
+        unsafe { ffi::submit(&self.inner, pixel_buffer, pts, self.fps, force_keyframe) }
+    }
+
+    /// Frame size this encoder takes (`width`, `height`).
+    pub fn dims(&self) -> (u16, u16) {
+        (self.width, self.height)
     }
 
     /// Pull every encoded frame the callback has produced so far.
@@ -430,6 +480,10 @@ mod ffi {
         pub(super) static kCVImageBufferTransferFunction_ITU_R_709_2: CFStringRef;
         pub(super) static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
         pub(super) static kCFBooleanTrue: CFBooleanRef;
+        pub(super) static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+        pub(super) static kCVImageBufferCGColorSpaceKey: CFStringRef;
+        pub(super) static kCVImageBufferICCProfileKey: CFStringRef;
+        pub(super) fn CVBufferRemoveAttachment(buffer: CVPixelBufferRef, key: CFStringRef);
         pub(super) static kCFBooleanFalse: CFBooleanRef;
 
         // CFDictionary creation for VT frame-properties payloads.
@@ -574,8 +628,18 @@ mod ffi {
         bitrate_bps: u32,
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
+        full_range: bool,
     ) -> Result<SessionGuard> {
         let mut session: VTCompressionSessionRef = ptr::null();
+        // Full range: the session takes `420f` buffers. A BGRA buffer (the
+        // capture buffer, see `Encoder::encode_pixel_buffer`) is then
+        // converted by VideoToolbox itself to full-range NV12, on the GPU,
+        // with the same result as `bgra_to_nv12_full_range` (+-1).
+        let source_attrs = if full_range {
+            pixel_format_attrs(K_CV_PIXEL_FORMAT_TYPE_420F)?
+        } else {
+            ptr::null()
+        };
         let status = unsafe {
             VTCompressionSessionCreate(
                 ptr::null(),
@@ -583,13 +647,16 @@ mod ffi {
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
                 ptr::null(),
-                ptr::null(),
+                source_attrs,
                 ptr::null(),
                 Some(output_callback),
                 tx_ctx,
                 &mut session,
             )
         };
+        if !source_attrs.is_null() {
+            unsafe { CFRelease(source_attrs) };
+        }
         if status != 0 || session.is_null() {
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
         }
@@ -702,6 +769,36 @@ mod ffi {
             kVTCompressionPropertyKey_MaxKeyFrameInterval,
             keyframe_frames.max(1) as i32,
         )
+    }
+
+    /// `{kCVPixelBufferPixelFormatTypeKey: format}`, the source image buffer
+    /// attributes of a session. The caller releases it.
+    fn pixel_format_attrs(format: OSType) -> Result<CFDictionaryRef> {
+        let value = format as i32;
+        unsafe {
+            let number = CFNumberCreate(
+                ptr::null(),
+                KCF_NUMBER_INT32_TYPE,
+                &value as *const i32 as *const c_void,
+            );
+            if number.is_null() {
+                bail!("CFNumberCreate returned null");
+            }
+            let key = kCVPixelBufferPixelFormatTypeKey;
+            let dict = CFDictionaryCreate(
+                ptr::null(),
+                &key as *const *const c_void,
+                &number as *const *const c_void,
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            );
+            CFRelease(number);
+            if dict.is_null() {
+                bail!("CFDictionaryCreate returned null");
+            }
+            Ok(dict)
+        }
     }
 
     unsafe fn set_bool(
@@ -1266,7 +1363,7 @@ mod ffi {
 
     /// Hand a filled pixel buffer to the session (async; output arrives in
     /// `output_callback`). The caller keeps and releases its reference.
-    unsafe fn submit(
+    pub(super) unsafe fn submit(
         guard: &SessionGuard,
         pbuf: CVPixelBufferRef,
         pts: i64,
@@ -1985,6 +2082,54 @@ mod tests {
             "keyframe should carry SPS/PPS parameter sets"
         );
         Ok(())
+    }
+
+    /// A BGRA `CVPixelBuffer` (as the capture gives) goes to the session as
+    /// it is and comes out as a keyframe with parameter sets; AVC444 refuses
+    /// it (its views need the CPU split).
+    #[test]
+    fn encodes_a_bgra_pixel_buffer_without_a_copy() -> Result<()> {
+        use super::ffi::{
+            CFRelease, CVPixelBufferCreate, CVPixelBufferGetBaseAddress,
+            CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress,
+            CVPixelBufferUnlockBaseAddress, K_CV_PIXEL_FORMAT_TYPE_32_BGRA,
+        };
+        let (w, h): (u16, u16) = (320, 240);
+        let mut pbuf: *const c_void = std::ptr::null();
+        let status = unsafe {
+            CVPixelBufferCreate(
+                std::ptr::null(),
+                w.into(),
+                h.into(),
+                K_CV_PIXEL_FORMAT_TYPE_32_BGRA,
+                std::ptr::null(),
+                &mut pbuf,
+            )
+        };
+        assert_eq!(status, 0);
+        unsafe {
+            CVPixelBufferLockBaseAddress(pbuf, 0);
+            let base = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRow(pbuf);
+            std::slice::from_raw_parts_mut(base, stride * usize::from(h)).fill(0x80);
+            CVPixelBufferUnlockBaseAddress(pbuf, 0);
+        }
+        let pb = CapturePixelBuffer(pbuf);
+        let result = (|| {
+            let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, false)?;
+            assert_eq!(enc.dims(), (w, h));
+            enc.encode_pixel_buffer(pb.0, false)?;
+            enc.encode_pixel_buffer(pb.0, false)?;
+            let frames = enc.flush()?;
+            assert_eq!(frames.len(), 2);
+            assert!(frames[0].is_keyframe && !frames[0].parameter_sets.is_empty());
+            assert_eq!(frames.iter().map(|f| f.pts).collect::<Vec<_>>(), [0, 1]);
+            let mut avc444 = Encoder::new(w, h, 30, 4_000_000, 5.0, true)?;
+            assert!(avc444.encode_pixel_buffer(pb.0, false).is_err());
+            Ok(())
+        })();
+        unsafe { CFRelease(pbuf) };
+        result
     }
 
     /// AVC444: each frame gives two encoded views from the one session, main

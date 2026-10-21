@@ -1188,7 +1188,13 @@ mod macos {
                 // source scales to the output either way; `preserves_aspect_ratio`
                 // is the knob that picks letterbox vs stretch.
                 .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(letterbox);
+                .with_preserves_aspect_ratio(letterbox)
+                // The H.264 encoder keeps the capture buffers it encodes (no
+                // copy, see `Gfx::submit_bgra`): next to the frames queued
+                // for this loop and the one in hand, up to
+                // `--h264-frames-in-flight` more stay in use. The default
+                // pool of 3 would make SCK skip frames; 8 is the SCK maximum.
+                .with_queue_depth(8);
 
             let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
             stream
@@ -1546,6 +1552,7 @@ mod macos {
                                         true,
                                         None,
                                         self.held_dims,
+                                        None,
                                     ) {
                                         Ok(true) => {
                                             self.held_frame = false;
@@ -1604,6 +1611,7 @@ mod macos {
                                             false,
                                             Some(&same),
                                             self.last_dims,
+                                            None,
                                         ) {
                                             tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                         }
@@ -1777,6 +1785,9 @@ mod macos {
                         big_change || resume_keyframe,
                         changed.as_ref(),
                         (pb_width, pb_height),
+                        Some(crate::videotoolbox::CapturePixelBuffer(
+                            pixel_buffer.as_ptr().cast_const(),
+                        )),
                     ) {
                         Ok(true) => {
                             self.held_frame = false;
