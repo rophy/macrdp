@@ -261,6 +261,14 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           chunks of about 64 KB, ZGFX-compressed, one at a time.
                           Costs a burst of data and some CPU after each change.
                           Config: LOSSLESS_TEXT=0.
+--avc444                  Send H.264 as AVC444 (MS-RDPEGFX 2.2.4.5, full 4:4:4
+                          chroma) to a client whose negotiated EGFX capabilities
+                          allow it (V10 and later without AVC_DISABLED: mstsc,
+                          FreeRDP /gfx:AVC444); other clients get AVC420. Colored
+                          text and thin colored lines keep their color in H.264
+                          frames. Each frame is encoded twice (a luma and a chroma
+                          view), so encoder time and bitrate go up to 2x. Default
+                          off. Config: AVC444=1.
 --idle-timeout SECS       Disconnect the client after SECS seconds without keyboard
                           or mouse input (default 0 = off). The client gets a Set
                           Error Info PDU with ERRINFO_IDLE_TIMEOUT, so mstsc shows
@@ -458,7 +466,7 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 | `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default; `--stretch` fills instead of letterboxing |
 | `encoder` | (default) / `--no-h264` | `ENABLE_H264` | H.264 (VideoToolbox, hardware) is the default; `--no-h264` / `ENABLE_H264=0` serves legacy bitmaps / RemoteFX only |
 | `quality` | none | | Use `--bitrate` |
-| `chroma_mode` | none | | AVC420 only (no AVC444) |
+| `chroma_mode` | `--avc444` | `AVC444=1` | Default AVC420 (as v1); AVC444 only to clients that negotiate it |
 | `lossless_text` | `--no-lossless-text` to turn off | `LOSSLESS_TEXT=0` | Default on (H.264 only) |
 | `ctrl_as_cmd` | `--ctrl-as-cmd` | `CTRL_AS_CMD` | `--map-ctrl-to-cmd` remaps only editing shortcuts |
 | `wifi_keep_awake` | `--no-wifi-keep-awake` to turn off | `WIFI_KEEP_AWAKE=0` | Default on |

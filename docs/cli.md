@@ -498,6 +498,10 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   200 ms after the screen stops changing, the changed
                           #   tiles with few colors (text, UI) go again as ClearCodec
                           #   (lossless). Config key: LOSSLESS_TEXT=0.
+--avc444                  # Send H.264 as AVC444 (full chroma) to clients that negotiate
+                          #   it (mstsc, FreeRDP /gfx:AVC444); others get AVC420.
+                          #   Default OFF: two encodes per frame, up to 2x the bitrate.
+                          #   Config key: AVC444=1.
 --idle-timeout SECS       # Disconnect the client after SECS s without keyboard or mouse
                           #   input (default 0 = off); the client is told
                           #   ERRINFO_IDLE_TIMEOUT. Config key: IDLE_TIMEOUT_SECS.
