@@ -607,6 +607,39 @@ xfreerdp /v:127.0.0.1:3390 /u:$USER /cert:ignore /log-level:DEBUG
 
 When iterating on the capture/encode path, prefer FreeRDP with `/log-level:DEBUG` — its PDU traces are far more useful than mstsc's silent failures.
 
+### End-to-end test (`tests/e2e_test.sh`)
+
+A FreeRDP smoke test that runs from a Linux machine (FreeRDP 3 with H.264, `xvfb-run`;
+`xclip` for the clipboard test) against a running server. Start the server for it with:
+```bash
+macrdp --enable-h264 --bind 0.0.0.0:3390 --username "$USER" --password-file ~/.macrdp-pw \
+       --log-dir /tmp/macrdp-e2e --idle-timeout 30       # --idle-timeout only for test 11
+```
+Then on the Linux machine:
+```bash
+MACRDP_USER=<mac user> MACRDP_PASS_FILE=<file with the password> \
+MACRDP_MAC_SHELL="ssh <mac user>@<mac> sh" MACRDP_LOG=/tmp/macrdp-e2e/macrdp.log \
+MACRDP_IDLE_TIMEOUT=30 tests/e2e_test.sh <mac> 3390
+```
+`--keychain` instead of `--password-file` works too (the password then comes from the
+Keychain). The password goes to FreeRDP on stdin (`/args-from:stdin`), never on a command line.
+Tests: TCP connect; NLA login (`/auth-only`); a wrong password gets
+`ERRCONNECT_LOGON_FAILURE` (STATUS_LOGON_FAILURE, so mstsc asks again); a client without
+AVC gets legacy bitmap updates (EGFX declined); an AVC420 client gets H.264 frames; session
+takeover (the first client gets `ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION`); TLS-only with
+an empty password is rejected; `/audio-mode:2` does not start rdpsnd; `/dynamic-resolution`;
+clipboard file copy both ways; idle timeout (`ERRINFO_IDLE_TIMEOUT`). Optional parts:
+- `MACRDP_MAC_SHELL` (a command that runs a shell script from stdin on the Mac as the
+  logged-in user) enables the clipboard file copy test. It replaces the Mac pasteboard and
+  leaves an empty string on it.
+- `MACRDP_LOG` (the server's `macrdp.log`, read locally or through `MACRDP_MAC_SHELL`)
+  enables the server log checks (bitmap fallback, no rdpsnd).
+- `MACRDP_IDLE_TIMEOUT` (the server's `--idle-timeout`, 30 or more so that the other tests
+  stay under it) enables the idle timeout test.
+
+The exit code is the number of failed tests. The video checks only need FreeRDP; they say
+nothing about Windows mstsc.
+
 To decrypt a Wireshark capture of a session, run macrdp with `SSLKEYLOGFILE=/path/to/keylog.txt`
 and point Wireshark at that file (Preferences → Protocols → TLS → "(Pre)-Master-Secret log
 filename"). Covers the TCP RDP connection and the reliable-UDP multitransport flow (rustls);
