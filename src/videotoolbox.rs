@@ -153,6 +153,11 @@ impl Encoder {
         })
     }
 
+    /// Whether this encoder makes AVC444 views (see [`Encoder::new`]).
+    pub fn is_avc444(&self) -> bool {
+        self.avc444.is_some()
+    }
+
     /// Take the VideoToolbox output receiver, to run it on a dedicated ship
     /// thread (the push pipeline). After this, `drain`/`flush` on this encoder
     /// return nothing; the encoder is submit-only. Returns `None` if already
@@ -1883,6 +1888,7 @@ mod tests {
             px[3] = 0xff;
         }
         let mut enc = Encoder::new(w, h, 30, 4_000_000, 0.0, true)?;
+        assert!(enc.is_avc444());
         assert_eq!(enc.next_pts(), 0);
         enc.encode_bgra(&frame, stride, true)?;
         assert_eq!(enc.next_pts(), 2);

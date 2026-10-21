@@ -602,6 +602,14 @@ struct Args {
     #[arg(long = "no-lossless-text", action = clap::ArgAction::SetTrue)]
     no_lossless_text: bool,
 
+    /// Send H.264 as AVC444 (full chroma, MS-RDPEGFX 2.2.4.5) to clients that
+    /// negotiate it (mstsc, FreeRDP /gfx:AVC444): colored text and thin lines
+    /// keep their color. Each frame is encoded twice (luma and chroma views),
+    /// which costs encoder time and up to twice the bitrate. Clients without
+    /// AVC444 get AVC420. Off by default. Config key: AVC444=1.
+    #[arg(long = "avc444", action = clap::ArgAction::SetTrue)]
+    avc444: bool,
+
     /// Disconnect the client after this many seconds without keyboard or
     /// mouse input (0 = off, the default). The client is told why
     /// (ERRINFO_IDLE_TIMEOUT: mstsc shows the idle-time message).
@@ -2534,6 +2542,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if !on("LOSSLESS_TEXT", true) {
         argv.push("--no-lossless-text".into());
     }
+    if on("AVC444", false) {
+        argv.push("--avc444".into());
+    }
     if let Some(secs) = cfg.get("IDLE_TIMEOUT_SECS") {
         if !secs.is_empty() {
             argv.push("--idle-timeout".into());
@@ -3531,6 +3542,7 @@ async fn async_main() -> Result<()> {
                 .then(|| (u32::from(width), u32::from(height))),
         )
         .with_lossless_text(!args.no_lossless_text)
+        .with_avc444(args.avc444)
     });
 
     // On-change keyframes are off by default; --keyframe-on-change opts in.
@@ -4478,6 +4490,19 @@ mod config_tests {
         let args = args_from_config(&path).unwrap();
         fs::remove_file(&path).ok();
         assert!(args.no_lossless_text);
+    }
+
+    /// AVC444 is off unless AVC444=1.
+    #[test]
+    fn avc444_config_key() {
+        let path = write_temp("avc444-default", "USE_KEYCHAIN=0\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(!args.avc444);
+        let path = write_temp("avc444-on", "AVC444=1\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(args.avc444);
     }
 
     /// IDLE_TIMEOUT_SECS sets --idle-timeout; off by default.

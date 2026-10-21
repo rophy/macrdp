@@ -397,6 +397,12 @@ struct ConnectionContext {
     /// `Gfx::lossless_text`). A leaf mutex like `window`: never held while
     /// taking another lock.
     refine: Arc<Mutex<Refine>>,
+    /// AVC444 is turned on (`--avc444`); copied from `Gfx` at connection
+    /// start so the EGFX handler can read it.
+    avc444_enabled: bool,
+    /// The encoder makes AVC444 frames: `avc444_enabled` and the negotiated
+    /// capabilities allow AVC444 (set in `on_ready`, see [`caps_allow_avc444`]).
+    avc444: bool,
 }
 
 impl ConnectionContext {
@@ -1489,6 +1495,9 @@ pub struct Gfx {
     /// The refinement frame that is being ZGFX-compressed and not sent yet.
     /// Lock order: this, then ctx (released again), then a pipeline.
     refine_job: Arc<Mutex<Option<RefineJob>>>,
+    /// Send AVC444 (full chroma) to a client whose negotiated capabilities
+    /// allow it (`--avc444`, off by default); AVC420 otherwise.
+    avc444: bool,
 }
 
 /// A ClearCodec refinement frame taken from the pipeline and not sent yet.
@@ -1537,6 +1546,206 @@ impl ironrdp_pdu::Encode for ZgfxMessage {
 }
 
 impl ironrdp_dvc::DvcEncode for ZgfxMessage {}
+
+/// How long the ship thread waits for the auxiliary view of an AVC444 frame
+/// whose main view came alone. The encoder delivers both within a few ms.
+const AUX_VIEW_WAIT: Duration = Duration::from_millis(100);
+
+/// One EGFX video frame for the ship thread.
+#[derive(Debug)]
+enum ShipFrame {
+    Avc420(EncodedFrame),
+    /// The views of one AVC444 frame (MS-RDPEGFX 2.2.4.5): the main view
+    /// (luma, `RFX_AVC444_BITMAP_STREAM` stream 1) and the auxiliary view
+    /// (chroma, stream 2). Without the auxiliary view, the frame goes as
+    /// luma only.
+    Avc444 {
+        main: EncodedFrame,
+        aux: Option<EncodedFrame>,
+    },
+}
+
+impl ShipFrame {
+    /// The frame whose PTS keys the lossless-refinement regions.
+    fn main(&self) -> &EncodedFrame {
+        match self {
+            ShipFrame::Avc420(f) | ShipFrame::Avc444 { main: f, .. } => f,
+        }
+    }
+
+    /// Whether the frame starts a new reference chain: the client can show
+    /// it without earlier frames.
+    fn is_keyframe(&self) -> bool {
+        match self {
+            ShipFrame::Avc420(f) => f.is_keyframe,
+            ShipFrame::Avc444 { main, aux } => {
+                main.is_keyframe || aux.as_ref().is_some_and(|a| a.is_keyframe)
+            }
+        }
+    }
+}
+
+/// Output of [`ViewPairing`].
+#[derive(Debug)]
+enum Paired {
+    Frame(ShipFrame),
+    /// An auxiliary view whose main view the encoder did not deliver.
+    Stray(EncodedFrame),
+}
+
+/// Pairs the AVC444 views from the encoder output: each main view (even PTS)
+/// with the auxiliary view at the next PTS (`Encoder::encode_bgra`). The
+/// encoder delivers them in order; it can drop one.
+#[derive(Default)]
+struct ViewPairing {
+    main: Option<EncodedFrame>,
+}
+
+impl ViewPairing {
+    /// A main view waits for its auxiliary view.
+    fn waiting(&self) -> bool {
+        self.main.is_some()
+    }
+
+    fn push(&mut self, f: EncodedFrame, out: &mut Vec<Paired>) {
+        if f.pts.rem_euclid(2) == 0 {
+            // A new main view: the one before has no auxiliary view.
+            self.flush(out);
+            self.main = Some(f);
+            return;
+        }
+        match self.main.take() {
+            Some(main) if main.pts.wrapping_add(1) == f.pts => {
+                out.push(Paired::Frame(ShipFrame::Avc444 { main, aux: Some(f) }));
+            }
+            other => {
+                if let Some(main) = other {
+                    out.push(Paired::Frame(ShipFrame::Avc444 { main, aux: None }));
+                }
+                out.push(Paired::Stray(f));
+            }
+        }
+    }
+
+    /// Send a waiting main view alone.
+    fn flush(&mut self, out: &mut Vec<Paired>) {
+        if let Some(main) = self.main.take() {
+            out.push(Paired::Frame(ShipFrame::Avc444 { main, aux: None }));
+        }
+    }
+}
+
+/// AVC444 region rectangles for a frame of `width` x `height`: the tiles of
+/// `regions` (or the whole frame), with exclusive right and bottom edges as
+/// MS-RDPEGFX 2.2.4.4.1 reads them, and an even width: FreeRDP converts each
+/// AVC444 rectangle two pixels at a time and asserts an even width
+/// (`sse41_YUV444ToRGB_8u_P3AC4R_BGRX`, the client aborted on a 31-pixel
+/// edge tile). Tiles start at multiples of 32, so only the right edge of an
+/// odd-width frame loses its last column.
+///
+/// Unlike [`avc420_regions`], the frame edge is exact: the WireToSurface1 of
+/// an AVC444 frame is written by [`avc444_wire_to_surface`], whose
+/// destination rectangle is exclusive too.
+fn avc444_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
+    let right_edge = width & !1;
+    let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
+        left,
+        top,
+        right,
+        bottom,
+        quantization_parameter: 22,
+        quality: 100,
+    };
+    let rects: Vec<Avc420Region> = match regions {
+        Regions::Tiles(grid) if grid.size() == (u32::from(width), u32::from(height)) => grid
+            .rects()
+            .into_iter()
+            .map(|r| {
+                let right = (r.x + r.w).min(right_edge);
+                let bottom = (r.y + r.h).min(height);
+                region(r.x, r.y, right, bottom)
+            })
+            .filter(|r| r.right > r.left && r.bottom > r.top)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if rects.is_empty() {
+        vec![region(0, 0, right_edge, height)]
+    } else {
+        rects
+    }
+}
+
+/// The ZGFX-wrapped WireToSurface1 PDU of an AVC444 frame (codec
+/// `RDPGFX_CODECID_AVC444`, `RFX_AVC444_BITMAP_STREAM`, MS-RDPEGFX 2.2.4.5):
+/// `luma` with `regions` as stream 1 and, when present, `chroma` with the same
+/// regions as stream 2 (LC = 0; LC = 1 without it).
+///
+/// Written here and not by the pinned `ironrdp-egfx` (a5d1c682)
+/// `send_avc444_frame`: that one takes the region edges as inclusive and adds
+/// one to the bounding box for the destination rectangle, so exclusive edges
+/// (needed for even widths, see [`avc444_regions`]) would put the destination
+/// one pixel outside the surface, which FreeRDP rejects (`is_within_surface`).
+/// Upstream changed both to exclusive later (e0727394). The frame still goes
+/// through `send_avc444_frame` for its frame id and accounting; this PDU
+/// replaces the one it queued.
+fn avc444_wire_to_surface(
+    surface_id: u16,
+    luma: &[u8],
+    chroma: Option<&[u8]>,
+    regions: &[Avc420Region],
+) -> Result<Vec<u8>> {
+    use ironrdp_egfx::pdu::{
+        Avc420BitmapStream, Avc444BitmapStream, Codec1Type, Encoding, GfxPdu, WireToSurface1Pdu,
+    };
+    use ironrdp_pdu::Encode as _;
+    let stream = |data| Avc420BitmapStream {
+        rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
+        quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
+        data,
+    };
+    let bitmap = Avc444BitmapStream {
+        encoding: if chroma.is_some() {
+            Encoding::LUMA_AND_CHROMA
+        } else {
+            Encoding::LUMA
+        },
+        stream1: stream(luma),
+        stream2: chroma.map(stream),
+    };
+    let mut bitmap_data = vec![0u8; bitmap.size()];
+    bitmap
+        .encode(&mut ironrdp_pdu::WriteCursor::new(&mut bitmap_data))
+        .map_err(|e| anyhow!("AVC444 bitmap stream encode: {e}"))?;
+    let destination_rectangle = ExclusiveRectangle {
+        left: regions.iter().map(|r| r.left).min().unwrap_or(0),
+        top: regions.iter().map(|r| r.top).min().unwrap_or(0),
+        right: regions.iter().map(|r| r.right).max().unwrap_or(0),
+        bottom: regions.iter().map(|r| r.bottom).max().unwrap_or(0),
+    };
+    let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+        surface_id,
+        codec_id: Codec1Type::Avc444,
+        pixel_format: PixelFormat::XRgb,
+        destination_rectangle,
+        bitmap_data,
+    });
+    let mut bytes = vec![0u8; pdu.size()];
+    pdu.encode(&mut ironrdp_pdu::WriteCursor::new(&mut bytes))
+        .map_err(|e| anyhow!("AVC444 WireToSurface1 encode: {e}"))?;
+    Ok(ironrdp_graphics::zgfx::wrap_uncompressed(&bytes))
+}
+
+/// Whether a drained EGFX message is a WireToSurface1 PDU in an uncompressed
+/// single ZGFX segment (descriptor 0xE0, RDP8 header byte, then the
+/// RDPGFX_HEADER whose cmdId is 0x0001).
+fn is_wire_to_surface1(m: &ironrdp_dvc::DvcMessage) -> bool {
+    let mut b = vec![0u8; m.size()];
+    m.encode(&mut ironrdp_pdu::WriteCursor::new(&mut b)).is_ok()
+        && b.len() >= 4
+        && b[0] == 0xE0
+        && b[2..4] == [0x01, 0x00]
+}
 
 /// AVC420 region rectangles for a frame of `width` x `height`.
 ///
@@ -1855,6 +2064,7 @@ impl Gfx {
             reactivate_request: Arc::new(AtomicU32::new(0)),
             lossless_text: false,
             refine_job: Arc::new(Mutex::new(None)),
+            avc444: false,
         }
     }
 
@@ -1880,6 +2090,16 @@ impl Gfx {
             refine::REFINE_DELAY.as_millis()
         );
         self.lossless_text = on;
+        self
+    }
+
+    /// Turn AVC444 on or off (see `Gfx::avc444`).
+    pub fn with_avc444(mut self, on: bool) -> Self {
+        info!(
+            on,
+            "EGFX AVC444 for clients that negotiate it (--avc444; AVC420 otherwise)"
+        );
+        self.avc444 = on;
         self
     }
 
@@ -3154,20 +3374,87 @@ impl Gfx {
     /// capture tick. Bumps `shipped` per frame so the capture thread's
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
-        while let Ok(frame) = rx.recv() {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        shipped: Arc<AtomicU64>,
+        avc444: bool,
+    ) {
+        use std::sync::mpsc::RecvTimeoutError;
+        let mut pairing = ViewPairing::default();
+        loop {
+            // An AVC444 main view waits for its auxiliary view, which the
+            // encoder delivers right after it; without one in time (the
+            // encoder dropped it) the main view goes alone.
+            let first = if pairing.waiting() {
+                match rx.recv_timeout(AUX_VIEW_WAIT) {
+                    Ok(f) => Some(f),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(f) => Some(f),
+                    Err(_) => break,
+                }
+            };
+            let timed_out = first.is_none();
             // Sweep up any others VT delivered alongside it (keeps order).
-            let mut frames = vec![frame];
+            let mut frames: Vec<EncodedFrame> = first.into_iter().collect();
             while let Ok(f) = rx.try_recv() {
                 frames.push(f);
             }
-            let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
-                warn!(error = ?e, "EGFX ship_frames failed");
+            let (items, strays) = if avc444 {
+                let mut paired = Vec::new();
+                for f in frames {
+                    pairing.push(f, &mut paired);
+                }
+                if timed_out {
+                    pairing.flush(&mut paired);
+                }
+                let mut items = Vec::new();
+                let mut strays = Vec::new();
+                for p in paired {
+                    match p {
+                        Paired::Frame(f) => items.push(f),
+                        Paired::Stray(f) => strays.push(f.pts),
+                    }
+                }
+                (items, strays)
+            } else {
+                (
+                    frames.into_iter().map(ShipFrame::Avc420).collect(),
+                    Vec::new(),
+                )
+            };
+            if !strays.is_empty() {
+                self.on_stray_views(&strays);
             }
-            shipped.fetch_add(n, Ordering::Relaxed);
+            if !items.is_empty() {
+                if let Err(e) = self.ship_frames(&items) {
+                    warn!(error = ?e, "EGFX ship_frames failed");
+                }
+            }
+            shipped.fetch_add((items.len() + strays.len()) as u64, Ordering::Relaxed);
         }
         debug!("EGFX ship loop exiting (output channel closed)");
+    }
+
+    /// AVC444 auxiliary views came without their main view (the encoder
+    /// dropped it). They are not sent: the upstream pipeline sends a chroma
+    /// view only together with a main view. Later frames may reference them,
+    /// so the next frame is a keyframe, and the capture loop sends its newest
+    /// frame again in case the screen is still.
+    fn on_stray_views(&self, pts: &[i64]) {
+        if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.need_keyframe = true;
+        }
+        self.latest_dropped.store(true, Ordering::Relaxed);
+        warn!(
+            ?pts,
+            "EGFX AVC444 auxiliary view without its main view (the encoder dropped a frame): \
+             not sent; the next frame is a keyframe"
+        );
     }
 
     /// One-time per-connection surface + encoder setup. Caller holds `ctx`.
@@ -3254,13 +3541,14 @@ impl Gfx {
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
+            let avc444 = ctx.avc444;
             let mut encoder = Encoder::new(
                 width,
                 height,
                 self.fps,
                 ctx.adaptive_target_bps,
                 self.keyframe_secs,
-                false,
+                avc444,
             )?;
             // Hand VT's output channel to a dedicated ship thread (push model),
             // so encoded frames are sent the instant they're ready, off the
@@ -3287,9 +3575,12 @@ impl Gfx {
             let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
+                .spawn(move || gfx.ship_loop(rx, shipped, avc444))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
-            info!("EGFX VideoToolbox encoder initialized + ship thread started");
+            info!(
+                avc444,
+                "EGFX VideoToolbox encoder initialized + ship thread started"
+            );
         }
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
@@ -3540,7 +3831,7 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
+    fn ship_frames(&self, frames: &[ShipFrame]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -3598,7 +3889,7 @@ impl Gfx {
                 .map(|f| {
                     refine
                         .as_ref()
-                        .map(|r| r.lock().unwrap().take_regions(f.pts))
+                        .map(|r| r.lock().unwrap().take_regions(f.main().pts))
                 })
                 .collect();
             let mut shipped_regions: Vec<Regions> = Vec::new();
@@ -3608,19 +3899,30 @@ impl Gfx {
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
+            // Messages in queue order: AVC444 frames are drained one by one.
+            let mut dvc_out: Vec<ironrdp_dvc::DvcMessage> = Vec::new();
 
-            for (f, frame_regions) in frames.iter().zip(regions) {
-                let frame_regions = frame_regions.map(|r| refine::ship_regions(r, f.is_keyframe));
+            for (frame, frame_regions) in frames.iter().zip(regions) {
+                let f = frame.main();
+                let is_keyframe = frame.is_keyframe();
+                let frame_regions = frame_regions.map(|r| refine::ship_regions(r, is_keyframe));
                 // Region = full actual frame, inclusive bounds (or, with
                 // lossless refinement, the tiles this frame updates; see
                 // `avc420_regions`). QP 22 / quality 100 are first-light
                 // defaults; tuned in M3.
-                let region = avc420_regions(
-                    frame_regions.as_ref().unwrap_or(&Regions::Whole),
-                    width,
-                    height,
-                );
+                let whole = Regions::Whole;
+                let taken = frame_regions.as_ref().unwrap_or(&whole);
+                let region = match frame {
+                    ShipFrame::Avc420(_) => avc420_regions(taken, width, height),
+                    ShipFrame::Avc444 { .. } => avc444_regions(taken, width, height),
+                };
                 let payload = self.frame_payload(f);
+                // AVC444: the auxiliary (chroma) view, with the same regions.
+                let chroma = match frame {
+                    ShipFrame::Avc444 { aux: Some(a), .. } => Some(self.frame_payload(a)),
+                    _ => None,
+                };
+                let chroma_bytes = chroma.as_ref().map_or(0, Vec::len);
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
                 // Diagnostic for the reconnect-blank investigation: keyframes
@@ -3632,7 +3934,42 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let sent = server.send_avc420_frame(surface_id, &payload, &region, ts_ms);
+                let sent = match frame {
+                    ShipFrame::Avc420(_) => {
+                        server.send_avc420_frame(surface_id, &payload, &region, ts_ms)
+                    }
+                    ShipFrame::Avc444 { .. } => {
+                        // Queue an empty luma-only frame for the frame id and
+                        // accounting, then put our WireToSurface1 in its place
+                        // (see `avc444_wire_to_surface`). The frame's three
+                        // PDUs are the last ones queued.
+                        let sent =
+                            server.send_avc444_frame(surface_id, &[], &region, None, None, ts_ms);
+                        if sent.is_some() {
+                            let mut msgs = server.drain_output();
+                            let n = msgs.len();
+                            match avc444_wire_to_surface(
+                                surface_id,
+                                &payload,
+                                chroma.as_deref(),
+                                &region,
+                            ) {
+                                Ok(bytes) if n >= 3 && is_wire_to_surface1(&msgs[n - 2]) => {
+                                    msgs[n - 2] = Box::new(ZgfxMessage {
+                                        bytes,
+                                        name: "WireToSurface1Pdu",
+                                    });
+                                }
+                                other => warn!(
+                                    error = ?other.err(),
+                                    "EGFX AVC444 frame left without its picture"
+                                ),
+                            }
+                            dvc_out.extend(msgs);
+                        }
+                        sent
+                    }
+                };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -3646,30 +3983,36 @@ impl Gfx {
                         shipped_regions.push(r);
                     }
                 }
+                // `payload_bytes` is the whole frame (both views in AVC444).
+                let payload_bytes = payload.len() + chroma_bytes;
                 match sent {
-                    Some(frame_id) if f.is_keyframe => debug!(
+                    Some(frame_id) if is_keyframe => debug!(
                         frame_id,
                         ?self.wire_format,
                         param_sets = ps_count,
                         param_bytes = ps_bytes,
-                        payload_bytes = payload.len(),
+                        payload_bytes,
+                        chroma_bytes,
                         "EGFX shipped keyframe (IDR)"
                     ),
                     Some(frame_id) => trace!(
                         frame_id,
                         keyframe = false,
-                        payload_bytes = payload.len(),
+                        payload_bytes,
+                        chroma_bytes,
                         "EGFX shipped frame"
                     ),
                     None => debug!(
-                        keyframe = f.is_keyframe,
+                        keyframe = is_keyframe,
+                        avc444 = matches!(frame, ShipFrame::Avc444 { .. }),
                         param_sets = ps_count,
-                        bytes = payload.len(),
+                        bytes = payload_bytes,
                         "send_avc420_frame returned None"
                     ),
                 }
             }
-            let out = (server.drain_output(), egfx_channel_id);
+            dvc_out.extend(server.drain_output());
+            let out = (dvc_out, egfx_channel_id);
             drop(server);
             if let Some(r) = refine.as_ref() {
                 let now = Instant::now();
@@ -3850,6 +4193,8 @@ impl GfxServerFactory for Gfx {
             legacy_hold_logged: false,
             legacy_hold_expired_logged: false,
             refine: Arc::new(Mutex::new(Refine::default())),
+            avc444_enabled: self.avc444,
+            avc444: false,
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -3883,6 +4228,28 @@ fn caps_indicate_avc(caps: &[CapabilitySet]) -> bool {
         // Bare V8 / V10_1 carry no AVC flag — no positive AVC signal.
         CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
     })
+}
+
+/// Whether a negotiated capability set allows AVC444.
+///
+/// Same rule as ironrdp-egfx's codec capabilities (`supports_avc444`): V10
+/// and later allow AVC420 and AVC444 unless `AVC_DISABLED` is set (V10.1 has
+/// no flags). V8.1 allows AVC420 only and V8 allows no AVC. FreeRDP sends
+/// V10+ capability sets only with `/gfx:AVC444`, mstsc always.
+fn caps_allow_avc444(caps: &CapabilitySet) -> bool {
+    match caps {
+        CapabilitySet::V8 { .. } | CapabilitySet::V8_1 { .. } => false,
+        CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+            !flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
+        }
+        CapabilitySet::V10_1 => true,
+        CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+        CapabilitySet::V10_4 { flags }
+        | CapabilitySet::V10_5 { flags }
+        | CapabilitySet::V10_6 { flags }
+        | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+        CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+    }
 }
 
 /// Per-connection EGFX state callbacks from upstream `GraphicsPipelineServer`.
@@ -3945,7 +4312,19 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.need_keyframe = true;
                 // A (re)negotiated pipeline: older frames may never be acknowledged.
                 ctx.window.lock().unwrap().reset();
-                info!(?negotiated, "EGFX channel ready (H.264 active)");
+                // AVC444 when it is turned on and the negotiated capability set
+                // allows it; an encoder of the other kind is rebuilt by
+                // `setup_locked` on the next frame.
+                let avc444 = ctx.avc444_enabled && caps_allow_avc444(negotiated);
+                if ctx
+                    .encoder
+                    .as_ref()
+                    .is_some_and(|e| e.is_avc444() != avc444)
+                {
+                    ctx.encoder = None;
+                }
+                ctx.avc444 = avc444;
+                info!(?negotiated, avc444, "EGFX channel ready (H.264 active)");
             } else {
                 ctx.is_ready = false;
                 // Decline at the CHANNEL level, not just skip-using-it: flag
@@ -6123,5 +6502,256 @@ mod tests {
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
         assert_eq!(clocks(ctx), [built; 11]);
+    }
+
+    #[test]
+    fn avc444_v8_no() {
+        assert!(!caps_allow_avc444(&CapabilitySet::V8 {
+            flags: ironrdp_egfx::pdu::CapabilitiesV8Flags::empty(),
+        }));
+    }
+
+    #[test]
+    fn avc444_v8_1_avc420_only() {
+        assert!(!caps_allow_avc444(&CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED,
+        }));
+    }
+
+    #[test]
+    fn avc444_v10_and_v10_2() {
+        for set in [
+            |flags| CapabilitySet::V10 { flags },
+            |flags| CapabilitySet::V10_2 { flags },
+        ] {
+            assert!(caps_allow_avc444(&set(CapabilitiesV10Flags::empty())));
+            assert!(!caps_allow_avc444(&set(CapabilitiesV10Flags::AVC_DISABLED)));
+        }
+    }
+
+    #[test]
+    fn avc444_v10_1() {
+        assert!(caps_allow_avc444(&CapabilitySet::V10_1));
+    }
+
+    #[test]
+    fn avc444_v10_3() {
+        assert!(caps_allow_avc444(&CapabilitySet::V10_3 {
+            flags: CapabilitiesV103Flags::empty(),
+        }));
+        assert!(!caps_allow_avc444(&CapabilitySet::V10_3 {
+            flags: CapabilitiesV103Flags::AVC_DISABLED,
+        }));
+    }
+
+    #[test]
+    fn avc444_v10_4_to_v10_6err() {
+        for set in [
+            |flags| CapabilitySet::V10_4 { flags },
+            |flags| CapabilitySet::V10_5 { flags },
+            |flags| CapabilitySet::V10_6 { flags },
+            |flags| CapabilitySet::V10_6Err { flags },
+        ] {
+            assert!(caps_allow_avc444(&set(CapabilitiesV104Flags::empty())));
+            assert!(!caps_allow_avc444(&set(
+                CapabilitiesV104Flags::AVC_DISABLED
+            )));
+        }
+    }
+
+    #[test]
+    fn avc444_v10_7() {
+        assert!(caps_allow_avc444(&CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::empty(),
+        }));
+        assert!(!caps_allow_avc444(&CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::AVC_DISABLED,
+        }));
+    }
+
+    /// AVC444 needs the setting AND a capability set that allows it; a client
+    /// with V8.1 only (FreeRDP `/gfx:AVC420`) keeps AVC420.
+    #[test]
+    fn avc444_follows_the_setting_and_the_negotiated_caps() {
+        let v10 = CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::empty(),
+        };
+        for (enabled, caps, want) in [
+            (true, v10.clone(), true),
+            (true, avc_ready(), false),
+            (false, v10.clone(), false),
+        ] {
+            let gfx = gfx_with_context().with_avc444(enabled);
+            assert!(gfx.build_server_with_handle().is_some());
+            gfx.ctx
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .client_supports_avc = true;
+            GfxHandler {
+                ctx: gfx.ctx.clone(),
+            }
+            .on_ready(&caps);
+            let guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_ref().unwrap();
+            assert!(ctx.is_ready);
+            assert_eq!(ctx.avc444, want, "enabled={enabled} caps={caps:?}");
+        }
+    }
+
+    fn view(pts: i64, key: bool) -> EncodedFrame {
+        EncodedFrame {
+            data: vec![pts as u8],
+            is_keyframe: key,
+            pts,
+            parameter_sets: Vec::new(),
+        }
+    }
+
+    fn pts_of(p: &Paired) -> (i64, Option<i64>, bool) {
+        match p {
+            Paired::Frame(ShipFrame::Avc444 { main, aux }) => {
+                (main.pts, aux.as_ref().map(|a| a.pts), false)
+            }
+            Paired::Frame(ShipFrame::Avc420(f)) => (f.pts, None, false),
+            Paired::Stray(f) => (f.pts, None, true),
+        }
+    }
+
+    /// Main and auxiliary views pair by PTS; a main view without its
+    /// auxiliary view goes alone (luma only); an auxiliary view without its
+    /// main view is a stray.
+    #[test]
+    fn avc444_views_pair_by_pts() {
+        let mut p = ViewPairing::default();
+        let mut out = Vec::new();
+        p.push(view(0, true), &mut out);
+        assert!(p.waiting());
+        assert!(out.is_empty());
+        p.push(view(1, false), &mut out);
+        assert!(!p.waiting());
+        // Main 2 lost its auxiliary view: main 4 sends it alone.
+        p.push(view(2, false), &mut out);
+        p.push(view(4, false), &mut out);
+        // Main 6 was dropped: auxiliary 7 arrives while 4 waits.
+        p.push(view(7, false), &mut out);
+        // Main 8 times out without its auxiliary view.
+        p.push(view(8, false), &mut out);
+        p.flush(&mut out);
+        let got: Vec<_> = out.iter().map(pts_of).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, Some(1), false),
+                (2, None, false),
+                (4, None, false),
+                (7, None, true),
+                (8, None, false),
+            ]
+        );
+        assert!(!p.waiting());
+    }
+
+    /// A frame is a keyframe when either view is one (the periodic interval
+    /// counts views, so it can fall on an auxiliary view).
+    #[test]
+    fn avc444_keyframe_is_either_view() {
+        let f = |m, a: Option<bool>| ShipFrame::Avc444 {
+            main: view(0, m),
+            aux: a.map(|k| view(1, k)),
+        };
+        assert!(f(true, Some(false)).is_keyframe());
+        assert!(f(false, Some(true)).is_keyframe());
+        assert!(f(true, None).is_keyframe());
+        assert!(!f(false, Some(false)).is_keyframe());
+        assert!(!f(false, None).is_keyframe());
+        assert!(ShipFrame::Avc420(view(3, true)).is_keyframe());
+        assert_eq!(f(false, None).main().pts, 0);
+    }
+
+    /// AVC444 rectangles: exclusive edges, even widths, the frame edge exact
+    /// (an odd-width frame loses its last column).
+    #[test]
+    fn avc444_regions_are_exclusive_and_even() {
+        let r = avc444_regions(&Regions::Whole, 1280, 720);
+        assert_eq!(
+            (r[0].left, r[0].top, r[0].right, r[0].bottom),
+            (0, 0, 1280, 720)
+        );
+        let r = avc444_regions(&Regions::Whole, 1365, 767);
+        assert_eq!((r[0].right, r[0].bottom), (1364, 767));
+        // Edge tiles of a tile grid.
+        let mut grid = refine::TileGrid::new(1280, 720);
+        grid.mark_all();
+        let r = avc444_regions(&Regions::Tiles(grid), 1280, 720);
+        assert!(r.iter().all(|r| (r.right - r.left) % 2 == 0));
+        assert_eq!(r.iter().map(|r| r.right).max(), Some(1280));
+        assert_eq!(r.iter().map(|r| r.bottom).max(), Some(720));
+        let mut grid = refine::TileGrid::new(1281, 721);
+        grid.mark_all();
+        let r = avc444_regions(&Regions::Tiles(grid), 1281, 721);
+        assert!(r
+            .iter()
+            .all(|r| (r.right - r.left) % 2 == 0 && r.right > r.left));
+        assert_eq!(r.iter().map(|r| r.right).max(), Some(1280));
+        assert_eq!(r.iter().map(|r| r.bottom).max(), Some(721));
+    }
+
+    /// The WireToSurface1 we write decodes as an AVC444 command whose
+    /// destination is the exclusive bounding box of the regions (inside the
+    /// surface), with both streams and the same region rectangles.
+    #[test]
+    fn avc444_wire_to_surface_has_an_exclusive_destination() {
+        use ironrdp_egfx::pdu::{Avc444BitmapStream, Codec1Type, Encoding, GfxPdu};
+        let regions = avc444_regions(&Regions::Whole, 1280, 720);
+        for chroma in [Some(&[4u8, 5, 6][..]), None] {
+            let wrapped = avc444_wire_to_surface(7, &[1, 2, 3], chroma, &regions).unwrap();
+            // Small PDU: one uncompressed ZGFX segment.
+            assert_eq!(wrapped[0], 0xE0);
+            let pdu: GfxPdu = ironrdp_core::decode(&wrapped[2..]).unwrap();
+            let GfxPdu::WireToSurface1(w) = pdu else {
+                panic!("not a WireToSurface1");
+            };
+            assert_eq!(w.surface_id, 7);
+            assert_eq!(w.codec_id, Codec1Type::Avc444);
+            let d = &w.destination_rectangle;
+            assert_eq!((d.left, d.top, d.right, d.bottom), (0, 0, 1280, 720));
+            let stream: Avc444BitmapStream<'_> = ironrdp_core::decode(&w.bitmap_data).unwrap();
+            assert_eq!(stream.stream1.data, &[1, 2, 3]);
+            let r = &stream.stream1.rectangles[0];
+            assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1280, 720));
+            match chroma {
+                Some(c) => {
+                    assert_eq!(stream.encoding, Encoding::LUMA_AND_CHROMA);
+                    let s2 = stream.stream2.as_ref().unwrap();
+                    assert_eq!(s2.data, c);
+                    assert_eq!(s2.rectangles.len(), 1);
+                }
+                None => {
+                    assert_eq!(stream.encoding, Encoding::LUMA);
+                    assert!(stream.stream2.is_none());
+                }
+            }
+        }
+    }
+
+    /// The pinned pipeline queues StartFrame, WireToSurface1 and EndFrame for
+    /// an AVC444 frame; the middle one is found and is what we replace.
+    #[test]
+    fn avc444_queued_frame_has_its_wire_to_surface1_second_to_last() {
+        let msg = |b: Vec<u8>| -> ironrdp_dvc::DvcMessage {
+            Box::new(ZgfxMessage {
+                bytes: b,
+                name: "x",
+            })
+        };
+        let regions = avc444_regions(&Regions::Whole, 64, 64);
+        let w2s1 = avc444_wire_to_surface(1, &[], None, &regions).unwrap();
+        assert!(is_wire_to_surface1(&msg(w2s1)));
+        // StartFrame (cmdId 0x000B) and a multipart segment are not.
+        assert!(!is_wire_to_surface1(&msg(vec![0xE0, 0x04, 0x0B, 0x00])));
+        assert!(!is_wire_to_surface1(&msg(vec![0xE1, 0x01, 0x00, 0x01])));
+        assert!(!is_wire_to_surface1(&msg(vec![0xE0])));
     }
 }
