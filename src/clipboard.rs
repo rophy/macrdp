@@ -496,7 +496,7 @@ impl ServerEventSender for MacCliprdr {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
                 let current = pb::change_count();
                 if current == last_seen {
                     continue;
@@ -537,10 +537,16 @@ impl ServerEventSender for MacCliprdr {
                     std::time::Duration::from_millis(2500),
                     std::time::Duration::from_millis(5000),
                 ] {
-                    tokio::time::sleep(delay).await;
+                    // A newer Mac-side copy ends this wave at once: the main
+                    // loop advertises it on its next tick. (A plain sleep hid
+                    // each copy made during a wave for up to 8.5 s, e.g. when
+                    // the wave was for a pasteboard with nothing to send.)
+                    if sleep_until_changed(delay, POLL_INTERVAL, || pb::change_count() != last_seen)
+                        .await
+                    {
+                        break;
+                    }
                     if advertise_state.generation.load(Ordering::Relaxed) != my_gen {
-                        // A newer Mac-side copy started a new wave; let the
-                        // main loop handle it on its next tick.
                         break;
                     }
                     if advertise_state.locked_gen.load(Ordering::Relaxed) == my_gen {
@@ -818,6 +824,29 @@ impl MacCliprdrBackend {
 /// server populates its `local_file_list` and accepts subsequent
 /// FileContentsRequests instead of short-circuiting them with
 /// CB_RESPONSE_FAIL.
+/// How often the pasteboard poller reads the change count.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sleep `delay` in steps of `step`; return true as soon as `changed()` is
+/// true (checked after each step), false when the whole delay passed.
+async fn sleep_until_changed(
+    delay: std::time::Duration,
+    step: std::time::Duration,
+    mut changed: impl FnMut() -> bool,
+) -> bool {
+    let end = tokio::time::Instant::now() + delay;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= end {
+            return false;
+        }
+        tokio::time::sleep(step.min(end - now)).await;
+        if changed() {
+            return true;
+        }
+    }
+}
+
 fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
     if pb::has_files() {
         let entries = pb::read_files();
@@ -2324,5 +2353,42 @@ mod tests {
         let ok = pb::walk_inner(&mut entries, &bogus, "root".to_owned());
         assert!(ok);
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pasteboard_change_ends_the_wave_sleep_early() {
+        let mut calls = 0;
+        let start = std::time::Instant::now();
+        let changed = sleep_until_changed(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+            || {
+                calls += 1;
+                calls == 3
+            },
+        )
+        .await;
+        assert!(changed);
+        assert_eq!(calls, 3);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn without_a_change_the_wave_sleeps_the_whole_delay() {
+        let mut calls = 0;
+        let start = std::time::Instant::now();
+        let changed = sleep_until_changed(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(30),
+            || {
+                calls += 1;
+                false
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(100));
+        // 30 + 30 + 30 + 10 ms: the last step is cut to the delay.
+        assert_eq!(calls, 4);
     }
 }
