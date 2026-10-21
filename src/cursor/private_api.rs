@@ -184,7 +184,7 @@ pub fn copy_current_system_cursor() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
                 return None;
             }
             let src_row = &buf[src_row_start..src_row_start + w * 4];
-            for px in src_row.chunks_exact(4) {
+            for px in src_row.as_chunks::<4>().0 {
                 let b = px[0];
                 let g = px[1];
                 let r = px[2];

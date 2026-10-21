@@ -152,7 +152,7 @@ impl Avc444Planes {
                     u16::from(a[x]) + u16::from(a[x + 1]) + u16::from(b[x]) + u16::from(b[x + 1]);
                 ((sum + 2) / 4) as u8
             };
-            for (x, d) in dst.chunks_exact_mut(2).enumerate() {
+            for (x, d) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 d[0] = avg(u0, u1, 2 * x);
                 d[1] = avg(v0, v1, 2 * x);
             }
@@ -184,7 +184,7 @@ impl Avc444Planes {
             let u = &self.u444[src..src + w];
             let v = &self.v444[src..src + w];
             let dst = &mut cbcr[row * c_stride..row * c_stride + w];
-            for (x, d) in dst.chunks_exact_mut(2).enumerate() {
+            for (x, d) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 d[0] = u[2 * x + 1];
                 d[1] = v[2 * x + 1];
             }

@@ -1236,8 +1236,10 @@ impl CliprdrBackend for MacCliprdrBackend {
                     warn!(len = data.len(), "odd-length UTF-16 payload");
                 } else {
                     let mut units: Vec<u16> = data
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&c| u16::from_le_bytes(c))
                         .collect();
                     // CF_UNICODETEXT ends at its first NUL. Windows apps
                     // (Word) can hand over a buffer with MORE than one

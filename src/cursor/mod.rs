@@ -581,7 +581,11 @@ mod macos {
             assert_eq!((w, h), (16, 16));
             assert_eq!((hx, hy), (8, 8));
             // Solid opaque red must survive the downscale on every pixel.
-            assert!(out.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+            assert!(out
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [255, 0, 0, 255]));
         }
 
         #[test]

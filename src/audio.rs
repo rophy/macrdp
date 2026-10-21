@@ -868,7 +868,12 @@ fn deinterleave_first_two_channels(bytes: &[u8], channels: usize) -> (Vec<f32>, 
 
 #[cfg(target_os = "macos")]
 fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(read_f32_le).collect()
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
