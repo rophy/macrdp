@@ -1669,6 +1669,14 @@ mod macos {
                 let Some(pixel_buffer) = sample.image_buffer() else {
                     continue;
                 };
+                // The H.264 path gives this buffer to VideoToolbox as it is
+                // (also later, as the kept last frame): remove its color tags
+                // once, here.
+                if self.gfx.is_some() {
+                    crate::videotoolbox::strip_color_attachments(
+                        crate::videotoolbox::CapturePixelBuffer(pixel_buffer.as_ptr().cast_const()),
+                    );
+                }
 
                 let guard = pixel_buffer
                     .lock(CVPixelBufferLockFlags::READ_ONLY)

@@ -43,6 +43,17 @@ pub struct EncodedFrame {
     pub parameter_sets: Vec<Vec<u8>>,
 }
 
+/// Remove the color tags of a capture buffer (see
+/// `ffi::strip_color_attachments`), once when it arrives: it can be given to
+/// [`Encoder::encode_pixel_buffer`] more than once (flush frames), and VT may
+/// still hold it from an earlier submit.
+pub fn strip_color_attachments(pixel_buffer: CapturePixelBuffer) {
+    if !pixel_buffer.0.is_null() {
+        // SAFETY: a valid capture buffer (see `CapturePixelBuffer`).
+        unsafe { ffi::strip_color_attachments(pixel_buffer.0) };
+    }
+}
+
 /// A capture `CVPixelBufferRef` (32-bit BGRA) that holds the same pixels as
 /// the BGRA slice given with it; see [`Encoder::encode_pixel_buffer`]. It is
 /// valid while the caller holds the capture sample.
@@ -307,10 +318,9 @@ impl Encoder {
         if pixel_buffer.is_null() {
             bail!("encode_pixel_buffer: null pixel buffer");
         }
-        // SAFETY: a valid CVPixelBuffer from the caller.
-        unsafe { ffi::strip_color_attachments(pixel_buffer) };
-        // SAFETY: as above; VT retains it for the encode, the caller keeps
-        // its own reference.
+        // SAFETY: a valid CVPixelBuffer from the caller (its color tags are
+        // removed already, see `strip_color_attachments`); VT retains it for
+        // the encode, the caller keeps its own reference.
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
         unsafe { ffi::submit(&self.inner, pixel_buffer, pts, self.fps, force_keyframe) }
@@ -2138,7 +2148,7 @@ mod tests {
             std::slice::from_raw_parts_mut(base, stride * usize::from(h)).fill(0x80);
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
         }
-        // Tag it as a P3 capture would be; the encode removes every tag.
+        // Tag it as a P3 capture would be; `strip_color_attachments` removes every tag.
         #[link(name = "CoreVideo", kind = "framework")]
         extern "C" {
             fn CVBufferSetAttachment(b: *const c_void, k: *const c_void, v: *const c_void, m: u32);
@@ -2162,6 +2172,7 @@ mod tests {
             assert!(!unsafe { CVBufferGetAttachment(pbuf, k, std::ptr::null_mut()) }.is_null());
         }
         let pb = CapturePixelBuffer(pbuf);
+        strip_color_attachments(pb);
         let result = (|| {
             let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, false)?;
             assert_eq!(enc.dims(), (w, h));
