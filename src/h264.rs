@@ -79,6 +79,12 @@ use crate::videotoolbox::{EncodedFrame, Encoder};
 /// `submit_bgra` and `ConnectionContext::last_throttle_ship`.
 const UDP_THROTTLE_FLOOR: Duration = Duration::from_millis(100);
 
+/// Periodic keyframe interval (seconds) while EGFX is on a UDP tunnel and
+/// `--keyframe-interval` is 0 (the default). On UDP a frame can be lost, and the
+/// periodic IDR is the backstop for a loss that no other path heals
+/// (docs/rdp-udp-multitransport-feasibility.md). On TCP there is no periodic IDR.
+const UDP_KEYFRAME_SECS: f32 = 2.0;
+
 /// P3 cold-start guard: how long after the first frame-ack the adaptive controller
 /// ignores the ack-lag congestion signal. At connect the encoder ships an initial
 /// burst (keyframe + first frames) before the client starts acking, so `shipped −
@@ -295,6 +301,10 @@ struct ConnectionContext {
     /// (stretched) because the tunnel is congested. Restored (+ one recovery IDR)
     /// when the link fully recovers. See [`idr_backoff_decision`].
     idr_backed_off: bool,
+    /// The transport the encoder's periodic-keyframe interval was last set for
+    /// (`true` = UDP). The encoder starts with the TCP value; `submit_bgra` sets
+    /// the other one when EGFX moves (see `Gfx::periodic_keyframe_frames`).
+    keyframe_on_udp: bool,
     /// P3: which transport EGFX was on at the previous controller step, so the
     /// step can detect the UDP→TCP edge (watchdog de-migrate) and snap the bitrate
     /// back to the ceiling once before the TCP controller takes over. Mirrors
@@ -1271,8 +1281,9 @@ pub struct Gfx {
     desktop_size: crate::capture::SharedDesktopSize,
     fps: u32,
     bitrate_bps: u32,
-    /// Periodic keyframe (IDR) interval in seconds (from `--keyframe-interval`).
-    /// Heal-vs-smoothness knob; converted to a frame count by `Encoder::new`.
+    /// Periodic keyframe (IDR) interval in seconds on TCP (from
+    /// `--keyframe-interval`; 0 = none, the default). Converted to a frame count
+    /// by `crate::videotoolbox::keyframe_frames`.
     keyframe_secs: f32,
     /// Capture-side drop-to-latest depth (from `--h264-frames-in-flight`): the
     /// max frames allowed in the VT/ship pipeline (`submitted - shipped`) before
@@ -1367,10 +1378,15 @@ pub struct Gfx {
     /// `MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE` overrides (0 = the old "any retransmit"
     /// behaviour). Only the UDP path produces retransmits, so this never affects TCP.
     adaptive_retx_tolerance: u64,
-    /// P2a IDR backoff: the normal periodic-keyframe interval (frames, from
-    /// `--keyframe-interval`) restored on recovery, and the stretched value used to
-    /// suppress the periodic IDR under congestion.
-    normal_keyframe_frames: u32,
+    /// Periodic-keyframe interval (frames) while EGFX is on TCP: from
+    /// `--keyframe-interval`; the default 0 gives one hour, i.e. no periodic IDR.
+    /// TCP delivers every frame, and an IDR is ~50x a P-frame (~290 KB at 720p).
+    tcp_keyframe_frames: u32,
+    /// Periodic-keyframe interval (frames) while EGFX is on a UDP tunnel, where a
+    /// frame can be lost: `--keyframe-interval`, or `UDP_KEYFRAME_SECS` when it is 0.
+    udp_keyframe_frames: u32,
+    /// P2a IDR backoff: the stretched value used to suppress the periodic IDR
+    /// under congestion (the transport's normal value is restored on recovery).
     stretched_keyframe_frames: u32,
     /// Cumulative reliable-tunnel retransmit count, bumped by the UDP listener and
     /// sampled (as deltas) by the controller. Shared `Arc` like the egfx flags.
@@ -1522,9 +1538,16 @@ impl Gfx {
         // derivation as Encoder::new), and a stretched value (~10 min) that
         // effectively suppresses the periodic IDR for the duration of a congestion
         // episode without a hard "never" (VT still honors forced keyframes).
-        let normal_keyframe_frames =
-            (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let stretched_keyframe_frames = fps.saturating_mul(600).max(normal_keyframe_frames + 1);
+        let tcp_keyframe_frames = crate::videotoolbox::keyframe_frames(fps, keyframe_secs);
+        let udp_keyframe_frames = crate::videotoolbox::keyframe_frames(
+            fps,
+            if keyframe_secs > 0.0 {
+                keyframe_secs
+            } else {
+                UDP_KEYFRAME_SECS
+            },
+        );
+        let stretched_keyframe_frames = fps.saturating_mul(600).max(udp_keyframe_frames + 1);
         // Blank-presentation recovery (the mstsc reconnect-blank): on by default —
         // it only ever acts on the pcap-proven blank signature (QoE acks flowing
         // with decode+render time zero on EVERY frame of a whole window), so a
@@ -1625,7 +1648,8 @@ impl Gfx {
                 interval_ms = adaptive_interval.as_millis() as u64,
                 queue_high_ms = adaptive_queue_high_ms,
                 ewma_alpha = adaptive_ewma_alpha,
-                normal_keyframe_frames,
+                tcp_keyframe_frames,
+                udp_keyframe_frames,
                 stretched_keyframe_frames,
                 floor_fps = adaptive_floor_fps,
                 "EGFX adaptive bitrate + IDR backoff + frame-rate floor ENABLED (--adaptive-bitrate) — \
@@ -1658,7 +1682,8 @@ impl Gfx {
             adaptive_queue_high_ms,
             adaptive_ewma_alpha,
             adaptive_retx_tolerance,
-            normal_keyframe_frames,
+            tcp_keyframe_frames,
+            udp_keyframe_frames,
             stretched_keyframe_frames,
             congestion_retransmits,
             adaptive_min_fps_interval,
@@ -2182,6 +2207,19 @@ impl Gfx {
                     trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
                 }
             }
+            // EGFX moved between TCP and a UDP tunnel: use that transport's
+            // periodic-keyframe interval (none on TCP by default, a backstop on
+            // UDP). A backed-off interval stays until the controller restores it.
+            let on_udp = self.egfx_on_udp.load(Ordering::Relaxed);
+            if ctx.keyframe_on_udp != on_udp {
+                ctx.keyframe_on_udp = on_udp;
+                if !ctx.idr_backed_off {
+                    let frames = self.periodic_keyframe_frames(on_udp);
+                    if let Err(e) = encoder.set_keyframe_interval(frames) {
+                        trace!(error = ?e, frames, "transport set_keyframe_interval failed");
+                    }
+                }
+            }
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
@@ -2207,6 +2245,15 @@ impl Gfx {
     /// there and the unbounded ship channel lets `shipped` advance, so the lag
     /// reflects the real backlog). IDR backoff stays UDP-only — on TCP the periodic
     /// keyframe is cheap insurance and not worth the false-suppress risk.
+    /// The periodic-keyframe interval (frames) for the transport EGFX is on.
+    fn periodic_keyframe_frames(&self, on_udp: bool) -> u32 {
+        if on_udp {
+            self.udp_keyframe_frames
+        } else {
+            self.tcp_keyframe_frames
+        }
+    }
+
     fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> AdaptiveActions {
         let mut actions = AdaptiveActions::default();
         if !self.adaptive_enabled {
@@ -2236,7 +2283,7 @@ impl Gfx {
             }
             if ctx.idr_backed_off {
                 ctx.idr_backed_off = false;
-                actions.keyframe_frames = Some(self.normal_keyframe_frames);
+                actions.keyframe_frames = Some(self.periodic_keyframe_frames(false));
             }
             if actions.bitrate_bps.is_some() || actions.keyframe_frames.is_some() {
                 ctx.adaptive_last_control = now;
@@ -2400,7 +2447,15 @@ impl Gfx {
         // insurance, deferrable until the link clears (Restore then forces one
         // clean recovery IDR). (Originally UDP-only because the frame-count
         // signal false-positived on TCP; that calculus changed with the signal.)
-        match idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off) {
+        // No periodic IDR on this transport (TCP, default): nothing to suppress,
+        // and no recovery IDR is needed after congestion (TCP loses no frame).
+        let periodic_active = on_udp || self.keyframe_secs > 0.0;
+        let backoff = if periodic_active {
+            idr_backoff_decision(congested, new_target, ceiling, ctx.idr_backed_off)
+        } else {
+            IdrBackoff::Hold
+        };
+        match backoff {
             IdrBackoff::Stretch => {
                 ctx.idr_backed_off = true;
                 actions.keyframe_frames = Some(self.stretched_keyframe_frames);
@@ -2409,7 +2464,7 @@ impl Gfx {
             }
             IdrBackoff::Restore => {
                 ctx.idr_backed_off = false;
-                actions.keyframe_frames = Some(self.normal_keyframe_frames);
+                actions.keyframe_frames = Some(self.periodic_keyframe_frames(on_udp));
                 ctx.need_keyframe = true; // one clean recovery IDR now the link is clear
                 info!(
                     "EGFX IDR backoff: link recovered — restoring periodic keyframe + forcing recovery IDR"
@@ -2533,6 +2588,8 @@ impl Gfx {
                 .take_receiver()
                 .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
             ctx.encoder = Some(encoder);
+            // The new encoder has the TCP periodic-keyframe interval.
+            ctx.keyframe_on_udp = false;
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
             ctx.shipped.store(0, Ordering::Relaxed);
@@ -3034,6 +3091,7 @@ impl GfxServerFactory for Gfx {
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
             idr_backed_off: false,
+            keyframe_on_udp: false,
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
@@ -5119,6 +5177,34 @@ mod tests {
         );
         assert!(gfx.build_server_with_handle().is_some());
         gfx
+    }
+
+    fn gfx_with_keyframe(keyframe_secs: f32) -> Gfx {
+        Gfx::new(
+            crate::capture::SharedDesktopSize::new(1280, 720),
+            60,
+            6_000_000,
+            keyframe_secs,
+            2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            true,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
+
+    #[test]
+    fn no_periodic_keyframe_on_tcp_by_default_but_a_backstop_on_udp() {
+        let gfx = gfx_with_keyframe(0.0);
+        assert_eq!(gfx.periodic_keyframe_frames(false), 60 * 3600);
+        assert_eq!(gfx.periodic_keyframe_frames(true), 120);
+        assert!(gfx.stretched_keyframe_frames > gfx.periodic_keyframe_frames(true));
+        // An explicit interval applies on both transports.
+        let gfx = gfx_with_keyframe(1.5);
+        assert_eq!(gfx.periodic_keyframe_frames(false), 90);
+        assert_eq!(gfx.periodic_keyframe_frames(true), 90);
     }
 
     /// Every connection-start clock, so a test can't pass by checking only the

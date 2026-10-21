@@ -444,13 +444,16 @@ struct Args {
     bitrate: u32,
 
     /// H.264 periodic keyframe (IDR) interval in seconds (only with
-    /// --enable-h264). Default 2. This is a safety net for transient decode
-    /// glitches on small changes (e.g. mstsc's lingering garbled text while
-    /// typing); large changes (window-to-front, scroll) can also force an
-    /// immediate IDR if --keyframe-on-change is set (off by default). Lower self-heals
-    /// faster but frequent IDRs cost bandwidth/quality at a fixed bitrate and
-    /// can stutter. Fractional values are allowed. First frame is a keyframe.
-    #[arg(long, default_value_t = 2.0)]
+    /// --enable-h264). Default 0 = no periodic keyframe while the video runs
+    /// over TCP: TCP delivers every frame, and an IDR is ~50x a P-frame (about
+    /// 290 KB at 720p), so a 2 s interval spent ~0.3 Mbps on a screen with only
+    /// a blinking caret. Keyframes are still forced when the client needs one
+    /// (first frame, new surface, resume after minimize, blank recovery, the
+    /// Ctrl+Alt+Shift+R resync hotkey). On a UDP tunnel, where a frame can be
+    /// lost, the interval is this value or 2 s when it is 0. A value > 0 also
+    /// applies on TCP (a safety net for a client decode glitch). Fractional
+    /// values are allowed.
+    #[arg(long, default_value_t = 0.0)]
     keyframe_interval: f32,
 
     /// Force on-change H.264 keyframes (only with --enable-h264). OFF by
@@ -458,9 +461,9 @@ struct Args {
     /// screen changes at once — a window raised to front, a scroll, an app
     /// launch — and briefly after a mouse click, so large updates render
     /// immediately on clients (e.g. mstsc) that apply big P-frames cleanly only
-    /// on a keyframe. Left off (the default), the periodic --keyframe-interval
-    /// safety net plus the trailing flush-burst (--flush-frames) already drain
-    /// mstsc's presentation buffer, so the extra forced IDRs mostly just spend
+    /// on a keyframe. Left off (the default), the trailing flush-burst
+    /// (--flush-frames) already drains mstsc's presentation buffer, so the
+    /// extra forced IDRs mostly just spend
     /// bitrate/quality at a fixed bitrate for no typing benefit; enable it only
     /// if large updates visibly lag on your client/link.
     #[arg(long = "keyframe-on-change", action = clap::ArgAction::SetTrue)]
@@ -509,6 +512,10 @@ struct Args {
     /// times as cheap skip-P-frames to drain that buffer so the change appears
     /// promptly. mstsc needs ≥2; default 4 gives margin. Raise if a slight
     /// trailing lag remains; set 0 to disable the flush burst entirely.
+    /// The burst only follows a change, so a static screen sends nothing.
+    /// It also refines the last picture after motion and keeps the frame
+    /// acks and QoE reports that blank recovery reads flowing (with 0, Windows
+    /// 10 mstsc got false blank-recovery drops on a near-static screen).
     #[arg(long, default_value_t = 4)]
     flush_frames: u32,
 

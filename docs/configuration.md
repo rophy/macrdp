@@ -106,12 +106,14 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           is the ceiling, not a fixed target. Config key: BITRATE
                           (the menu-bar controller's Video tab sets it).
 --keyframe-interval SECS  H.264 periodic keyframe (IDR) interval in seconds
-                          (default 2; only with --enable-h264). Safety net for
-                          transient decode glitches; fractional values OK.
+                          (default 0 = none over TCP; on a UDP tunnel this value,
+                          or 2 s when 0). Only with --enable-h264. Keyframes are
+                          still forced when the client needs one; fractional
+                          values OK.
 --keyframe-on-change      Force on-change H.264 keyframes (OFF by default; only
                           with --enable-h264): an IDR on large changes (window-
                           to-front, scroll, app launch) and briefly after a click.
-                          The periodic interval + flush-burst already cover this,
+                          The flush-burst already covers this,
                           so enable it only if big updates lag. See [video.md](video.md).
 --flush-frames N          Trailing frames re-sent after each change to drain
                           mstsc's presentation buffer (default 4; only with

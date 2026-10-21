@@ -220,7 +220,8 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   --enable-h264). With --adaptive-bitrate it's the
                           #   ceiling the encoder backs off from under congestion;
                           #   otherwise a fixed target. Config key: BITRATE.
---keyframe-interval SECS  # periodic IDR safety net (default 2; only with --enable-h264)
+--keyframe-interval SECS  # periodic IDR (default 0 = none over TCP; 2 s on a UDP tunnel
+                          #   when 0; only with --enable-h264)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
                           #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
 --enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
@@ -373,7 +374,8 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   gracefully — including a no-ack distress fallback so a
                           #   fully choked client (acks silent) still registers.
                           #   Under congestion it also stretches the periodic IDR
-                          #   (BOTH transports) to avoid injecting a big keyframe
+                          #   (where one runs: a UDP tunnel, or --keyframe-interval
+                          #   > 0 on TCP) to avoid injecting a big keyframe
                           #   into a congested pipe. So --bitrate is a CEILING, not a
                           #   fixed target: set it high (e.g. 8) and it backs off
                           #   only when the link strains.

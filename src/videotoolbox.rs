@@ -69,6 +69,18 @@ pub struct Encoder {
     full_range: bool,
 }
 
+/// Periodic keyframe (IDR) interval in frames for `keyframe_secs` seconds at
+/// `fps`. At least 1 (every frame an IDR). `keyframe_secs <= 0` means no
+/// periodic keyframe: one hour of frames, because 0 would let VideoToolbox
+/// choose its own interval. Forced keyframes (first frame, recovery) are not
+/// affected.
+pub fn keyframe_frames(fps: u32, keyframe_secs: f32) -> u32 {
+    if keyframe_secs <= 0.0 {
+        return fps.max(1).saturating_mul(3600);
+    }
+    (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32
+}
+
 impl Encoder {
     /// Create a new H.264 encoder. `bitrate_bps` is the target average
     /// bitrate; `fps` sets the frame-duration hint used by VT's rate
@@ -94,9 +106,7 @@ impl Encoder {
             std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
-        // Keyframe interval is a frame count; derive it from the requested
-        // seconds and the frame rate. At least 1 (every frame an IDR).
-        let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
+        let keyframe_frames = keyframe_frames(fps, keyframe_secs);
         let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
         Ok(Self {
             inner: session,
@@ -539,7 +549,9 @@ mod ffi {
             // keyframe is still forced explicitly in encode_bgra(); this governs
             // only the periodic safety net. (Was fps*30 ≈ 30s, which let mstsc
             // corruption persist for half a minute.) Set via --keyframe-interval
-            // (seconds), already converted to a frame count by the caller.
+            // (seconds), already converted to a frame count by the caller; the
+            // default (0) is one hour of frames, i.e. no periodic IDR on TCP
+            // (see `keyframe_frames`).
             set_i32(
                 session,
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -1264,6 +1276,19 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyframe_interval_zero_means_no_periodic_idr() {
+        // 0 (the default) and negative: one hour of frames, never 0 (which would
+        // let VideoToolbox pick its own interval).
+        assert_eq!(keyframe_frames(60, 0.0), 216_000);
+        assert_eq!(keyframe_frames(60, -1.0), 216_000);
+        assert_eq!(keyframe_frames(0, 0.0), 3600);
+        // A set interval converts to frames, at least 1.
+        assert_eq!(keyframe_frames(60, 2.0), 120);
+        assert_eq!(keyframe_frames(30, 0.5), 15);
+        assert_eq!(keyframe_frames(60, 0.001), 1);
+    }
 
     /// Round-trip sanity test. Creates a session, encodes a single
     /// solid-color BGRA frame, drains the channel, and asserts that
