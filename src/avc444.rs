@@ -9,8 +9,11 @@
 //! - [`split_yuv444_to_yuv420_v1`] does the *encoder* side — full-res YUV444 →
 //!   main + auxiliary YUV420.
 //! - [`combine_luma_to_yuv444`] / [`combine_chroma_v1_to_yuv444`] do the
-//!   *decoder* side. Both must be applied (luma first, then chroma) to fully
-//!   reconstruct YUV444.
+//!   *decoder* side (tests only). Both must be applied (luma first, then
+//!   chroma) to fully reconstruct YUV444.
+//! - [`Avc444Planes`] holds the buffers of one frame for the encoder
+//!   (`videotoolbox.rs`): the YUV444 picture padded to whole macroblocks and
+//!   the two views made from it.
 //!
 //! The combine functions are ported essentially verbatim from FreeRDP's
 //! `general_LumaToYUV444` / `general_ChromaV1ToYUV444`
@@ -34,14 +37,145 @@
 //! - All planes are tightly packed with `stride = plane_width` in the test
 //!   helpers; the production API takes explicit strides.
 
-#![allow(dead_code)] // wired into the h264 pipeline in a follow-up commit
-
 /// Height the auxiliary Y plane must be allocated to. Matches FreeRDP's
 /// `padHeigth = height + 16 - height % 16`. Adds 16 when already aligned, which
 /// is intentional padding margin — B4/B5 packing only writes through `height`
 /// odd rows, so the over-allocation is just unused space.
 pub fn padded_aux_height(height: usize) -> usize {
     height - height % 16 + 16
+}
+
+/// `v` rounded up to a multiple of 16 (whole H.264 macroblocks).
+pub fn align16(v: usize) -> usize {
+    v.div_ceil(16) * 16
+}
+
+/// One AVC444 frame on the encoder side: the full-range YUV444 picture at the
+/// size rounded up to whole macroblocks, and its main and auxiliary YUV420
+/// views (Y stride = width, U/V stride = width / 2). Allocated once per
+/// encoder and reused for every frame.
+///
+/// The size is padded to multiples of 16 because the auxiliary view packs the
+/// odd chroma rows in 16-row blocks (B4/B5): with a height that is a multiple
+/// of 16 every packed row lands inside the picture; with another height the
+/// last odd rows would fall outside the encoded frame.
+pub struct Avc444Planes {
+    width: usize,
+    height: usize,
+    y444: Vec<u8>,
+    u444: Vec<u8>,
+    v444: Vec<u8>,
+    main_y: Vec<u8>,
+    main_u: Vec<u8>,
+    main_v: Vec<u8>,
+    aux_y: Vec<u8>,
+    aux_u: Vec<u8>,
+    aux_v: Vec<u8>,
+}
+
+impl Avc444Planes {
+    /// Buffers for a `src_width` x `src_height` picture.
+    pub fn new(src_width: usize, src_height: usize) -> Self {
+        let width = align16(src_width.max(1));
+        let height = align16(src_height.max(1));
+        let full = width * height;
+        let quarter = (width / 2) * (height / 2);
+        Self {
+            width,
+            height,
+            y444: vec![0; full],
+            u444: vec![128; full],
+            v444: vec![128; full],
+            main_y: vec![0; full],
+            main_u: vec![128; quarter],
+            main_v: vec![128; quarter],
+            aux_y: vec![128; width * padded_aux_height(height)],
+            aux_u: vec![128; quarter],
+            aux_v: vec![128; quarter],
+        }
+    }
+
+    /// Encoded width (a multiple of 16).
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Encoded height (a multiple of 16).
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// The YUV444 planes (stride = `width()`), to be filled by the converter.
+    pub fn yuv444_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
+        (&mut self.y444, &mut self.u444, &mut self.v444)
+    }
+
+    /// Repeat the last column and row of the `src_width` x `src_height`
+    /// picture into the padding, so the padded macroblocks cost few bits and
+    /// do not bleed a wrong color into the picture's edge through the 4:2:0
+    /// views.
+    pub fn pad_edges(&mut self, src_width: usize, src_height: usize) {
+        let (w, h) = (self.width, self.height);
+        let sw = src_width.clamp(1, w);
+        let sh = src_height.clamp(1, h);
+        for plane in [&mut self.y444, &mut self.u444, &mut self.v444] {
+            if sw < w {
+                for row in plane.chunks_exact_mut(w).take(sh) {
+                    let last = row[sw - 1];
+                    row[sw..].fill(last);
+                }
+            }
+            if sh < h {
+                let (top, rest) = plane.split_at_mut(sh * w);
+                let last = &top[(sh - 1) * w..];
+                for row in rest.chunks_exact_mut(w) {
+                    row.copy_from_slice(last);
+                }
+            }
+        }
+    }
+
+    /// Make the main and auxiliary views from the YUV444 planes
+    /// ([`split_yuv444_to_yuv420_v1`]).
+    pub fn split(&mut self) {
+        let (w, h) = (self.width, self.height);
+        split_yuv444_to_yuv420_v1(
+            &self.y444,
+            &self.u444,
+            &self.v444,
+            w,
+            w,
+            w,
+            &mut self.main_y,
+            &mut self.main_u,
+            &mut self.main_v,
+            w,
+            w / 2,
+            w / 2,
+            &mut self.aux_y,
+            &mut self.aux_u,
+            &mut self.aux_v,
+            w,
+            w / 2,
+            w / 2,
+            w,
+            h,
+        );
+    }
+
+    /// Main view: Y, U, V.
+    pub fn main(&self) -> (&[u8], &[u8], &[u8]) {
+        (&self.main_y, &self.main_u, &self.main_v)
+    }
+
+    /// Auxiliary view: Y (the first `height()` rows are the picture), U, V.
+    pub fn aux(&self) -> (&[u8], &[u8], &[u8]) {
+        (
+            &self.aux_y[..self.width * self.height],
+            &self.aux_u,
+            &self.aux_v,
+        )
+    }
 }
 
 /// Split a full-resolution YUV444 frame into main + auxiliary YUV420 frames per
@@ -147,6 +281,7 @@ pub fn split_yuv444_to_yuv420_v1(
 /// main-view Y to dst Y at full resolution and replicates the main-view U/V
 /// samples across every position of each 2x2 block. The chroma pass below
 /// overwrites the odd positions with the auxiliary samples.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn combine_luma_to_yuv444(
     main_y: &[u8],
@@ -216,6 +351,7 @@ pub fn combine_luma_to_yuv444(
 /// Decoder CHROMAv1 pass — ported from FreeRDP's `general_ChromaV1ToYUV444`.
 /// Reverses [`split_yuv444_to_yuv420_v1`]'s B4/B5/B6/B7 packing back into the
 /// dst U/V planes' odd positions.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn combine_chroma_v1_to_yuv444(
     aux_y: &[u8],
@@ -278,6 +414,7 @@ pub fn combine_chroma_v1_to_yuv444(
 
 /// Borrow two disjoint rows from a strided plane. The bottom row is `None`
 /// when it falls outside `height` (caller's responsibility to verify).
+#[cfg(test)]
 fn split_two_rows_mut(
     plane: &mut [u8],
     stride: usize,
@@ -435,6 +572,91 @@ mod tests {
         roundtrip(1920, 1088);
         roundtrip(2560, 1440);
         roundtrip(3840, 2160);
+    }
+
+    #[test]
+    fn planes_are_whole_macroblocks() {
+        let p = Avc444Planes::new(1920, 1080);
+        assert_eq!((p.width(), p.height()), (1920, 1088));
+        let p = Avc444Planes::new(1280, 720);
+        assert_eq!((p.width(), p.height()), (1280, 720));
+        let p = Avc444Planes::new(1001, 7);
+        assert_eq!((p.width(), p.height()), (1008, 16));
+        assert_eq!(align16(0), 0);
+        assert_eq!(align16(16), 16);
+        assert_eq!(align16(17), 32);
+    }
+
+    /// The padding repeats the last column and row; the picture is unchanged.
+    #[test]
+    fn pad_edges_repeats_the_last_column_and_row() {
+        let mut p = Avc444Planes::new(5, 3);
+        let w = p.width();
+        {
+            let (y, u, v) = p.yuv444_mut();
+            for r in 0..3 {
+                for c in 0..5 {
+                    y[r * w + c] = (r * 10 + c) as u8;
+                    u[r * w + c] = 100 + (r * 10 + c) as u8;
+                    v[r * w + c] = 200 + (r * 10 + c) as u8;
+                }
+            }
+        }
+        p.pad_edges(5, 3);
+        let (y, u, v) = p.yuv444_mut();
+        for r in 0..16 {
+            for c in 0..16 {
+                let (sr, sc) = (r.min(2), c.min(4));
+                let want = (sr * 10 + sc) as u8;
+                assert_eq!(y[r * w + c], want, "Y ({c},{r})");
+                assert_eq!(u[r * w + c], 100 + want, "U ({c},{r})");
+                assert_eq!(v[r * w + c], 200 + want, "V ({c},{r})");
+            }
+        }
+    }
+
+    /// With a 16-aligned height every packed auxiliary row lies inside the
+    /// encoded picture, and the views decode back to the source exactly.
+    #[test]
+    fn split_views_fit_the_encoded_picture() {
+        let (w, h) = (64usize, 48usize);
+        let mut p = Avc444Planes::new(w, h);
+        let (src_y, src_u, src_v) = synthetic_yuv444(w, h);
+        {
+            let (y, u, v) = p.yuv444_mut();
+            y.copy_from_slice(&src_y);
+            u.copy_from_slice(&src_u);
+            v.copy_from_slice(&src_v);
+        }
+        p.split();
+        // Rows beyond the picture keep the fill value: nothing was packed there.
+        assert!(p.aux_y[w * h..].iter().all(|&b| b == 128));
+        let (my, mu, mv) = p.main();
+        let (ay, au, av) = p.aux();
+        assert_eq!(ay.len(), w * h);
+        let mut dy = vec![0u8; w * h];
+        let mut du = vec![0u8; w * h];
+        let mut dv = vec![0u8; w * h];
+        combine_luma_to_yuv444(
+            my,
+            mu,
+            mv,
+            w,
+            w / 2,
+            w / 2,
+            &mut dy,
+            &mut du,
+            &mut dv,
+            w,
+            w,
+            w,
+            w,
+            h,
+        );
+        combine_chroma_v1_to_yuv444(ay, au, av, w, w / 2, w / 2, &mut du, &mut dv, w, w, w, h);
+        assert_eq!(dy, src_y);
+        assert_eq!(du, src_u);
+        assert_eq!(dv, src_v);
     }
 
     #[test]

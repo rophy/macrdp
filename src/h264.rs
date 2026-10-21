@@ -3260,6 +3260,7 @@ impl Gfx {
                 self.fps,
                 ctx.adaptive_target_bps,
                 self.keyframe_secs,
+                false,
             )?;
             // Hand VT's output channel to a dedicated ship thread (push model),
             // so encoded frames are sent the instant they're ready, off the

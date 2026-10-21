@@ -67,6 +67,13 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
+    /// AVC444 (MS-RDPEGFX 3.3.8.3.2): each frame is split into a main view
+    /// (luma + 4:2:0 chroma) and an auxiliary view (the rest of the chroma),
+    /// and both go through this one session as two consecutive frames: main
+    /// at an even PTS, auxiliary at the next (odd) PTS. One session, because
+    /// the client feeds both views to one H.264 decoder (FreeRDP
+    /// `avc444_decompress`), so they must be one stream. `None` for AVC420.
+    avc444: Option<Box<crate::avc444::Avc444Planes>>,
 }
 
 /// Periodic keyframe (IDR) interval in frames for `keyframe_secs` seconds at
@@ -85,12 +92,20 @@ impl Encoder {
     /// Create a new H.264 encoder. `bitrate_bps` is the target average
     /// bitrate; `fps` sets the frame-duration hint used by VT's rate
     /// controller. The first encoded frame will always be a keyframe.
+    ///
+    /// With `avc444`, the session encodes the main and the auxiliary view of
+    /// each frame (see the `avc444` field) at the size rounded up to whole
+    /// macroblocks: the auxiliary view packs the odd chroma rows in 16-row
+    /// blocks. Each view then gets a frame time of 1/`fps` (media time runs at
+    /// twice the real time), so `bitrate_bps` applies to each view, as in
+    /// macrdp-v1; the periodic keyframe interval counts frames, not views.
     pub fn new(
         width: u16,
         height: u16,
         fps: u32,
         bitrate_bps: u32,
         keyframe_secs: f32,
+        avc444: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodedFrame>();
         // The callback receives the raw `*mut Sender` and clones it per
@@ -106,8 +121,25 @@ impl Encoder {
             std::env::var("MACRDP_H264_FULL_RANGE").as_deref(),
             Ok("0") | Ok("false") | Ok("FALSE")
         );
-        let keyframe_frames = keyframe_frames(fps, keyframe_secs);
-        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        let avc444 = avc444.then(|| {
+            Box::new(crate::avc444::Avc444Planes::new(
+                usize::from(width),
+                usize::from(height),
+            ))
+        });
+        let (session_w, session_h) = match avc444.as_deref() {
+            Some(p) => (
+                u16::try_from(p.width())
+                    .map_err(|_| anyhow!("AVC444 width {} too large", p.width()))?,
+                u16::try_from(p.height())
+                    .map_err(|_| anyhow!("AVC444 height {} too large", p.height()))?,
+            ),
+            None => (width, height),
+        };
+        let views = if avc444.is_some() { 2 } else { 1 };
+        let keyframe_frames = keyframe_frames(fps, keyframe_secs).saturating_mul(views);
+        let session =
+            ffi::create_session(session_w, session_h, bitrate_bps, keyframe_frames, tx_ptr)?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -117,6 +149,7 @@ impl Encoder {
             next_pts: 0,
             fps,
             full_range,
+            avc444,
         })
     }
 
@@ -140,12 +173,20 @@ impl Encoder {
     /// congestion-responsive IDR backoff (`h264.rs`). Stretch it under congestion to
     /// suppress the periodic IDR; restore on recovery. No encoder rebuild.
     pub fn set_keyframe_interval(&self, keyframe_frames: u32) -> Result<()> {
+        // Two views per frame in AVC444: the session counts views.
+        let views = if self.avc444.is_some() { 2 } else { 1 };
         // SAFETY: `self.inner.session` is valid for the lifetime of the Encoder.
-        unsafe { ffi::set_max_keyframe_interval(self.inner.session, keyframe_frames) }
+        unsafe {
+            ffi::set_max_keyframe_interval(
+                self.inner.session,
+                keyframe_frames.saturating_mul(views),
+            )
+        }
     }
 
     /// Presentation time stamp the next `encode_bgra` gives its frame
-    /// (`EncodedFrame::pts`).
+    /// (`EncodedFrame::pts`). In AVC444 this is the main view's PTS (even);
+    /// the auxiliary view has the next one.
     pub fn next_pts(&self) -> i64 {
         self.next_pts
     }
@@ -176,6 +217,33 @@ impl Encoder {
                 expected,
                 stride,
                 self.height
+            );
+        }
+        if let Some(planes) = self.avc444.as_deref_mut() {
+            let pts = self.next_pts;
+            self.next_pts = self.next_pts.wrapping_add(2);
+            ffi::bgra_to_yuv444_padded(
+                bgra,
+                stride,
+                usize::from(self.width),
+                usize::from(self.height),
+                planes,
+            );
+            planes.split();
+            let (w, h) = (planes.width(), planes.height());
+            let main = planes.main();
+            ffi::encode_yuv420(&self.inner, w, h, main, pts, self.fps, force_keyframe)?;
+            // The auxiliary view follows its main view; a forced keyframe is
+            // the main view, so the periodic keyframes stay on main views too.
+            let aux = planes.aux();
+            return ffi::encode_yuv420(
+                &self.inner,
+                w,
+                h,
+                aux,
+                pts.wrapping_add(1),
+                self.fps,
+                false,
             );
         }
         let pts = self.next_pts;
@@ -865,21 +933,15 @@ mod ffi {
         Ok(())
     }
 
-    // --- BGRA -> full-range YUV444 planar (AVC444 scoping benchmark) ---------
+    // --- BGRA -> full-range YUV444 planar (AVC444) ----------------------------
     //
-    // Two reference implementations of full-resolution chroma conversion, kept
-    // side-by-side for an A/B perf decision before committing to AVC444's
-    // 2-encoder pipeline. Same BT.709 full-range matrix as the NV12 path.
-    // Neither is wired into encode_frame; they exist for the bench in
-    // videotoolbox::tests::bench_yuv444_full_range.
-    //
-    // Gated behind cfg(test) until AVC444 is actually wired up — they're
-    // dead code in a production build today.
+    // Full-resolution chroma for AVC444: same BT.709 full-range matrix as the
+    // NV12 path, without the 2x2 averaging. The vImage path is used; the scalar
+    // one is the fallback and the reference of the tests.
 
     /// Scalar BGRA -> three full-resolution planar Y/Cb/Cr buffers. The matrix
     /// matches `bgra_to_nv12_full_range` exactly — the only difference is no
     /// 2x2 averaging.
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_scalar(
         bgra: &[u8],
@@ -915,7 +977,6 @@ mod ffi {
         }
     }
 
-    #[cfg(test)]
     extern "C" {
         /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
         /// per output plane. The matrix is `int16_t[4]` in source byte order; we
@@ -939,30 +1000,22 @@ mod ffi {
     /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
     /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
     /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
-    #[cfg(test)]
     const DIVISOR: i32 = 16384; // 2^14
 
     // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
-    #[cfg(test)]
     const Y_MATRIX: [i16; 4] = [1183, 11718, 3483, 0]; // 0.0722, 0.7152, 0.2126, 0
-    #[cfg(test)]
     const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
 
     // Cb plane coefficients + 128*Q14 bias to recenter.
-    #[cfg(test)]
     const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
-    #[cfg(test)]
     const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     // Cr plane.
-    #[cfg(test)]
     const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
-    #[cfg(test)]
     const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
     /// `vImageMatrixMultiply_ARGB8888ToPlanar8` calls (one per plane).
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bgra_to_yuv444_planar_vimage(
         bgra: &[u8],
@@ -1007,6 +1060,141 @@ mod ffi {
             if err != 0 {
                 bail!("vImageMatrixMultiply_ARGB8888ToPlanar8 failed: {err}");
             }
+        }
+        Ok(())
+    }
+
+    /// BGRA (`width` x `height`) -> the full-range YUV444 planes of `planes`,
+    /// whose size is rounded up to whole macroblocks; the last column and row
+    /// are repeated into the padding (`Avc444Planes::pad_edges`).
+    pub(super) fn bgra_to_yuv444_padded(
+        bgra: &[u8],
+        stride: usize,
+        width: usize,
+        height: usize,
+        planes: &mut crate::avc444::Avc444Planes,
+    ) {
+        let pw = planes.width();
+        let (y, u, v) = planes.yuv444_mut();
+        if bgra_to_yuv444_planar_vimage(bgra, stride, width, height, y, pw, u, pw, v, pw).is_err() {
+            bgra_to_yuv444_planar_scalar(bgra, stride, width, height, y, pw, u, pw, v, pw);
+        }
+        planes.pad_edges(width, height);
+    }
+
+    /// Submit one planar YUV420 picture (`width` x `height`, Y stride `width`,
+    /// U/V stride `width / 2`) as a full-range NV12 frame. Used for the two
+    /// AVC444 views; the auxiliary view carries chroma samples in its Y
+    /// plane, so the buffer must be full range (`420f`) to keep 0-255.
+    pub(super) fn encode_yuv420(
+        guard: &SessionGuard,
+        width: usize,
+        height: usize,
+        planes: (&[u8], &[u8], &[u8]),
+        pts: i64,
+        fps: u32,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        let (src_y, src_u, src_v) = planes;
+        let half_w = width / 2;
+        if src_y.len() < width * height
+            || src_u.len() < half_w * (height / 2)
+            || src_v.len() < half_w * (height / 2)
+        {
+            bail!("YUV420 planes too small for {width}x{height}");
+        }
+        let mut pbuf: CVPixelBufferRef = ptr::null();
+        let status = unsafe {
+            CVPixelBufferCreate(
+                ptr::null(),
+                width,
+                height,
+                K_CV_PIXEL_FORMAT_TYPE_420F,
+                ptr::null(),
+                &mut pbuf,
+            )
+        };
+        if status != 0 || pbuf.is_null() {
+            bail!("CVPixelBufferCreate failed: {status}");
+        }
+        let result = unsafe {
+            CVPixelBufferLockBaseAddress(pbuf, 0);
+            let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
+            let c_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8;
+            let c_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
+            let y_plane = std::slice::from_raw_parts_mut(y_base, y_stride * height);
+            let c_plane = std::slice::from_raw_parts_mut(c_base, c_stride * (height / 2));
+            for row in 0..height {
+                y_plane[row * y_stride..row * y_stride + width]
+                    .copy_from_slice(&src_y[row * width..(row + 1) * width]);
+            }
+            for row in 0..height / 2 {
+                let dst = &mut c_plane[row * c_stride..row * c_stride + half_w * 2];
+                let u = &src_u[row * half_w..(row + 1) * half_w];
+                let v = &src_v[row * half_w..(row + 1) * half_w];
+                for ((d, &cb), &cr) in dst.chunks_exact_mut(2).zip(u).zip(v) {
+                    d[0] = cb;
+                    d[1] = cr;
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pbuf, 0);
+            submit(guard, pbuf, pts, fps, force_keyframe)
+        };
+        unsafe { CFRelease(pbuf) };
+        result
+    }
+
+    /// Hand a filled pixel buffer to the session (async; output arrives in
+    /// `output_callback`). The caller keeps and releases its reference.
+    unsafe fn submit(
+        guard: &SessionGuard,
+        pbuf: CVPixelBufferRef,
+        pts: i64,
+        fps: u32,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        let presentation = CMTime {
+            value: pts,
+            timescale: i32::try_from(fps).unwrap_or(30),
+            flags: K_CM_TIME_FLAGS_VALID,
+            epoch: 0,
+        };
+        let duration = CMTime {
+            value: 1,
+            timescale: i32::try_from(fps).unwrap_or(30),
+            flags: K_CM_TIME_FLAGS_VALID,
+            epoch: 0,
+        };
+        let frame_props: CFDictionaryRef = if force_keyframe {
+            let key = kVTEncodeFrameOptionKey_ForceKeyFrame;
+            let value = kCFBooleanTrue;
+            CFDictionaryCreate(
+                ptr::null(),
+                &key as *const *const c_void,
+                &value as *const *const c_void,
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            )
+        } else {
+            ptr::null()
+        };
+        let mut info_flags: VTEncodeInfoFlags = 0;
+        let encode_status = VTCompressionSessionEncodeFrame(
+            guard.session,
+            pbuf,
+            presentation,
+            duration,
+            frame_props,
+            ptr::null_mut(),
+            &mut info_flags,
+        );
+        if !frame_props.is_null() {
+            CFRelease(frame_props);
+        }
+        if encode_status != 0 {
+            bail!("VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}");
         }
         Ok(())
     }
@@ -1108,54 +1296,7 @@ mod ffi {
                 }
             }
             CVPixelBufferUnlockBaseAddress(pbuf, 0);
-
-            let presentation = CMTime {
-                value: pts,
-                timescale: i32::try_from(fps).unwrap_or(30),
-                flags: K_CM_TIME_FLAGS_VALID,
-                epoch: 0,
-            };
-            let duration = CMTime {
-                value: 1,
-                timescale: i32::try_from(fps).unwrap_or(30),
-                flags: K_CM_TIME_FLAGS_VALID,
-                epoch: 0,
-            };
-            let frame_props: CFDictionaryRef = if force_keyframe {
-                let key = kVTEncodeFrameOptionKey_ForceKeyFrame;
-                let value = kCFBooleanTrue;
-                CFDictionaryCreate(
-                    ptr::null(),
-                    &key as *const *const c_void,
-                    &value as *const *const c_void,
-                    1,
-                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
-                )
-            } else {
-                ptr::null()
-            };
-
-            let mut info_flags: VTEncodeInfoFlags = 0;
-            let encode_status = VTCompressionSessionEncodeFrame(
-                guard.session,
-                pbuf,
-                presentation,
-                duration,
-                frame_props,
-                ptr::null_mut(),
-                &mut info_flags,
-            );
-            if !frame_props.is_null() {
-                CFRelease(frame_props);
-            }
-            if encode_status != 0 {
-                Err(anyhow!(
-                    "VTCompressionSessionEncodeFrame failed: OSStatus {encode_status}"
-                ))
-            } else {
-                Ok(())
-            }
+            submit(guard, pbuf, pts, fps, force_keyframe)
         };
         unsafe { CFRelease(pbuf) };
         result
@@ -1595,12 +1736,12 @@ mod tests {
         // Warm up VT (first session boot is expensive; we don't want it skewing
         // the baseline).
         {
-            let mut warm = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+            let mut warm = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false).unwrap();
             drive_one(&mut warm);
         }
 
         // Baseline: single session, N frames.
-        let mut e1 = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+        let mut e1 = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false).unwrap();
         let t = Instant::now();
         drive_one(&mut e1);
         let t_single = t.elapsed();
@@ -1608,8 +1749,8 @@ mod tests {
         // Dual: two sessions, N frames each, submissions interleaved, then both
         // flushed. If VT parallelizes, e_b's frames overlap with e_a's flush
         // wait and the second flush returns nearly instantly.
-        let mut e_a = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
-        let mut e_b = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S).unwrap();
+        let mut e_a = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false).unwrap();
+        let mut e_b = Encoder::new(W, H, FPS, BITRATE_BPS, KEYFRAME_S, false).unwrap();
         let t = Instant::now();
         for i in 0..N_FRAMES {
             e_a.encode_bgra(black_box(&frame), stride, i == 0).unwrap();
@@ -1710,7 +1851,7 @@ mod tests {
             px[3] = 0xff; // A
         }
 
-        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0)?;
+        let mut enc = Encoder::new(w, h, 30, 4_000_000, 5.0, false)?;
         enc.encode_bgra(&frame, stride, false)?;
         let frames = enc.flush()?;
         assert!(!frames.is_empty(), "expected at least one encoded frame");
@@ -1724,6 +1865,38 @@ mod tests {
             !first.parameter_sets.is_empty(),
             "keyframe should carry SPS/PPS parameter sets"
         );
+        Ok(())
+    }
+
+    /// AVC444: each frame gives two encoded views from the one session, main
+    /// at the even PTS and auxiliary at the next one, at the size rounded up
+    /// to whole macroblocks; a forced keyframe is the main view.
+    #[test]
+    fn avc444_encodes_a_main_and_an_auxiliary_view_per_frame() -> Result<()> {
+        let (w, h): (u16, u16) = (328, 244);
+        let stride = usize::from(w) * 4;
+        let mut frame = vec![0u8; stride * usize::from(h)];
+        for (i, px) in frame.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 251) as u8;
+            px[1] = 0x77;
+            px[2] = (i % 199) as u8;
+            px[3] = 0xff;
+        }
+        let mut enc = Encoder::new(w, h, 30, 4_000_000, 0.0, true)?;
+        assert_eq!(enc.next_pts(), 0);
+        enc.encode_bgra(&frame, stride, true)?;
+        assert_eq!(enc.next_pts(), 2);
+        enc.encode_bgra(&frame, stride, false)?;
+        enc.encode_bgra(&frame, stride, true)?;
+        let frames = enc.flush()?;
+        let pts: Vec<i64> = frames.iter().map(|f| f.pts).collect();
+        assert_eq!(pts, vec![0, 1, 2, 3, 4, 5]);
+        let keys: Vec<bool> = frames.iter().map(|f| f.is_keyframe).collect();
+        assert_eq!(keys, vec![true, false, false, false, true, false]);
+        assert!(frames.iter().all(|f| !f.data.is_empty()));
+        // The keyframe carries the parameter sets (SPS first).
+        let sps = &frames[0].parameter_sets[0];
+        assert_eq!(sps[0] & 0x1f, 7, "first parameter set is the SPS");
         Ok(())
     }
 }
