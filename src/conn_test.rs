@@ -349,11 +349,35 @@ async fn connect_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    let (result, framed) = connect_client_with(client_io, client_w, client_h, false).await?;
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        framed,
+    ))
+}
+
+/// [`connect_client`], returning the whole `ConnectionResult`; with `drdynvc`
+/// the client also joins the drdynvc static channel.
+async fn connect_client_with<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+    drdynvc: bool,
+) -> anyhow::Result<(
+    ironrdp_connector::ConnectionResult,
+    TokioFramed<tokio_rustls::client::TlsStream<S>>,
+)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
     // pre-TLS negotiation
     let mut connector = ClientConnector::new(
         client_config(client_w, client_h),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
     );
+    if drdynvc {
+        connector = connector.with_static_channel(ironrdp_dvc::DrdynvcClient::new());
+    }
     let mut framed = TokioFramed::new(client_io);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
     let initial = framed.into_inner_no_leftover();
@@ -384,10 +408,7 @@ where
         None,
     )
     .await?;
-    Ok((
-        (result.desktop_size.width, result.desktop_size.height),
-        tls_framed,
-    ))
+    Ok((result, tls_framed))
 }
 
 /// Run one full client→server connect over an in-memory duplex with the given
@@ -1309,6 +1330,30 @@ fn without_error_info_support(connect_initial: &[u8]) -> anyhow::Result<Vec<u8>>
     .map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 
+/// The client's Client Info PDU with INFO_AUDIOCAPTURE set (mstsc "Record from
+/// this computer"), or `None` if `pdu` is not a Client Info PDU.
+fn with_audio_capture(pdu: &[u8]) -> Option<Vec<u8>> {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::mcs::{McsMessage, SendDataRequest};
+    use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+    use ironrdp_pdu::rdp::ClientInfoPdu;
+    use ironrdp_pdu::x224::X224;
+
+    let x224 = decode::<X224<McsMessage<'_>>>(pdu).ok()?;
+    let McsMessage::SendDataRequest(req) = x224.0 else {
+        return None;
+    };
+    let mut info = decode::<ClientInfoPdu>(&req.user_data).ok()?;
+    info.client_info.flags |= ClientInfoFlags::AUDIO_CAPTURE;
+    let user_data = encode_vec(&info).ok()?;
+    encode_vec(&X224(McsMessage::SendDataRequest(SendDataRequest {
+        initiator_id: req.initiator_id,
+        channel_id: req.channel_id,
+        user_data: std::borrow::Cow::Owned(user_data),
+    })))
+    .ok()
+}
+
 /// A TLS man in the middle between the test client and the server that clears
 /// SUPPORT_ERR_INFO_PDU in the Connect Initial and passes everything else
 /// unchanged. The IronRDP client always sets the flag, and CredSSP is off, so
@@ -1316,6 +1361,19 @@ fn without_error_info_support(connect_initial: &[u8]) -> anyhow::Result<Vec<u8>>
 async fn strip_error_info_support(
     client: tokio::io::DuplexStream,
     server: tokio::io::DuplexStream,
+) -> anyhow::Result<()> {
+    patching_proxy(client, server, true, false).await
+}
+
+/// A TLS man in the middle between the test client and the server. It can
+/// clear SUPPORT_ERR_INFO_PDU in the Connect Initial (`strip_error_info`) and
+/// set INFO_AUDIOCAPTURE in the Client Info PDU (`audio_capture`); the IronRDP
+/// client cannot be told to do either. Everything else passes unchanged.
+async fn patching_proxy(
+    client: tokio::io::DuplexStream,
+    server: tokio::io::DuplexStream,
+    strip_error_info: bool,
+    audio_capture: bool,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
@@ -1339,11 +1397,38 @@ async fn strip_error_info_support(
 
     // The first PDU over TLS is the MCS Connect Initial.
     let connect_initial = read_tpkt(&mut client).await?;
-    server
-        .write_all(&without_error_info_support(&connect_initial)?)
-        .await?;
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-    Ok(())
+    if strip_error_info {
+        server
+            .write_all(&without_error_info_support(&connect_initial)?)
+            .await?;
+    } else {
+        server.write_all(&connect_initial).await?;
+    }
+    if !audio_capture {
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        return Ok(());
+    }
+    // The client's slow-path PDUs up to the Client Info PDU (all TPKT; no
+    // fast-path before activation), while the server's go through as they are.
+    let (mut client_rx, mut client_tx) = tokio::io::split(client);
+    let (mut server_rx, mut server_tx) = tokio::io::split(server);
+    let to_client = async move {
+        let _ = tokio::io::copy(&mut server_rx, &mut client_tx).await;
+    };
+    let to_server = async move {
+        loop {
+            let pdu = read_tpkt(&mut client_rx).await?;
+            if let Some(patched) = with_audio_capture(&pdu) {
+                server_tx.write_all(&patched).await?;
+                break;
+            }
+            server_tx.write_all(&pdu).await?;
+        }
+        let _ = tokio::io::copy(&mut client_rx, &mut server_tx).await;
+        anyhow::Ok(())
+    };
+    let (_, sent) = tokio::join!(to_client, to_server);
+    sent
 }
 
 /// What a connected client reads after the server sends
@@ -1425,6 +1510,139 @@ async fn idle_timeout_disconnect_sends_no_error_info_to_a_client_without_it() ->
     assert!(
         !idle_timeout_disconnect(true).await?,
         "a client without SUPPORT_ERR_INFO_PDU must not get the Set Error Info PDU"
+    );
+    Ok(())
+}
+
+// ---- AUDIO_INPUT only for INFO_AUDIOCAPTURE (vendored divergence (34)) -----
+
+/// An audio-input factory that never receives audio (no sink).
+struct TestAudin;
+impl ironrdp_server::AudinServerFactory for TestAudin {
+    fn build_processor(&self) -> ironrdp_server::AudinServer {
+        ironrdp_server::AudinServer::new(None)
+    }
+}
+
+/// The DVC names the server offers (Create Requests) to a client that joins
+/// drdynvc and answers the Capabilities Request, with or without
+/// INFO_AUDIOCAPTURE in its Client Info PDU. The server has an audio-input
+/// factory, as with `--enable-microphone-redirection`.
+async fn offered_dvcs(audio_capture: bool) -> anyhow::Result<Vec<String>> {
+    use ironrdp_core::decode;
+    use ironrdp_dvc::pdu::{
+        CapabilitiesResponsePdu, CapsVersion, DrdynvcClientPdu, DrdynvcServerPdu,
+    };
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::x224::X224;
+    use ironrdp_tokio::FramedWrite as _;
+
+    init_tracing();
+    let (client_io, proxy_client_io) = tokio::io::duplex(64 * 1024);
+    let (proxy_server_io, server_io) = tokio::io::duplex(64 * 1024);
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(TestInput)
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_audin_factory(Some(Box::new(TestAudin)))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .build();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let proxy_task = tokio::task::spawn_local(patching_proxy(
+                proxy_client_io,
+                proxy_server_io,
+                false,
+                audio_capture,
+            ));
+            let (result, mut framed) = connect_client_with(client_io, 1024, 768, true).await?;
+            let dvc_channel = result
+                .static_channels
+                .get_channel_id_by_type::<ironrdp_dvc::DrdynvcClient>()
+                .ok_or_else(|| anyhow::anyhow!("drdynvc not joined"))?;
+
+            let mut names = Vec::new();
+            let mut answered = false;
+            loop {
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_millis(if names.is_empty() { 10_000 } else { 500 }),
+                    framed.read_pdu(),
+                )
+                .await;
+                let Ok(read) = read else { break };
+                let (_action, bytes) = read?;
+                let Ok(x224) = decode::<X224<McsMessage<'_>>>(&bytes) else {
+                    continue;
+                };
+                let McsMessage::SendDataIndication(data) = x224.0 else {
+                    continue;
+                };
+                // CHANNEL_PDU_HEADER (length, flags), then one DVC PDU.
+                if data.channel_id != dvc_channel || data.user_data.len() < 8 {
+                    continue;
+                }
+                match decode::<DrdynvcServerPdu>(&data.user_data[8..]) {
+                    Ok(DrdynvcServerPdu::Capabilities(_)) if !answered => {
+                        answered = true;
+                        let caps = DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+                            CapsVersion::V2,
+                        ));
+                        let msg = ironrdp_svc::client_encode_svc_messages(
+                            vec![caps.into()],
+                            dvc_channel,
+                            result.user_channel_id,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                        framed.write_all(&msg).await?;
+                    }
+                    Ok(DrdynvcServerPdu::Create(req)) => names.push(req.channel_name().to_owned()),
+                    _ => {}
+                }
+            }
+            server_task.abort();
+            proxy_task.abort();
+            anyhow::ensure!(answered, "no DVC Capabilities Request from the server");
+            anyhow::Ok(names)
+        })
+        .await
+}
+
+/// mstsc without "Record from this computer" (no INFO_AUDIOCAPTURE) is not
+/// offered AUDIO_INPUT; the other DVCs are still offered.
+#[tokio::test]
+async fn audio_input_is_not_offered_without_audio_capture() -> anyhow::Result<()> {
+    let names = offered_dvcs(false).await?;
+    assert!(!names.is_empty(), "the server offered no DVC at all");
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == ironrdp_server::AUDIO_INPUT_CHANNEL_NAME),
+        "AUDIO_INPUT offered without INFO_AUDIOCAPTURE: {names:?}"
+    );
+    Ok(())
+}
+
+/// With INFO_AUDIOCAPTURE the AUDIO_INPUT DVC is offered.
+#[tokio::test]
+async fn audio_input_is_offered_with_audio_capture() -> anyhow::Result<()> {
+    let names = offered_dvcs(true).await?;
+    assert!(
+        names
+            .iter()
+            .any(|n| n == ironrdp_server::AUDIO_INPUT_CHANNEL_NAME),
+        "AUDIO_INPUT not offered with INFO_AUDIOCAPTURE: {names:?}"
     );
     Ok(())
 }
