@@ -116,6 +116,13 @@ const ADAPTIVE_WARMUP: Duration = Duration::from_secs(2);
 /// any realistic frames-in-flight window (even 500 ms RTT at 60 fps is ~30).
 const RTT_RING: usize = 128;
 
+/// A new encoder id, unique in the process (never 0). See
+/// `ConnectionContext::encoder_gen`.
+fn next_encoder_gen() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Bucket width of the two-bucket windowed-minimum RTT filter. The min over
 /// the current + previous bucket is the base-RTT estimate the queue-delay
 /// signal subtracts; a route change (VPN reconnect) re-baselines within ~2
@@ -227,9 +234,16 @@ struct ConnectionContext {
     /// suspend frame acks (queue_depth=0xFFFFFFFF) which disables the EGFX
     /// ack-based backpressure entirely. Per-connection (fresh each context) so
     /// counts don't leak across reconnects; `Arc` so the ship thread shares
-    /// `shipped`.
+    /// `shipped`. Each encoder gets new counters (`setup_locked`): a ship
+    /// thread of a replaced encoder keeps its own `shipped`, so it cannot
+    /// make `shipped` larger than `submitted` for the new encoder.
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
+    /// Id of the current encoder (0: none yet), from [`next_encoder_gen`].
+    /// Its ship thread carries the same id; `ship_frames` drops the frames
+    /// of a ship thread whose encoder was replaced, so they cannot go to the
+    /// new surface or take the new encoder's refinement regions.
+    encoder_gen: u64,
     /// Dimensions the surface + encoder were created with (in
     /// `setup_locked`, from the live `SharedDesktopSize`). `ship_frames`
     /// builds its AVC420 regions from these — not from a fresh
@@ -406,6 +420,15 @@ struct ConnectionContext {
 }
 
 impl ConnectionContext {
+    /// A new encoder starts: new throttle counters and a new encoder id.
+    /// Returns the id and the `shipped` counter for its ship thread.
+    fn start_encoder_generation(&mut self) -> (u64, Arc<AtomicU64>) {
+        self.submitted = Arc::new(AtomicU64::new(0));
+        self.shipped = Arc::new(AtomicU64::new(0));
+        self.encoder_gen = next_encoder_gen();
+        (self.encoder_gen, self.shipped.clone())
+    }
+
     /// Starts the connection's clocks at `now`, the moment the EGFX channel goes
     /// ready. The context is built when the server attaches channels, which is
     /// at TCP accept, before TLS and authentication. A slow login (a
@@ -3459,6 +3482,7 @@ impl Gfx {
         rx: std::sync::mpsc::Receiver<EncodedFrame>,
         shipped: Arc<AtomicU64>,
         avc444: bool,
+        gen: u64,
     ) {
         use std::sync::mpsc::RecvTimeoutError;
         let mut pairing = ViewPairing::default();
@@ -3510,11 +3534,11 @@ impl Gfx {
                     n,
                 )
             };
-            if !strays.is_empty() {
+            if !strays.is_empty() && self.is_current_encoder(gen) {
                 self.on_stray_views(&strays);
             }
             if !items.is_empty() {
-                if let Err(e) = self.ship_frames(&items) {
+                if let Err(e) = self.ship_frames(gen, &items) {
                     warn!(error = ?e, "EGFX ship_frames failed");
                 }
             }
@@ -3536,6 +3560,15 @@ impl Gfx {
              went alone after the wait): the next frame is a keyframe; frames already encoded \
              against it show wrong pixels until then"
         );
+    }
+
+    /// Whether encoder `gen` is still the connection's encoder.
+    fn is_current_encoder(&self, gen: u64) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.encoder_gen == gen)
     }
 
     /// The client's decoder missed a picture: the next frame is a keyframe,
@@ -3659,14 +3692,15 @@ impl Gfx {
             }
             // A frame dropped before belongs to the old encoder (maybe another size).
             self.latest_dropped.store(false, Ordering::Relaxed);
-            // Fresh throttle counters for this connection.
-            ctx.submitted.store(0, Ordering::Relaxed);
-            ctx.shipped.store(0, Ordering::Relaxed);
+            // Fresh throttle counters and id for this encoder. New `Arc`s, not
+            // `store(0)`: a ship thread of the encoder before may still hold
+            // frames (it waits for the ctx lock held here) and adds them to
+            // its own counter after this.
+            let (gen, shipped) = ctx.start_encoder_generation();
             let gfx = self.clone();
-            let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped, avc444))
+                .spawn(move || gfx.ship_loop(rx, shipped, avc444, gen))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             debug!(
                 avc444,
@@ -3784,8 +3818,8 @@ impl Gfx {
     /// expects (real RDS servers send a deactivation-reactivation + graphics
     /// reset). Dropping `ctx.encoder` here synchronously invalidates the old
     /// VT session and closes its channel, so the old ship thread exits
-    /// cleanly; frames it still holds fail the `surface_id` lookup and are
-    /// dropped harmlessly.
+    /// cleanly; frames it still holds carry the old encoder id and are
+    /// dropped by `ship_frames`, also after the new `setup_locked` ran.
     ///
     /// History: a channel-level non-destructive surface swap (CreateSurface
     /// then MapSurfaceToOutput over the live session, NO core reactivation,
@@ -3806,6 +3840,7 @@ impl Gfx {
             // `submit_bgra` run `setup_locked` (which also rebuilds the
             // encoder and resets the throttle counters).
             ctx.encoder = None;
+            ctx.encoder_gen = 0;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
             self.latest_dropped.store(false, Ordering::Relaxed);
@@ -3922,7 +3957,11 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[ShipFrame]) -> Result<()> {
+    /// Ships the frames of encoder `gen`. Frames of an encoder that was
+    /// replaced (live resize, AVC444/AVC420 switch, a new connection) are
+    /// dropped: the new encoder's surface, size and refinement regions are
+    /// not theirs.
+    fn ship_frames(&self, gen: u64, frames: &[ShipFrame]) -> Result<()> {
         let (dvc_messages, egfx_channel_id) = {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -3951,6 +3990,15 @@ impl Gfx {
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
+                if ctx.encoder_gen != gen {
+                    debug!(
+                        frames = frames.len(),
+                        gen,
+                        current = ctx.encoder_gen,
+                        "EGFX frames of a replaced encoder dropped"
+                    );
+                    return Ok(());
+                }
                 let surface_id = ctx
                     .surface_id
                     .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
@@ -4265,6 +4313,7 @@ impl GfxServerFactory for Gfx {
             egfx_declined: egfx_declined.clone(),
             submitted: Arc::new(AtomicU64::new(0)),
             shipped: Arc::new(AtomicU64::new(0)),
+            encoder_gen: 0,
             dims: (0, 0),
             last_ack_at: Instant::now(),
             last_ack_advance_at: Instant::now(),
@@ -4438,6 +4487,7 @@ impl GraphicsPipelineHandler for GfxHandler {
                     .is_some_and(|e| e.is_avc444() != avc444)
                 {
                     ctx.encoder = None;
+                    ctx.encoder_gen = 0;
                 }
                 ctx.avc444 = avc444;
                 info!(?negotiated, avc444, "EGFX channel ready (H.264 active)");
@@ -4656,6 +4706,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             );
             ctx.is_ready = false;
             ctx.encoder = None;
+            ctx.encoder_gen = 0;
             ctx.surface_id = None;
             ctx.need_keyframe = true;
             // Frames sent on the closed channel are never acknowledged.
@@ -7009,6 +7060,48 @@ mod tests {
         assert_eq!(count(&[0, 1, 3], &[]), 2);
         // Normal pairs.
         assert_eq!(count(&[0, 1, 2, 3], &[]), 2);
+    }
+
+    /// An encoder rebuild while the old ship thread still holds frames (R50,
+    /// final review I3): the old thread counts its frames on its own counter,
+    /// so the new encoder's `submitted == shipped` (the refinement gate) still
+    /// holds; its frames are dropped and do not take the new encoder's
+    /// refinement regions.
+    #[test]
+    fn a_replaced_encoder_cannot_ship_or_count_into_the_new_one() {
+        let gfx = gfx_with_context();
+        let (old_gen, old_shipped) = {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.surface_id = Some(0);
+            ctx.start_encoder_generation()
+        };
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            let (new_gen, _) = ctx.start_encoder_generation();
+            assert_ne!(new_gen, old_gen);
+            ctx.submitted.fetch_add(1, Ordering::Relaxed);
+            let mut grid = refine::TileGrid::new(64, 64);
+            grid.mark_all();
+            ctx.refine
+                .lock()
+                .unwrap()
+                .on_encoded(0, Regions::Tiles(grid));
+        }
+        // The old thread ships a frame with a large time stamp, then counts it.
+        assert!(gfx
+            .ship_frames(old_gen, &[ShipFrame::Avc420(view(100, false))])
+            .is_ok());
+        old_shipped.fetch_add(1, Ordering::Relaxed);
+        let guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        assert_eq!(ctx.shipped.load(Ordering::Relaxed), 0);
+        assert_eq!(ctx.submitted.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            ctx.refine.lock().unwrap().take_regions(0),
+            Regions::Tiles(_)
+        ));
     }
 
     /// A frame is a keyframe when either view is one (the periodic interval
