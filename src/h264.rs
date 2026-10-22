@@ -1755,7 +1755,9 @@ impl ViewPairing {
 ///
 /// The whole frame is exact (the WireToSurface1 of an AVC444 frame is written
 /// by [`avc444_wire_to_surface`], whose destination rectangle is exclusive
-/// too). Tiles stop one row above the frame bottom, as the AVC420 tiles do:
+/// too). Tiles stop one row above the frame bottom (AVC444 only; AVC420 tiles
+/// reach the bottom row, 6 of 6 FreeRDP sessions clean in R51, while AVC444
+/// tiles that reach it corrupted the heap 3 of 3 times again):
 /// FreeRDP 3.30 corrupted its heap (abort in `free()` when the session ended,
 /// 3 of 3 runs on two machines) with several AVC444 rectangles of which one
 /// reached the bottom edge, and not with one rectangle (whole frame, a single
