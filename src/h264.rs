@@ -1924,9 +1924,9 @@ fn is_wire_to_surface1(m: &ironrdp_dvc::DvcMessage) -> bool {
 /// (`areRectsValid`, "outside of bounding frame", every frame at
 /// `/size:1023x719`). So the last column or row of an odd size is not painted.
 fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
+    let (width, height) = (width & !1, height & !1);
     let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
         left,
-    let (width, height) = (width & !1, height & !1);
         top,
         right,
         bottom,
