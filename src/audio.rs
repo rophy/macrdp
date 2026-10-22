@@ -28,6 +28,40 @@ use tracing::{debug, info, warn};
 // the ~20% over-feed / drift on mstsc. The capture loop resamples 48 -> 44.1
 // before handing PCM to the client.
 const SCK_SAMPLE_RATE: u32 = 48000;
+
+/// Resampler input chunk (frames at the SCK rate). SCK delivers audio in
+/// buffers of 960 frames (20 ms at 48 kHz, measured 2026-10-22, macOS on M1),
+/// so a chunk of that size is resampled as soon as its buffer arrives. With
+/// 1024 a chunk waited for part of the next buffer.
+#[cfg(any(target_os = "macos", test))]
+const RESAMPLE_CHUNK: usize = 960;
+
+/// Sub-chunks of the FFT resampler: a shorter FFT, so a shorter delay (147
+/// output frames, 3.3 ms, instead of 514, 11.7 ms, with one 1024 chunk); the
+/// response stays flat to 20 kHz (-5 dB at 21 kHz).
+#[cfg(any(target_os = "macos", test))]
+const RESAMPLE_SUB_CHUNKS: usize = 3;
+
+/// The 48 -> 44.1 kHz resampler of the capture loop.
+///
+/// SCK only delivers 8/16/24/48 kHz. We capture at 48 and resample to the
+/// advertised SAMPLE_RATE (44.1 kHz) so the client plays at its native rate
+/// without internal resampling. The resampler and the chunking are on the
+/// path of every sound: with 1024-frame chunks and one FFT per chunk, the
+/// first wave of a sound left 22-64 ms after its SCK buffer arrived
+/// (R51 trace; macrdp-v1, which sends 48 kHz 20 ms frames as they come, was
+/// ~30 ms sooner on the wire).
+#[cfg(any(target_os = "macos", test))]
+fn new_resampler() -> anyhow::Result<rubato::FftFixedIn<f32>> {
+    rubato::FftFixedIn::<f32>::new(
+        SCK_SAMPLE_RATE as usize,
+        SAMPLE_RATE as usize,
+        RESAMPLE_CHUNK,
+        RESAMPLE_SUB_CHUNKS,
+        CHANNELS as usize,
+    )
+    .map_err(|e| anyhow::anyhow!("rubato resampler init: {e}"))
+}
 const SAMPLE_RATE: u32 = 44100;
 const CHANNELS: u16 = 2;
 const BITS_PER_SAMPLE: u16 = 16;
@@ -378,20 +412,7 @@ async fn capture_loop(
         .with_sample_rate(SCK_SAMPLE_RATE as i32)
         .with_channel_count(CHANNELS as i32);
 
-    // SCK only delivers 8/16/24/48 kHz. We capture at 48 and resample to the
-    // advertised SAMPLE_RATE (44.1 kHz) so the client plays at its native rate
-    // without internal resampling. Chunk size matches a typical SCK audio
-    // buffer (~21 ms at 48 kHz) — input is buffered until we have a full
-    // chunk, then fed to the resampler.
-    const RESAMPLE_CHUNK: usize = 1024;
-    let mut resampler = rubato::FftFixedIn::<f32>::new(
-        SCK_SAMPLE_RATE as usize,
-        SAMPLE_RATE as usize,
-        RESAMPLE_CHUNK,
-        1,
-        CHANNELS as usize,
-    )
-    .map_err(|e| anyhow!("rubato resampler init: {e}"))?;
+    let mut resampler = new_resampler()?;
     let mut input_buf: [Vec<f32>; 2] = [
         Vec::with_capacity(RESAMPLE_CHUNK * 2),
         Vec::with_capacity(RESAMPLE_CHUNK * 2),
@@ -463,8 +484,8 @@ async fn capture_loop(
     let mut suppressed_since: Option<std::time::Instant> = None;
 
     // SCK delivery-rate measurement. The vendor server's audio-lag model
-    // assumes one Wave = `WAVE_MS = 1024/48 = 21.33 ms` of real audio,
-    // which is only true if SCK actually delivers at 48 kHz. Some
+    // derives each PCM wave's length from its bytes at 44.1 kHz, which is
+    // only true if SCK actually delivers at 48 kHz. Some
     // configurations (system audio rate ≠ requested capture rate) cause
     // SCK to deliver samples at a different effective rate while still
     // *reporting* 48 kHz in the format description, which manifests as
@@ -606,7 +627,7 @@ async fn capture_loop(
                 let expected_in = f64::from(SCK_SAMPLE_RATE);
                 let expected_out = f64::from(SAMPLE_RATE);
                 // PCM emits one wave per resampled chunk (RESAMPLE_CHUNK input
-                // samples at the SCK rate → ~46.875/s). AAC emits one wave per
+                // samples at the SCK rate → 50/s). AAC emits one wave per
                 // 1024-frame access unit at the *output* rate → ~43.07/s. Pick the
                 // right baseline so `waves_per_sec` vs `waves_expected` is a real
                 // health check for the active codec, not always the PCM number.
@@ -620,8 +641,7 @@ async fn capture_loop(
                 } else {
                     0.0
                 };
-                // Server's vendored audio-lag model assumes each wave is exactly
-                // 1024/48 = 21.33 ms. If avg_wave_samples / SAMPLE_RATE * 1000
+                // Each wave should be RESAMPLE_CHUNK / 48 ms of audio (20 ms). If avg_wave_samples / SAMPLE_RATE * 1000
                 // differs from that, the model drifts.
                 let avg_wave_ms = if waves_emitted > 0 {
                     avg_wave_samples / f64::from(SAMPLE_RATE) * 1000.0
@@ -641,7 +661,7 @@ async fn capture_loop(
                     wire_kbps,
                     silent_skipped,
                     codec = if use_aac { "aac" } else { "pcm" },
-                    model_wave_ms = 1024.0 / 48.0,
+                    model_wave_ms = RESAMPLE_CHUNK as f64 / 48.0,
                     "audio capture rates"
                 );
                 samples_received = 0;
@@ -754,8 +774,8 @@ async fn capture_loop(
 
                     // Lazy resolve both senders on first need. If set_sender /
                     // set_audio_sender haven't populated their Mutexes yet, retry
-                    // next iteration — at 48 kHz / 1024 samples this is ~21 ms
-                    // later.
+                    // next iteration — at 48 kHz / RESAMPLE_CHUNK samples this is
+                    // ~20 ms later.
                     if audio_s.is_none() {
                         audio_s = audio_sender.lock().unwrap().clone();
                     }
@@ -896,14 +916,15 @@ fn planar_f32_to_interleaved_i16(planar: &[Vec<f32>]) -> Vec<u8> {
     out
 }
 
-/// Silent chunks (21.3 ms each: 1024 frames in at 48 kHz) still sent after a
-/// sound ends, before the waves pause (~171 ms). Without them the client's
-/// queue runs empty right after the last sound: FreeRDP 3.30 (ALSA) then cut
-/// the end of the sound at a non-zero sample, a click, in 6 of 20 tries (0 of
-/// 12 with 8 chunks; 2026-10-21, 3 s tone recorded at the client). Costs
-/// ~30 KB per sound end.
+/// Silent chunks (20 ms each: `RESAMPLE_CHUNK` frames in at 48 kHz) still
+/// sent after a sound ends, before the waves pause (180 ms). Without them the
+/// client's queue runs empty right after the last sound: FreeRDP 3.30 (ALSA)
+/// then cut the end of the sound at a non-zero sample, a click, in 6 of 20
+/// tries (0 of 12 with 8 chunks of 21.3 ms, 171 ms; 2026-10-21, 3 s tone
+/// recorded at the client; 9 chunks of 20 ms keep at least that time).
+/// Costs ~32 KB per sound end.
 #[cfg(any(target_os = "macos", test))]
-const SILENCE_TAIL_CHUNKS: u32 = 8;
+const SILENCE_TAIL_CHUNKS: u32 = 9;
 
 /// What `SilenceGate::decide` does with one resampled chunk.
 #[cfg(any(target_os = "macos", test))]
@@ -980,6 +1001,47 @@ fn float_to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gain (dB) of a `freq` tone through the capture resampler, measured on
+    /// the second half of one second of output.
+    fn resampler_gain_db(freq: f64) -> f64 {
+        use rubato::Resampler;
+        let mut r = new_resampler().unwrap();
+        let input: Vec<f32> = (0..SCK_SAMPLE_RATE as usize)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * freq * i as f64 / f64::from(SCK_SAMPLE_RATE)).sin()
+                    as f32
+                    * 0.5
+            })
+            .collect();
+        let mut out = Vec::new();
+        for c in input.as_chunks::<RESAMPLE_CHUNK>().0 {
+            let o = r.process(&[c.to_vec(), c.to_vec()], None).unwrap();
+            // One SCK buffer in, its 44.1 kHz frames out at once.
+            assert_eq!(o[0].len(), RESAMPLE_CHUNK * 147 / 160);
+            out.extend_from_slice(&o[0]);
+        }
+        let tail = &out[out.len() / 2..];
+        let rms =
+            (tail.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+        20.0 * (rms / (0.5 / 2f64.sqrt())).log10()
+    }
+
+    /// The resampler adds little delay (a sound's first wave leaves soon after
+    /// its SCK buffer), passes the audio band and removes what would alias.
+    #[test]
+    fn the_resampler_is_quick_and_keeps_the_audio_band() {
+        use rubato::Resampler;
+        let r = new_resampler().unwrap();
+        assert!(r.output_delay() <= 150, "delay {} frames", r.output_delay());
+        assert_eq!(r.input_frames_next(), RESAMPLE_CHUNK);
+        for f in [100.0, 1000.0, 10_000.0, 19_000.0] {
+            let g = resampler_gain_db(f);
+            assert!(g.abs() < 0.5, "{f} Hz: {g:.2} dB");
+        }
+        // 23 kHz would fold to 21.1 kHz at 44.1 kHz.
+        assert!(resampler_gain_db(23_000.0) < -60.0);
+    }
 
     #[test]
     fn silent_chunk_detected() {
