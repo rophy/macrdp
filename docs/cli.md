@@ -31,7 +31,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   silently ignored) — resize needs the client-resolution
                           #   auto-adopt path, which --hidpi pins off, same as it
                           #   pins the initial connect-time size.
---fps N                   # default 60 with H.264 (default), 15 with --no-h264
+--fps N                   # default 60 (also with --no-h264)
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
                           #   client upscales the desktop but draws the pointer

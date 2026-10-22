@@ -222,10 +222,11 @@ struct Args {
     #[arg(long)]
     hidpi: bool,
 
-    /// Frame rate cap. Defaults to 60 with H.264 (the default), or 15 with
-    /// --no-h264 (H.264 over mstsc holds a ~2-frame presentation buffer, so
-    /// 60fps keeps that buffer's wall-clock latency low enough that typing feels
-    /// immediate — at 30fps it lags ~2 keystrokes). Set explicitly to override.
+    /// Frame rate cap. Defaults to 60, also with --no-h264 (H.264 over mstsc
+    /// holds a ~2-frame presentation buffer, so 60fps keeps that buffer's
+    /// wall-clock latency low enough that typing feels immediate — at 30fps it
+    /// lags ~2 keystrokes; the bitmap path shows a key ~20 ms sooner at 60 than
+    /// at 15). Set explicitly to override.
     #[arg(long)]
     fps: Option<u32>,
 
@@ -3441,16 +3442,17 @@ async fn async_main() -> Result<()> {
         (w, h, None, size)
     };
 
-    // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
-    // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 with
-    // --no-h264 (the legacy bitmap path has no such buffer). It is chosen here,
-    // before any client connects, so a client without AVC420 that falls back to
-    // bitmaps under the H.264 default also captures at 60. Measured (FreeRDP
-    // 3.30 `/gfx:RFX` and `-gfx`, 2026-10-21): the bitmap path is link-bound
-    // (~62-64 Mbps) at 60 and at 15 fps; motion 13.7 vs 13.4 fps shown, 143 vs
-    // 136 % server CPU; scroll 19.6 vs 14.7 fps. So 60 costs little and scrolls
-    // smoother; it is kept.
-    let fps = args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 });
+    // Frame rate: explicit --fps wins; otherwise 60, with or without H.264.
+    // H.264: mstsc holds a ~2-frame presentation buffer, so 60fps keeps typing
+    // latency low. Bitmaps (--no-h264, or a client without AVC420 that falls
+    // back to them): measured with FreeRDP 3.30 `/gfx` without AVC on the
+    // bench latency page (2026-10-22), key-to-screen p50 with the link kept
+    // awake 68-71 ms at 60, 73-76 at 30 and 78-100 at 15 fps (macrdp-v1, 60
+    // fps: 65-70); in motion 499 vs 587 ms; server CPU in motion 9.9 % at 60
+    // vs 8.8 % at 15, the same on a static screen (SCK sends no frames then).
+    // Earlier (2026-10-21, `/gfx:RFX` and `-gfx`): link-bound at 62-64 Mbps at
+    // both rates, scroll 19.6 vs 14.7 fps. macrdp-v1 used 60 for both paths.
+    let fps = args.fps.unwrap_or(60);
 
     // Live session desktop size, shared by capture, input scaling, and the
     // H.264 pipeline. Starts at the size resolved above; when `auto_size`

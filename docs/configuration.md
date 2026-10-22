@@ -106,8 +106,8 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           `none` to disable translation. Keys are translated via
                           UCKeyTranslate and posted as Unicode; the Mac's own
                           input source is untouched. macOS-only.
---fps N                   Frame rate cap (default 60 with H.264, or 15 with --no-h264
-                          — see [video.md](video.md) for why H.264 wants the higher rate)
+--fps N                   Frame rate cap (default 60, also with --no-h264 — see
+                          [video.md](video.md) for why the higher rate)
 --no-h264                 Serve legacy bitmaps only. By default the display is
                           H.264 over EGFX (AVC420), hardware-encoded via
                           VideoToolbox, with an automatic legacy fallback for
@@ -475,7 +475,7 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 | `username` | `--username` | `USERNAME` | A macOS account name; default the login user |
 | `password` | `--password-file`, `--keychain` or the prompt | `PASSWORD_FILE` (with `USE_KEYCHAIN=0`) or `USE_KEYCHAIN=1` | The macOS password of that account, not an RDP-only password (`--skip-auth --password` only for tests) |
 | `width`, `height` | `--width`, `--height` | `EXTRA_FLAGS` | Default: the client's requested size |
-| `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with H.264 (the default), 15 with `--no-h264` |
+| `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 (H.264 and `--no-h264`), as v1 |
 | `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default automatic from the session size (22 Mbps at 1280x720@60); adaptive below it by default, `--no-adaptive-bitrate` (`ADAPTIVE_BITRATE=0`) for a fixed rate |
 | `resolution` / `hidpi_scale` | `--hidpi` | `HIDPI` | Backing (Retina) pixels of the primary display |
 | `upscale` | (default) / `--max-client-size WxH` | `MAX_CLIENT_SIZE` | The client's size is served by default, up to 3840x2160 as in v1; `--stretch` fills instead of letterboxing |
