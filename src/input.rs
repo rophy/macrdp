@@ -1456,6 +1456,11 @@ mod macos {
             if had_mods {
                 self.post_flags_changed(VK_LCMD);
             }
+            // The switcher's Cmd (or Option) is up now: a Cmd+Tab cycle held
+            // when the connection ended lands as on a Cmd release, and the
+            // next client starts a new cycle instead of resuming it with the
+            // HUD still up.
+            end_cycle_session();
 
             if released_buttons > 0
                 || !keys.is_empty()
@@ -1585,8 +1590,7 @@ mod macos {
                     && !self.mods.l_alt
                     && !self.mods.r_alt;
                 if cmd_released || opt_released {
-                    CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    commit_cycle_session();
+                    end_cycle_session();
                 }
                 return;
             }
@@ -2291,7 +2295,7 @@ mod macos {
     }
 
     /// Incremented every time both Cmd halves transition to released
-    /// (see `commit_cycle_session` callers). A `CycleSession` stamps
+    /// (see `take_cycle_session_on_release`). A `CycleSession` stamps
     /// its start-time value; on later presses, a match means "Cmd has
     /// not been released since this session started" — so we
     /// continue, regardless of pause length.
@@ -2815,27 +2819,33 @@ mod macos {
     /// eventually recovering from a stuck session.
     const CYCLE_RESUME_GRACE: Duration = Duration::from_secs(300);
 
-    /// Commit the active cycle session — promote cursor's bundle to
-    /// MRU front and clear the session. Called when Cmd is fully
-    /// released, and lazily from cycle_apps when the grace timeout
-    /// has elapsed.
-    fn commit_cycle_session() {
-        // Take the session out under the CYCLE_SESSION lock, then DROP the lock
-        // (it's confined to this block) before any HUD / AX / mru /
-        // LAST_FOCUS_BUNDLE work below — those acquire OTHER mutexes, and holding
-        // CYCLE_SESSION across them would nest locks (the same lock-order hazard
-        // removed from h264 `ship_frames`: LAST_FOCUS_BUNDLE is written cross-
-        // thread by the focus observer / click hit-test). Nothing below needs the
-        // session map locked, only the taken session's data. The session is
-        // already `take()`n, so a racing cycle_apps just starts a fresh one — the
-        // correct outcome after a commit.
-        let session = {
-            let mut guard = CYCLE_SESSION.lock().expect("cycle session mutex poisoned");
-            match guard.take() {
-                Some(s) => s,
-                None => return,
-            }
-        };
+    /// The switcher's modifier went up (or the connection that held it
+    /// ended): the next press starts a new cycle. Returns the session that
+    /// was active, for the caller to land. The CYCLE_SESSION lock is held
+    /// only for the take: the HUD / AX / MRU / LAST_FOCUS_BUNDLE work of
+    /// the landing takes other mutexes, and nesting them under this one is
+    /// the lock-order hazard removed from h264 `ship_frames`
+    /// (LAST_FOCUS_BUNDLE is written cross-thread by the focus observer and
+    /// the click hit-test). A racing `cycle_apps` then starts a new session,
+    /// the correct outcome after a release.
+    fn take_cycle_session_on_release() -> Option<CycleSession> {
+        CMD_RELEASE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CYCLE_SESSION
+            .lock()
+            .expect("cycle session mutex poisoned")
+            .take()
+    }
+
+    /// Release of the switcher's modifier: end and land the active cycle.
+    fn end_cycle_session() {
+        if let Some(session) = take_cycle_session_on_release() {
+            land_cycle_session(session);
+        }
+    }
+
+    /// Land a taken cycle session: hide the HUD, promote and activate the
+    /// app the cursor is on (as macOS does on Cmd release).
+    fn land_cycle_session(session: CycleSession) {
         // A session existed → tear down the on-screen HUD (best-effort).
         if super::APP_SWITCHER_HUD.load(std::sync::atomic::Ordering::Relaxed) {
             crate::switcher_hud::hide();
@@ -4216,6 +4226,25 @@ mod macos {
     #[cfg(test)]
     mod modifier_state_tests {
         use super::*;
+
+        /// A connection end ends the Cmd+Tab cycle (final review M16): the
+        /// session is taken and the release generation moves, so the next
+        /// Cmd+Tab does not resume it.
+        #[test]
+        fn a_release_ends_the_cycle_session() {
+            let gen = CMD_RELEASE_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+            *CYCLE_SESSION.lock().unwrap() = Some(CycleSession {
+                snapshot: Vec::new(),
+                cursor_pid: -1,
+                last_press_at: Instant::now(),
+                cmd_release_gen: gen,
+            });
+            let taken = take_cycle_session_on_release();
+            assert!(taken.is_some_and(|s| s.cmd_release_gen == gen));
+            assert!(!cycle_session_active());
+            assert!(CMD_RELEASE_GENERATION.load(std::sync::atomic::Ordering::SeqCst) > gen);
+            assert!(take_cycle_session_on_release().is_none());
+        }
 
         /// The stale-modifier resync must drop every HELD modifier but leave
         /// Caps Lock alone — it's a toggle reconciled by `synchronize()`, and
