@@ -21,6 +21,14 @@ install -m 755 "$HERE/macrdp" "$BIN"
 
 if [ -f "$CONF" ]; then
     echo "Kept existing $CONF"
+    # Earlier versions wrote ENABLE_H264=0 / ADAPTIVE_BITRATE=0 into config.env; the kept file
+    # keeps them (the server also warns at start). Say so, so an upgrade does not stay on bitmaps.
+    for key in ENABLE_H264 ADAPTIVE_BITRATE; do
+        if grep -Eq "^[[:space:]]*(export[[:space:]]+)?$key=[\"']?0" "$CONF"; then
+            echo "NOTE: $CONF sets $key=0 (the default of earlier versions; now on by default)."
+            echo "      Delete that line or set $key=1 to use the new default."
+        fi
+    done
 else
     install -m 600 "$HERE/config.env.example" "$CONF"
     echo "Created $CONF (listens on 127.0.0.1:3390; set BIND there for the LAN)"

@@ -446,6 +446,18 @@ ESTABLISHED_MIN_QOE, ESTABLISHED_MAX_WAIT_MS, ESTABLISHED_WALL_REPORTS}` — tol
 brief zero-EDR windows a healthy client produces mid-session; see the blank-recovery
 notes in `docs/known-quirks.md` for the full story and the tuning history.
 
+## Upgrading: old `ENABLE_H264=0` / `ADAPTIVE_BITRATE=0` lines
+
+H.264 and adaptive bitrate are on by default now. Earlier versions of this server wrote
+`ENABLE_H264=0` and `ADAPTIVE_BITRATE=0` into `config.env` (the example file and the menu-bar
+app's first run), and the installers keep an existing `config.env`. The server cannot tell such a
+line from your own choice, so it keeps it: with `ENABLE_H264=0` clients get legacy bitmaps, with
+`ADAPTIVE_BITRATE=0` the bitrate is a fixed target. It logs one WARN at start for each of these
+lines, and `packaging/release/install.sh` / `packaging/install-launchagent.sh` print a NOTE when
+they keep a file that has them. To use the new defaults, delete the lines (or set them to `1`) in
+`~/Library/Application Support/macrdp/config.env` and restart the server. Keep them only if you
+want bitmaps or a fixed bitrate.
+
 ## Moving from macrdp-v1 (`config.toml`)
 
 macrdp-v1 read a `config.toml`; this server has no TOML file. It takes CLI flags, and the

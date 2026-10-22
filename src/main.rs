@@ -2458,6 +2458,36 @@ fn parse_max_client_size(spec: &str) -> Result<(u16, u16), String> {
 /// it and showed a broken picture. Clamped per dimension, as the option.
 const DEFAULT_MAX_CLIENT_SIZE: (u16, u16) = (3840, 2160);
 
+/// Upgrade path for keys whose default changed. Earlier versions wrote
+/// `ENABLE_H264=0` and `ADAPTIVE_BITRATE=0` into config.env (the example file,
+/// the menu-bar app's first run), and the installers keep an existing
+/// config.env. The server cannot tell such a line from a user's choice, so it
+/// keeps the setting (bitmaps or a fixed bitrate may be wanted) and warns once
+/// at start with the key and the new default.
+fn old_default_warnings(cfg: &std::collections::HashMap<String, String>) -> Vec<String> {
+    let off = |key: &str| cfg.get(key).is_some_and(|v| v != "1");
+    let mut out = Vec::new();
+    if off("ENABLE_H264") {
+        out.push(
+            "config.env sets ENABLE_H264=0: H.264 is off, clients get legacy bitmaps. H.264 is on \
+             by default now; config.env files written by earlier versions (the example file, the \
+             menu-bar app's first run) have ENABLE_H264=0. Delete the line or set ENABLE_H264=1 \
+             for H.264; keep it only if you want bitmaps"
+                .to_string(),
+        );
+    }
+    if off("ADAPTIVE_BITRATE") {
+        out.push(
+            "config.env sets ADAPTIVE_BITRATE=0: the H.264 bitrate is a fixed target. Adaptive \
+             bitrate is on by default now; config.env files written by earlier versions have \
+             ADAPTIVE_BITRATE=0. Delete the line or set ADAPTIVE_BITRATE=1 for adaptive bitrate; \
+             keep it only if you want a fixed bitrate"
+                .to_string(),
+        );
+    }
+    out
+}
+
 fn args_from_config(path: &Path) -> Result<Args> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
@@ -2814,7 +2844,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
     // config or the GUI, CTRL_AS_CMD=1 added by hand): clap rejects the pair,
     // and a launchd job would then not start at all. CTRL_AS_CMD wins (the
     // whole layout includes what the curated remap does); warn once.
-    let mut config_warnings = Vec::new();
+    let mut config_warnings = old_default_warnings(&cfg);
     if argv.iter().any(|a| a == "--ctrl-as-cmd") && argv.iter().any(|a| a == "--map-ctrl-to-cmd") {
         argv.retain(|a| a != "--map-ctrl-to-cmd");
         config_warnings.push(
@@ -4273,11 +4303,17 @@ mod config_tests {
 
     #[test]
     fn h264_is_on_unless_turned_off() {
+        // An ENABLE_H264=0 left by an earlier version is kept, with a warning.
         let p = write_temp("h1", "ENABLE_H264=0\n");
-        assert!(!args_from_config(&p).unwrap().enable_h264);
+        let a = args_from_config(&p).unwrap();
+        assert!(!a.enable_h264);
+        assert_eq!(a.config_warnings.len(), 1);
+        assert!(a.config_warnings[0].contains("ENABLE_H264=0"));
         fs::remove_file(&p).ok();
         let p = write_temp("h2", "ENABLE_H264=1\n");
-        assert!(args_from_config(&p).unwrap().enable_h264);
+        let a = args_from_config(&p).unwrap();
+        assert!(a.enable_h264);
+        assert!(a.config_warnings.is_empty());
         fs::remove_file(&p).ok();
         assert!(Args::try_parse_from(["macrdp"]).unwrap().enable_h264);
         assert!(
@@ -4302,7 +4338,10 @@ mod config_tests {
         assert!(!args_from_config(&p).unwrap().no_adaptive_bitrate);
         fs::remove_file(&p).ok();
         let p = write_temp("ab3", "ADAPTIVE_BITRATE=0\n");
-        assert!(args_from_config(&p).unwrap().no_adaptive_bitrate);
+        let a = args_from_config(&p).unwrap();
+        assert!(a.no_adaptive_bitrate);
+        assert_eq!(a.config_warnings.len(), 1);
+        assert!(a.config_warnings[0].contains("ADAPTIVE_BITRATE=0"));
         fs::remove_file(&p).ok();
         // The old opt-in flag is still accepted.
         assert!(Args::try_parse_from(["macrdp", "--adaptive-bitrate"]).is_ok());
