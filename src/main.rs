@@ -2488,6 +2488,22 @@ fn old_default_warnings(cfg: &std::collections::HashMap<String, String>) -> Vec<
     out
 }
 
+/// H.264-only flags that were given together with `--no-h264` (they are then
+/// ignored; the server says so once at start).
+fn h264_flags_without_h264(args: &Args) -> Vec<&'static str> {
+    if args.enable_h264 {
+        return Vec::new();
+    }
+    [
+        (args.avc444, "--avc444"),
+        (args.no_lossless_text, "--no-lossless-text"),
+        (args.bitrate.is_some(), "--bitrate"),
+    ]
+    .into_iter()
+    .filter_map(|(set, flag)| set.then_some(flag))
+    .collect()
+}
+
 fn args_from_config(path: &Path) -> Result<Args> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
@@ -3567,6 +3583,9 @@ async fn async_main() -> Result<()> {
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
     // H.264 bitrate ceiling: --bitrate, else automatic from the desktop size.
+    for flag in h264_flags_without_h264(&args) {
+        warn!("{flag} has no effect with --no-h264 (ENABLE_H264=0): it is for the H.264 path only");
+    }
     #[cfg(target_os = "macos")]
     let bitrate_bps = match args.bitrate {
         Some(mbps) => mbps.max(1).saturating_mul(1_000_000),
@@ -4327,6 +4346,25 @@ mod config_tests {
                 .unwrap()
                 .enable_h264
         );
+    }
+
+    /// H.264-only flags with --no-h264 are named in a start warning (M5).
+    #[test]
+    fn h264_flags_without_h264_are_named() {
+        let parse = |a: &[&str]| Args::try_parse_from(a).unwrap();
+        assert!(h264_flags_without_h264(&parse(&["macrdp", "--avc444"])).is_empty());
+        assert_eq!(
+            h264_flags_without_h264(&parse(&[
+                "macrdp",
+                "--no-h264",
+                "--avc444",
+                "--no-lossless-text",
+                "--bitrate",
+                "8"
+            ])),
+            ["--avc444", "--no-lossless-text", "--bitrate"]
+        );
+        assert!(h264_flags_without_h264(&parse(&["macrdp", "--no-h264"])).is_empty());
     }
 
     #[test]
