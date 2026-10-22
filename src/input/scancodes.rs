@@ -166,6 +166,9 @@ pub(crate) fn keypad_navigation_vk(scancode: u8) -> Option<u16> {
 /// default table (Ctrl → Control, Alt → Option, Win → Command) and returns the
 /// one to post, so that Ctrl → Command, Alt → Option, Win → Control. That is a
 /// Control/Command swap, per side; every other key is unchanged.
+/// Ported from macrdp-v1 fb6fd13 (`ctrl_as_cmd_keycode` and its test
+/// `ctrl_as_cmd_swaps_the_modifiers`), relicensed to MIT OR Apache-2.0 by the
+/// author.
 pub(crate) fn ctrl_as_cmd_vk(vk: u16) -> u16 {
     match vk {
         0x3B => 0x37, // Left Ctrl: Control → Command
