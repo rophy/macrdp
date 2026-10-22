@@ -40,6 +40,21 @@ pub trait GfxServerFactory: ServerEventSender + Send {
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
         None
     }
+
+    /// (vendored, divergence 36) Like [`Self::build_server_with_handle`], for
+    /// a takeover candidate that negotiates (TLS, CredSSP) while another
+    /// session is live. The application must not let it replace the live
+    /// session's state yet: the candidate may fail, and only a winner is
+    /// served ([`Self::activate_candidate`]). Default: the same as
+    /// `build_server_with_handle`.
+    fn build_candidate_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        self.build_server_with_handle()
+    }
+
+    /// (vendored, divergence 36) The takeover candidate whose GFX server is
+    /// `handle` won; the replaced session has ended and the winner is served
+    /// now. Default: nothing.
+    fn activate_candidate(&self, _handle: &GfxServerHandle) {}
 }
 
 /// DVC bridge wrapping a shared `GraphicsPipelineServer`.

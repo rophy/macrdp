@@ -1388,6 +1388,13 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
 pub struct Gfx {
     sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     ctx: Arc<Mutex<Option<ConnectionContext>>>,
+    /// The context of a takeover candidate that is still negotiating (TLS,
+    /// CredSSP) while another session is live. It goes into `ctx` only when
+    /// the candidate wins and is served (`activate_candidate`): before, the
+    /// candidate replaced the live session's context at once, and the live
+    /// session lost its encoder and refinement state and fell back to
+    /// legacy bitmaps, also when the candidate then failed to log in.
+    staged: Arc<Mutex<Option<ConnectionContext>>>,
     /// Live session desktop size, shared with `CaptureDisplay` /
     /// `MacInputHandler`. Read in `setup_locked` when the per-connection
     /// surface + encoder are created, so the H.264 pipeline tracks the
@@ -2127,6 +2134,7 @@ impl Gfx {
         Self {
             sender: Arc::new(Mutex::new(None)),
             ctx: Arc::new(Mutex::new(None)),
+            staged: Arc::new(Mutex::new(None)),
             desktop_size,
             fps,
             bitrate_bps,
@@ -4281,6 +4289,45 @@ impl GfxServerFactory for Gfx {
     }
 
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        let (ctx, bridge, handle) = self.build_connection();
+        self.latest_dropped.store(false, Ordering::Relaxed);
+        *self.ctx.lock().unwrap() = Some(ctx);
+        Some((bridge, handle))
+    }
+
+    /// A takeover candidate: its context waits in `staged` until it wins
+    /// (see the field note); the live session keeps its own.
+    fn build_candidate_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        let (ctx, bridge, handle) = self.build_connection();
+        *self.staged.lock().unwrap() = Some(ctx);
+        Some((bridge, handle))
+    }
+
+    /// The candidate with `handle` won and is served now: its context
+    /// becomes the connection's. A staged context of another candidate (a
+    /// newer one that started negotiating) is not this one's: keep the
+    /// current context then.
+    fn activate_candidate(&self, handle: &GfxServerHandle) {
+        let staged = self.staged.lock().unwrap().take();
+        match staged {
+            Some(ctx) if Arc::ptr_eq(&ctx.server_handle, handle) => {
+                self.latest_dropped.store(false, Ordering::Relaxed);
+                *self.ctx.lock().unwrap() = Some(ctx);
+                debug!("EGFX: takeover winner's connection context installed");
+            }
+            other => {
+                *self.staged.lock().unwrap() = other;
+                warn!("EGFX: takeover winner has no staged connection context; keeping the current one");
+            }
+        }
+    }
+}
+
+impl Gfx {
+    /// A per-connection EGFX server, its DVC bridge and a fresh context
+    /// for it (not installed: see `build_server_with_handle` and
+    /// `build_candidate_server_with_handle`).
+    fn build_connection(&self) -> (ConnectionContext, GfxDvcBridge, GfxServerHandle) {
         let handler = Box::new(GfxHandler {
             ctx: self.ctx.clone(),
         });
@@ -4322,8 +4369,7 @@ impl GfxServerFactory for Gfx {
         } else {
             self.bitrate_bps
         };
-        self.latest_dropped.store(false, Ordering::Relaxed);
-        *self.ctx.lock().unwrap() = Some(ConnectionContext {
+        let ctx = ConnectionContext {
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
@@ -4382,11 +4428,12 @@ impl GfxServerFactory for Gfx {
             refine: Arc::new(Mutex::new(Refine::default())),
             avc444_enabled: self.avc444,
             avc444: false,
-        });
-        Some((
+        };
+        (
+            ctx,
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
             handle,
-        ))
+        )
     }
 }
 
@@ -6877,14 +6924,46 @@ mod tests {
         assert_eq!(ctx.epoch, started);
     }
 
+    /// A takeover candidate does not replace the live session's context while
+    /// it negotiates (final review P1); only the winner's context is installed,
+    /// when it is served.
+    #[test]
+    fn a_takeover_candidate_waits_until_it_wins() {
+        let gfx = gfx_with_context();
+        let live = {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.is_ready = true;
+            ctx.server_handle.clone()
+        };
+        let is_live = |h: &GfxServerHandle| {
+            gfx.ctx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(&c.server_handle, h))
+        };
+        let (_, first) = gfx.build_candidate_server_with_handle().unwrap();
+        let (_, second) = gfx.build_candidate_server_with_handle().unwrap();
+        assert!(is_live(&live));
+        assert!(gfx.ctx.lock().unwrap().as_ref().unwrap().is_ready);
+        // The first candidate's context was replaced by the second's: no change.
+        gfx.activate_candidate(&first);
+        assert!(is_live(&live));
+        gfx.activate_candidate(&second);
+        assert!(is_live(&second));
+        assert!(!gfx.ctx.lock().unwrap().as_ref().unwrap().is_ready);
+        assert!(gfx.staged.lock().unwrap().is_none());
+    }
+
     /// `Gfx::hold_legacy` across the connection states (R36 review 2, 3, 10).
     #[test]
     fn hold_legacy_follows_the_connection_state() {
         let gfx = gfx_with_context();
         assert_eq!(gfx.legacy_hold, Duration::from_millis(3000));
         let now = Instant::now();
-        // Negotiating: hold. A capture that started long ago (the live session
-        // during a takeover candidate's negotiation) is past the limit: no hold.
+        // Negotiating: hold. A capture that started long ago is past the
+        // limit: no hold.
         assert!(gfx.hold_legacy(now));
         assert!(!gfx.hold_legacy(now - Duration::from_secs(4)));
         // Ready (also the race where it became ready after submit_bgra said

@@ -899,6 +899,9 @@ fn attach_channels_impl(
     camera_factory: Option<&dyn crate::RdCameraServerFactory>,
     audin_factory: Option<&dyn crate::AudinServerFactory>,
     #[cfg(feature = "egfx")] gfx_factory: Option<&dyn GfxServerFactory>,
+    // (divergence 36) A takeover candidate: its GFX server is built with
+    // `build_candidate_server_with_handle`, so the live session keeps its own.
+    #[cfg(feature = "egfx")] candidate: bool,
     #[cfg(feature = "multitransport")] multitransport_lossy_audio_formats: Option<
         Vec<ironrdp_rdpsnd::pdu::AudioFormat>,
     >,
@@ -948,7 +951,12 @@ fn attach_channels_impl(
         let mut dvc = dvc;
         let mut gfx_handle = None;
         if let Some(gfx_factory) = gfx_factory {
-            if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
+            let built = if candidate {
+                gfx_factory.build_candidate_server_with_handle()
+            } else {
+                gfx_factory.build_server_with_handle()
+            };
+            if let Some((bridge, handle)) = built {
                 gfx_handle = Some(handle);
                 dvc = dvc.with_dynamic_channel(bridge);
             } else {
@@ -1156,6 +1164,8 @@ async fn negotiate_candidate(
         ctx.audin_factory.as_deref(),
         #[cfg(feature = "egfx")]
         ctx.gfx_factory.as_deref(),
+        #[cfg(feature = "egfx")]
+        true,
         // No multitransport offer for a candidate (see the struct doc on
         // `NegotiationContext`), so the lossy-audio DVC — which is only
         // useful paired with that offer — is never attached here either.
@@ -1615,6 +1625,8 @@ impl RdpServer {
             self.audin_factory.as_deref(),
             #[cfg(feature = "egfx")]
             self.gfx_factory.as_deref(),
+            #[cfg(feature = "egfx")]
+            false,
             #[cfg(feature = "multitransport")]
             self.multitransport_lossy_audio_formats.clone(),
             #[cfg(feature = "multitransport")]
@@ -1676,6 +1688,33 @@ impl RdpServer {
         }
     }
 
+    /// (vendored, divergence 36) Drop the EGFX messages still queued on the
+    /// server-global event channel, putting every other event back in
+    /// arrival order. Called when a takeover winner is served, after its GFX
+    /// context is installed: the messages left are for the replaced session.
+    #[cfg(feature = "egfx")]
+    async fn discard_stale_egfx_events(&mut self) {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let ev_receiver = Arc::clone(&self.ev_receiver);
+        let mut ev_receiver = ev_receiver.lock().await;
+        let mut keep = Vec::new();
+        let mut discarded = 0usize;
+        loop {
+            match ev_receiver.try_recv() {
+                Ok(ServerEvent::Egfx(_)) => discarded += 1,
+                Ok(other) => keep.push(other),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if discarded > 0 {
+            debug!(discarded, "dropped EGFX messages of the replaced session");
+        }
+        for event in keep {
+            let _ = self.ev_sender.send(event);
+        }
+    }
+
     fn negotiation_context(&self) -> NegotiationContext {
         NegotiationContext {
             opts: self.opts.clone(),
@@ -1716,6 +1755,14 @@ impl RdpServer {
         #[cfg(feature = "egfx")]
         {
             self.gfx_handle = candidate.gfx_handle;
+            // (divergence 36) The winner's GFX state replaces the replaced
+            // session's only now. EGFX messages still queued were encoded for
+            // the replaced session's channel: the winner has no EGFX channel
+            // yet, so they must not reach it.
+            if let (Some(factory), Some(handle)) = (self.gfx_factory.as_deref(), self.gfx_handle.as_ref()) {
+                factory.activate_candidate(handle);
+            }
+            self.discard_stale_egfx_events().await;
         }
         #[cfg(not(feature = "egfx"))]
         #[allow(clippy::let_unit_value, reason = "gfx_handle is () when the egfx feature is off")]
