@@ -497,8 +497,8 @@ async fn capture_loop(
     let mut last_rate_log = std::time::Instant::now();
     // Output-side counters. If output samples don't match 44.1 kHz × elapsed
     // (after warm-up), the resampler is producing less audio than it should.
-    // If output samples match but wave count is below 46.875/sec, average
-    // wave size is bigger than the server's hardcoded WAVE_MS expects.
+    // If output samples match but wave count is below 50/sec (PCM: one
+    // wave per RESAMPLE_CHUNK), the waves are larger than one chunk.
     let mut output_samples: u64 = 0;
     let mut waves_emitted: u64 = 0;
     // Encoded bytes actually shipped per window. Logged as `wire_kbps` so the
