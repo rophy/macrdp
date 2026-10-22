@@ -1811,28 +1811,74 @@ fn avc444_wire_to_surface(
     chroma: Option<&[u8]>,
     regions: &[Avc420Region],
 ) -> Result<Vec<u8>> {
-    use ironrdp_egfx::pdu::{
-        Avc420BitmapStream, Avc444BitmapStream, Codec1Type, Encoding, GfxPdu, WireToSurface1Pdu,
-    };
-    use ironrdp_pdu::Encode as _;
-    let stream = |data| Avc420BitmapStream {
-        rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
-        quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
-        data,
-    };
+    use ironrdp_egfx::pdu::{Avc444BitmapStream, Codec1Type, Encoding};
     let bitmap = Avc444BitmapStream {
         encoding: if chroma.is_some() {
             Encoding::LUMA_AND_CHROMA
         } else {
             Encoding::LUMA
         },
-        stream1: stream(luma),
-        stream2: chroma.map(stream),
+        stream1: avc420_stream(luma, regions),
+        stream2: chroma.map(|c| avc420_stream(c, regions)),
     };
-    let mut bitmap_data = vec![0u8; bitmap.size()];
-    bitmap
-        .encode(&mut ironrdp_pdu::WriteCursor::new(&mut bitmap_data))
-        .map_err(|e| anyhow!("AVC444 bitmap stream encode: {e}"))?;
+    let mut bitmap_data = vec![0u8; ironrdp_pdu::Encode::size(&bitmap)];
+    ironrdp_pdu::Encode::encode(
+        &bitmap,
+        &mut ironrdp_pdu::WriteCursor::new(&mut bitmap_data),
+    )
+    .map_err(|e| anyhow!("AVC444 bitmap stream encode: {e}"))?;
+    wire_to_surface(surface_id, Codec1Type::Avc444, bitmap_data, regions)
+}
+
+/// The ZGFX-wrapped WireToSurface1 PDU of an AVC420 frame (codec
+/// `RDPGFX_CODECID_AVC420`, `RFX_AVC420_BITMAP_STREAM`, MS-RDPEGFX 2.2.4.4):
+/// `h264` with `regions`, whose edges are exclusive (see [`avc420_regions`]).
+///
+/// Written here for the same reason as [`avc444_wire_to_surface`]: the pinned
+/// `send_avc420_frame` adds one to the region bounding box for the
+/// destination, so the regions had to stop at `width - 1` / `height - 1`,
+/// and clients (FreeRDP `avc420_process_transform`, mstsc) read the region
+/// rectangles as exclusive: the last pixel column and row were never painted
+/// (R49: column 1279 black on photos, -2.6 dB photo PSNR).
+fn avc420_wire_to_surface(
+    surface_id: u16,
+    h264: &[u8],
+    regions: &[Avc420Region],
+) -> Result<Vec<u8>> {
+    use ironrdp_egfx::pdu::Codec1Type;
+    let stream = avc420_stream(h264, regions);
+    let mut bitmap_data = vec![0u8; ironrdp_pdu::Encode::size(&stream)];
+    ironrdp_pdu::Encode::encode(
+        &stream,
+        &mut ironrdp_pdu::WriteCursor::new(&mut bitmap_data),
+    )
+    .map_err(|e| anyhow!("AVC420 bitmap stream encode: {e}"))?;
+    wire_to_surface(surface_id, Codec1Type::Avc420, bitmap_data, regions)
+}
+
+/// An `RFX_AVC420_BITMAP_STREAM` of `data` with the region rectangles and
+/// quantization values of `regions` (written unchanged: exclusive edges).
+fn avc420_stream<'a>(
+    data: &'a [u8],
+    regions: &[Avc420Region],
+) -> ironrdp_egfx::pdu::Avc420BitmapStream<'a> {
+    ironrdp_egfx::pdu::Avc420BitmapStream {
+        rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
+        quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
+        data,
+    }
+}
+
+/// The ZGFX-wrapped WireToSurface1 PDU for `bitmap_data` of `codec_id`; the
+/// destination is the exclusive bounding box of `regions`.
+fn wire_to_surface(
+    surface_id: u16,
+    codec_id: ironrdp_egfx::pdu::Codec1Type,
+    bitmap_data: Vec<u8>,
+    regions: &[Avc420Region],
+) -> Result<Vec<u8>> {
+    use ironrdp_egfx::pdu::{GfxPdu, WireToSurface1Pdu};
+    use ironrdp_pdu::Encode as _;
     let destination_rectangle = ExclusiveRectangle {
         left: regions.iter().map(|r| r.left).min().unwrap_or(0),
         top: regions.iter().map(|r| r.top).min().unwrap_or(0),
@@ -1841,14 +1887,14 @@ fn avc444_wire_to_surface(
     };
     let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
         surface_id,
-        codec_id: Codec1Type::Avc444,
+        codec_id,
         pixel_format: PixelFormat::XRgb,
         destination_rectangle,
         bitmap_data,
     });
     let mut bytes = vec![0u8; pdu.size()];
     pdu.encode(&mut ironrdp_pdu::WriteCursor::new(&mut bytes))
-        .map_err(|e| anyhow!("AVC444 WireToSurface1 encode: {e}"))?;
+        .map_err(|e| anyhow!("WireToSurface1 encode: {e}"))?;
     Ok(ironrdp_graphics::zgfx::wrap_uncompressed(&bytes))
 }
 
@@ -1863,16 +1909,12 @@ fn is_wire_to_surface1(m: &ironrdp_dvc::DvcMessage) -> bool {
         && b[2..4] == [0x01, 0x00]
 }
 
-/// AVC420 region rectangles for a frame of `width` x `height`.
-///
-/// The pinned `ironrdp-egfx` takes `Avc420Region` edges as inclusive and
-/// writes them unchanged, while MS-RDPEGFX 2.2.4.4.1 reads `regionRects` as
-/// RDPGFX_RECT16 with exclusive right and bottom (upstream fixed this later,
-/// e0727394). The tile rectangles are therefore given with exclusive edges.
-/// At the right or bottom edge of the frame the value stays `width - 1` /
-/// `height - 1`, as the whole-frame region always had: the pipeline adds one
-/// to the largest edge for the WireToSurface1 destination, which must stay
-/// within the surface.
+/// AVC420 region rectangles for a frame of `width` x `height`: the tiles of
+/// `regions` (or the whole frame), with exclusive right and bottom edges as
+/// MS-RDPEGFX 2.2.4.4.1 reads `regionRects` (RDPGFX_RECT16), up to `width` and
+/// `height`. The WireToSurface1 is written by [`avc420_wire_to_surface`]
+/// (the pinned `ironrdp-egfx` would add one to these edges for the
+/// destination and leave the surface).
 fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
     let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
         left,
@@ -1887,17 +1929,13 @@ fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Regio
             .rects()
             .into_iter()
             .map(|r| {
-                let right = (r.x + r.w).min(width.saturating_sub(1));
-                let bottom = (r.y + r.h).min(height.saturating_sub(1));
+                let right = (r.x + r.w).min(width);
+                let bottom = (r.y + r.h).min(height);
                 region(r.x, r.y, right, bottom)
             })
+            .filter(|r| r.right > r.left && r.bottom > r.top)
             .collect(),
-        _ => vec![region(
-            0,
-            0,
-            width.saturating_sub(1),
-            height.saturating_sub(1),
-        )],
+        _ => vec![region(0, 0, width, height)],
     }
 }
 
@@ -4079,17 +4117,17 @@ impl Gfx {
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
-            // Messages in queue order: AVC444 frames are drained one by one.
+            // Messages in queue order: each frame is drained after it is queued.
             let mut dvc_out: Vec<ironrdp_dvc::DvcMessage> = Vec::new();
-            // An AVC444 frame went without its picture: the client's decoder
-            // misses it, so the next frame must be a keyframe.
+            // A frame went without its picture: the client's decoder misses
+            // it, so the next frame must be a keyframe.
             let mut lost_picture = false;
 
             for (frame, frame_regions) in frames.iter().zip(regions) {
                 let f = frame.main();
                 let is_keyframe = frame.is_keyframe();
                 let frame_regions = frame_regions.map(|r| refine::ship_regions(r, is_keyframe));
-                // Region = full actual frame, inclusive bounds (or, with
+                // Region = full actual frame, exclusive edges (or, with
                 // lossless refinement, the tiles this frame updates; see
                 // `avc420_regions`). QP 22 / quality 100 are first-light
                 // defaults; tuned in M3.
@@ -4117,61 +4155,60 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
+                // Queue an empty frame for the frame id and accounting, then
+                // put our WireToSurface1 in its place (see
+                // `avc420_wire_to_surface` / `avc444_wire_to_surface`: the
+                // pinned crate's destination is one pixel too large for
+                // exclusive region edges). The frame's three PDUs are the last
+                // ones queued. This needs the pipeline in
+                // `CompressionMode::Never` (the default, never changed here): a
+                // ZGFX-compressed placeholder would not be found, and the
+                // compressor history would hold bytes the client never got.
                 let sent = match frame {
                     ShipFrame::Avc420(_) => {
-                        server.send_avc420_frame(surface_id, &payload, &region, ts_ms)
+                        server.send_avc420_frame(surface_id, &[], &region, ts_ms)
                     }
                     ShipFrame::Avc444 { .. } => {
-                        // Queue an empty luma-only frame for the frame id and
-                        // accounting, then put our WireToSurface1 in its place
-                        // (see `avc444_wire_to_surface`). The frame's three
-                        // PDUs are the last ones queued. This needs the
-                        // pipeline in `CompressionMode::Never` (the default,
-                        // never changed here): a ZGFX-compressed placeholder
-                        // would not be found, and the compressor history would
-                        // hold bytes the client never got.
-                        let sent =
-                            server.send_avc444_frame(surface_id, &[], &region, None, None, ts_ms);
-                        if sent.is_some() {
-                            let mut msgs = server.drain_output();
-                            let n = msgs.len();
-                            let placeholder =
-                                (n >= 3 && is_wire_to_surface1(&msgs[n - 2])).then_some(n - 2);
-                            match (
-                                avc444_wire_to_surface(
-                                    surface_id,
-                                    &payload,
-                                    chroma.as_deref(),
-                                    &region,
-                                ),
-                                placeholder,
-                            ) {
-                                (Ok(bytes), Some(i)) => {
-                                    msgs[i] = Box::new(ZgfxMessage {
-                                        bytes,
-                                        name: "WireToSurface1Pdu",
-                                    });
-                                }
-                                (res, i) => {
-                                    // Never send the placeholder (an empty
-                                    // stream whose destination leaves the
-                                    // surface): the frame goes empty.
-                                    if let Some(i) = i {
-                                        msgs.remove(i);
-                                    }
-                                    lost_picture = true;
-                                    warn!(
-                                        error = ?res.err(),
-                                        placeholder_found = i.is_some(),
-                                        "EGFX AVC444 frame sent without its picture; next frame is a keyframe"
-                                    );
-                                }
-                            }
-                            dvc_out.extend(msgs);
-                        }
-                        sent
+                        server.send_avc444_frame(surface_id, &[], &region, None, None, ts_ms)
                     }
                 };
+                if sent.is_some() {
+                    let mut msgs = server.drain_output();
+                    let n = msgs.len();
+                    let placeholder =
+                        (n >= 3 && is_wire_to_surface1(&msgs[n - 2])).then_some(n - 2);
+                    let picture = match frame {
+                        ShipFrame::Avc420(_) => {
+                            avc420_wire_to_surface(surface_id, &payload, &region)
+                        }
+                        ShipFrame::Avc444 { .. } => {
+                            avc444_wire_to_surface(surface_id, &payload, chroma.as_deref(), &region)
+                        }
+                    };
+                    match (picture, placeholder) {
+                        (Ok(bytes), Some(i)) => {
+                            msgs[i] = Box::new(ZgfxMessage {
+                                bytes,
+                                name: "WireToSurface1Pdu",
+                            });
+                        }
+                        (res, i) => {
+                            // Never send the placeholder (an empty stream
+                            // whose destination leaves the surface): the
+                            // frame goes empty.
+                            if let Some(i) = i {
+                                msgs.remove(i);
+                            }
+                            lost_picture = true;
+                            warn!(
+                                error = ?res.err(),
+                                placeholder_found = i.is_some(),
+                                "EGFX frame sent without its picture; next frame is a keyframe"
+                            );
+                        }
+                    }
+                    dvc_out.extend(msgs);
+                }
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -7404,6 +7441,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// AVC420 rectangles: exclusive edges up to the frame width and height,
+    /// for the whole frame and for the edge tiles (R49: the last column and
+    /// row were never painted with `width - 1` / `height - 1`).
+    #[test]
+    fn avc420_regions_reach_the_right_and_bottom_edges() {
+        let r = avc420_regions(&Regions::Whole, 1280, 720);
+        assert_eq!(
+            (r[0].left, r[0].top, r[0].right, r[0].bottom),
+            (0, 0, 1280, 720)
+        );
+        for (w, h) in [(1280u16, 720u16), (1023, 767), (1281, 721)] {
+            let mut grid = refine::TileGrid::new(u32::from(w), u32::from(h));
+            grid.mark_all();
+            let r = avc420_regions(&Regions::Tiles(grid), w, h);
+            assert_eq!(r.iter().map(|r| r.right).max(), Some(w), "{w}x{h}");
+            assert_eq!(r.iter().map(|r| r.bottom).max(), Some(h), "{w}x{h}");
+            assert!(r.iter().all(|r| r.right > r.left && r.bottom > r.top));
+            // Every pixel is in exactly one rectangle.
+            let area: u32 = r
+                .iter()
+                .map(|r| u32::from(r.right - r.left) * u32::from(r.bottom - r.top))
+                .sum();
+            assert_eq!(area, u32::from(w) * u32::from(h), "{w}x{h}");
+        }
+        // A grid of another size than the frame goes whole.
+        let mut grid = refine::TileGrid::new(640, 480);
+        grid.mark_all();
+        let r = avc420_regions(&Regions::Tiles(grid), 1280, 720);
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].right, r[0].bottom), (1280, 720));
+    }
+
+    /// The AVC420 WireToSurface1 we write decodes as an AVC420 command whose
+    /// destination is the exclusive bounding box of the regions (the whole
+    /// surface for a whole frame, not one pixel more) and whose region
+    /// rectangle is the whole frame.
+    #[test]
+    fn avc420_wire_to_surface_covers_the_last_column_and_row() {
+        use ironrdp_egfx::pdu::{Avc420BitmapStream, Codec1Type, GfxPdu};
+        let regions = avc420_regions(&Regions::Whole, 1280, 720);
+        let wrapped = avc420_wire_to_surface(7, &[1, 2, 3], &regions).unwrap();
+        assert_eq!(wrapped[0], 0xE0);
+        let pdu: GfxPdu = ironrdp_core::decode(&wrapped[2..]).unwrap();
+        let GfxPdu::WireToSurface1(w) = pdu else {
+            panic!("not a WireToSurface1");
+        };
+        assert_eq!(w.surface_id, 7);
+        assert_eq!(w.codec_id, Codec1Type::Avc420);
+        let d = &w.destination_rectangle;
+        assert_eq!((d.left, d.top, d.right, d.bottom), (0, 0, 1280, 720));
+        let stream: Avc420BitmapStream<'_> = ironrdp_core::decode(&w.bitmap_data).unwrap();
+        assert_eq!(stream.data, &[1, 2, 3]);
+        assert_eq!(stream.rectangles.len(), 1);
+        let r = &stream.rectangles[0];
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1280, 720));
+        assert!(is_wire_to_surface1(
+            &(Box::new(ZgfxMessage {
+                bytes: wrapped,
+                name: "x",
+            }) as ironrdp_dvc::DvcMessage)
+        ));
+        // Tiles: the destination is their bounding box.
+        let mut grid = refine::TileGrid::new(1280, 720);
+        grid.mark_all();
+        let (cols, rows) = grid.cols_rows();
+        for row in 0..rows {
+            for col in 0..cols {
+                if (col, row) != (cols - 1, rows - 1) {
+                    grid.unset(col, row);
+                }
+            }
+        }
+        let last = grid.tile_rect(cols - 1, rows - 1);
+        let regions = avc420_regions(&Regions::Tiles(grid), 1280, 720);
+        let wrapped = avc420_wire_to_surface(7, &[], &regions).unwrap();
+        let GfxPdu::WireToSurface1(w) = ironrdp_core::decode(&wrapped[2..]).unwrap() else {
+            panic!("not a WireToSurface1");
+        };
+        let d = &w.destination_rectangle;
+        assert_eq!((d.right, d.bottom), (1280, 720));
+        assert_eq!((d.left, d.top), (last.x, last.y));
     }
 
     /// The pinned pipeline queues StartFrame, WireToSurface1 and EndFrame for
