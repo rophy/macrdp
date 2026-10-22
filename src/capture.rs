@@ -339,8 +339,7 @@ pub struct CaptureDisplay {
     /// anything specific.
     pub display_id: Option<u32>,
     /// Target display's logical size in points — fed through to
-    /// `CursorState` for the (currently disabled) position-polling
-    /// path. Caller queries it from `CGDisplay::main()` for the
+    /// `CursorState`. Caller queries it from `CGDisplay::main()` for the
     /// primary path, or from `VirtualDisplay::size_pts()`.
     pub screen_size_pts: (f64, f64),
     /// True when serving a `--virtual-display`. On disconnect the capture
@@ -1256,7 +1255,12 @@ mod macos {
                 cursor_scale,
                 "cursor pointer scaling"
             );
-            let cursor = CursorState::new(width, height, screen_size_pts, cursor_scale)?;
+            let cursor = CursorState::new(
+                desktop_size.clone(),
+                display.display_id(),
+                screen_size_pts,
+                cursor_scale,
+            )?;
             let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
 
             // Reset the cross-connection suppress flag — the `Arc<AtomicBool>`

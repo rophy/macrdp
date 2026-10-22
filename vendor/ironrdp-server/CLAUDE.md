@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(24)/(25)/(26)/(27)-(32)/(34)-(36) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(24)/(25)/(26)/(27)-(32)/(34)-(37) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2188,3 +2188,9 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     attempt (a wrong password, a scanner that completes TLS) turned the live
     session to legacy bitmaps until it reconnected. Test (macrdp):
     `h264::tests::a_takeover_candidate_waits_until_it_wins`.
+
+(37) `ClientSession::pointer_cache_size` (NOT upstreamed; added 2026-10-22).
+    The `pointerCacheSize` of the client's Pointer Capability Set
+    (MS-RDPBCGR 2.2.7.1.5), 0 when the client sent none. macrdp's
+    `src/cursor/cache.rs` sizes its pointer cache with it (New Pointer Update
+    into a cache slot, then Cached Pointer Update for a shape the client has).

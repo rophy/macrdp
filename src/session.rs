@@ -87,6 +87,7 @@ impl ConnectionHandler for SessionHandler {
     }
 
     fn on_client_session(&mut self, session: &ClientSession) {
+        crate::cursor::cache::set_client_cache_size(session.pointer_cache_size);
         if let Some(k) = &self.session.keep_awake {
             k.on_connect(session.supports_heartbeat);
         }

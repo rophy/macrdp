@@ -195,6 +195,9 @@ pub struct ClientSession {
     /// (vendored, divergence (32)) The client takes Server Set Error Info PDUs
     /// (`RNS_UD_CS_SUPPORT_ERRINFO_PDU`), so `ServerEvent::Disconnect` tells it why.
     pub supports_error_info: bool,
+    /// (vendored, divergence (37)) `pointerCacheSize` of the client's Pointer
+    /// Capability Set (MS-RDPBCGR 2.2.7.1.5); 0 when it sent none.
+    pub pointer_cache_size: u16,
 }
 
 /// (vendored, divergence (31)) The client asks for audio on its side unless it
@@ -3667,6 +3670,14 @@ impl RdpServer {
                 supports_heartbeat: self.client_supports_heartbeat(),
                 audio_playback: audio_playback_wanted(result.client_info_flags),
                 supports_error_info: self.client_supports_error_info(),
+                pointer_cache_size: result
+                    .capabilities
+                    .iter()
+                    .find_map(|c| match c {
+                        CapabilitySet::Pointer(p) => Some(p.pointer_cache_size),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
             };
             info!(?session, "client session");
             handler.borrow_mut().on_client_session(&session);

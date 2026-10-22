@@ -12,9 +12,15 @@
 //! set in macrdp's own process. Kept as a last resort in case a future
 //! macOS removes/renames the SLS symbols.
 //!
-//! Position is read via CGEvent.location() on a fresh no-op event but
-//! intentionally not forwarded — see `poll` for the reasoning.
+//! Position is read via CGEvent.location() on a fresh no-op event and sent
+//! as a Pointer Position Update only when the Mac cursor moved by itself
+//! (not by the client's input, see `moves`).
+//!
+//! Shapes go through the client's pointer cache (`cache`): a shape the client
+//! has already goes as a Cached Pointer Update.
 
+pub mod cache;
+pub mod moves;
 #[cfg(target_os = "macos")]
 mod private_api;
 
@@ -28,9 +34,10 @@ pub struct CursorState {
 }
 
 impl CursorState {
-    /// `screen_size_pts` is the target display's logical size in
-    /// points; only consumed by the (currently-disabled) position
-    /// polling path, but parameterized for symmetry with input.rs.
+    /// `display_id` is the captured display (its bounds place the Mac
+    /// cursor position); `desktop_size` is the live session size and
+    /// letterbox mode (as input.rs maps mouse input). `screen_size_pts` is
+    /// kept for symmetry with input.rs.
     ///
     /// `cursor_scale` is the user-facing comfort multiplier (`--cursor-scale`,
     /// default `1.0`). At `1.0` the SkyLight cursor passes through at its
@@ -39,15 +46,19 @@ impl CursorState {
     /// but draw the pointer at native pixels. The hotspot scales with the
     /// bitmap, so it stays accurate at any value.
     pub fn new(
-        desktop_w: u16,
-        desktop_h: u16,
+        desktop_size: crate::capture::SharedDesktopSize,
+        display_id: u32,
         screen_size_pts: (f64, f64),
         cursor_scale: f64,
     ) -> anyhow::Result<Self> {
+        // A new connection or a reactivation (each builds a new display
+        // stream, so the pointer cache starts empty too): older client
+        // cursor positions do not apply.
+        moves::forget();
         #[cfg(target_os = "macos")]
-        let inner = macos::Inner::new(desktop_w, desktop_h, screen_size_pts, cursor_scale)?;
+        let inner = macos::Inner::new(desktop_size, display_id, screen_size_pts, cursor_scale)?;
         #[cfg(not(target_os = "macos"))]
-        let _ = (desktop_w, desktop_h, screen_size_pts, cursor_scale);
+        let _ = (desktop_size, display_id, screen_size_pts, cursor_scale);
         Ok(Self {
             #[cfg(target_os = "macos")]
             inner,
@@ -75,7 +86,7 @@ mod macos {
     use core_graphics::event::CGEvent;
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use ironrdp_pdu::pointer::PointerPositionAttribute;
-    use ironrdp_server::{DisplayUpdate, RGBAPointer};
+    use ironrdp_server::DisplayUpdate;
     use objc2::rc::Retained;
     use objc2::ClassType;
     use objc2_app_kit::{
@@ -85,18 +96,18 @@ mod macos {
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use tracing::trace;
 
-    use super::private_api;
+    use super::cache::{self, PointerCache, Shape};
+    use super::{moves, private_api};
 
-    #[allow(dead_code)] // last_pos / desktop+screen fields are kept warm for
-                        // re-enabling position polling in non-RDP-driven cases
     pub struct Inner {
         source: CGEventSource,
         last_hash: u64,
-        last_pos: Option<(u16, u16)>,
-        desktop_w: u16,
-        desktop_h: u16,
-        screen_w_pts: f64,
-        screen_h_pts: f64,
+        /// Last Mac cursor position seen (global points).
+        last_pos: Option<(f64, f64)>,
+        desktop_size: crate::capture::SharedDesktopSize,
+        display_id: u32,
+        /// The client's pointer cache.
+        pointer_cache: PointerCache,
         /// session-framebuffer-px ÷ display-backing-px; see `CursorState::new`.
         cursor_scale: f64,
         /// one-shot guard for the cursor-size diagnostic log.
@@ -109,9 +120,9 @@ mod macos {
 
     impl Inner {
         pub fn new(
-            desktop_w: u16,
-            desktop_h: u16,
-            screen_size_pts: (f64, f64),
+            desktop_size: crate::capture::SharedDesktopSize,
+            display_id: u32,
+            _screen_size_pts: (f64, f64),
             cursor_scale: f64,
         ) -> Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -127,10 +138,9 @@ mod macos {
                 source,
                 last_hash: 0,
                 last_pos: None,
-                desktop_w,
-                desktop_h,
-                screen_w_pts: screen_size_pts.0,
-                screen_h_pts: screen_size_pts.1,
+                desktop_size,
+                display_id,
+                pointer_cache: PointerCache::new(cache::client_cache_size()),
                 cursor_scale,
                 diag_logged: false,
             })
@@ -139,39 +149,57 @@ mod macos {
         pub fn poll(&mut self) -> Vec<DisplayUpdate> {
             let mut updates = Vec::new();
             self.poll_shape(&mut updates);
-            // Intentionally NOT polling cursor position: mstsc (and other RDP
-            // clients) predict the cursor locally from the user's mouse input
-            // and snap to any PointerPositionPDU we send. Our updates lag the
-            // local prediction by the encode/network round-trip, so sending
-            // them causes the cursor to jump back to a stale position. The
-            // downside: if a Mac app programmatically moves the cursor (rare),
-            // the client won't see it until something else triggers a frame.
+            self.poll_position(&mut updates);
             updates
         }
 
-        #[allow(dead_code)]
+        /// A Pointer Position Update when the Mac cursor moved by itself.
+        /// mstsc (and other clients) move their cursor locally from the
+        /// user's input, ahead of the server, and snap to any Pointer
+        /// Position Update: a position that the client's input caused would
+        /// make the cursor jump back, so those are not sent (`moves`). The
+        /// first position of a connection is not sent either: the client
+        /// shows its cursor where its user left it.
         fn poll_position(&mut self, out: &mut Vec<DisplayUpdate>) {
             let Ok(ev) = CGEvent::new(self.source.clone()) else {
                 return;
             };
             let pt = ev.location();
-            // CGEvent::location is in pixels with top-left origin (display
-            // coordinates), same orientation as our captured framebuffer.
-            let x = (pt.x * f64::from(self.desktop_w) / self.screen_w_pts.max(1.0))
-                .round()
-                .clamp(0.0, f64::from(u16::MAX));
-            let y = (pt.y * f64::from(self.desktop_h) / self.screen_h_pts.max(1.0))
-                .round()
-                .clamp(0.0, f64::from(u16::MAX));
-            let x = x as u16;
-            let y = y as u16;
-            if self.last_pos != Some((x, y)) {
-                self.last_pos = Some((x, y));
-                out.push(DisplayUpdate::PointerPosition(PointerPositionAttribute {
-                    x,
-                    y,
-                }));
+            let pos = (pt.x, pt.y);
+            let first = self.last_pos.is_none();
+            if self.last_pos == Some(pos) {
+                return;
             }
+            self.last_pos = Some(pos);
+            if first || moves::is_client_move(pos) {
+                return;
+            }
+            // CGEvent::location is in global display points, top-left
+            // origin; the captured display's bounds place it.
+            let b = core_graphics::display::CGDisplay::new(self.display_id).bounds();
+            let (mx, my) = (pos.0 - b.origin.x, pos.1 - b.origin.y);
+            if mx < 0.0 || my < 0.0 || mx >= b.size.width || my >= b.size.height {
+                // On another display: the client cannot show it.
+                return;
+            }
+            let (dw, dh) = self.desktop_size.get();
+            let (x, y) = crate::input::map_display_to_client(
+                mx,
+                my,
+                dw,
+                dh,
+                b.size.width,
+                b.size.height,
+                self.desktop_size.letterbox(),
+            );
+            // The client cursor moves to this position: older client
+            // positions no longer describe where the client shows it.
+            moves::forget();
+            trace!(x, y, "Mac cursor moved by itself: pointer position sent");
+            out.push(DisplayUpdate::PointerPosition(PointerPositionAttribute {
+                x,
+                y,
+            }));
         }
 
         fn poll_shape(&mut self, out: &mut Vec<DisplayUpdate>) {
@@ -247,19 +275,30 @@ mod macos {
                 scale = self.cursor_scale,
                 "cursor shape changed"
             );
-            out.push(DisplayUpdate::RGBAPointer(RGBAPointer {
-                // macrdp doesn't maintain a client-side pointer cache; every
-                // shape change re-sends the full bitmap to slot 0 (the encoder
-                // always emits NewPointer for RGBAPointer, never CachedPointer),
-                // so a single fixed index is correct and won't freeze animated
-                // cursors (beachball/watch).
-                cache_index: 0,
+            // The client's cache size can be known only after this stream
+            // started; a new size means a new, empty client cache.
+            let size = cache::client_cache_size();
+            if size != self.pointer_cache.cache_size() {
+                self.pointer_cache = PointerCache::new(size);
+            }
+            if let Some(update) = self.pointer_cache.show(Shape {
                 width: w,
                 height: h,
                 hot_x,
                 hot_y,
                 data,
-            }));
+            }) {
+                match &update {
+                    DisplayUpdate::CachedPointer(i) => {
+                        trace!(cache_index = i, "pointer: cached shape")
+                    }
+                    DisplayUpdate::RGBAPointer(p) => {
+                        trace!(cache_index = p.cache_index, "pointer: new shape")
+                    }
+                    _ => {}
+                }
+                out.push(update);
+            }
         }
     }
 
