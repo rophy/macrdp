@@ -1911,13 +1911,20 @@ fn is_wire_to_surface1(m: &ironrdp_dvc::DvcMessage) -> bool {
 
 /// AVC420 region rectangles for a frame of `width` x `height`: the tiles of
 /// `regions` (or the whole frame), with exclusive right and bottom edges as
-/// MS-RDPEGFX 2.2.4.4.1 reads `regionRects` (RDPGFX_RECT16), up to `width` and
-/// `height`. The WireToSurface1 is written by [`avc420_wire_to_surface`]
-/// (the pinned `ironrdp-egfx` would add one to these edges for the
-/// destination and leave the surface).
+/// MS-RDPEGFX 2.2.4.4.1 reads `regionRects` (RDPGFX_RECT16), up to the even
+/// part of `width` and `height`. The WireToSurface1 is written by
+/// [`avc420_wire_to_surface`] (the pinned `ironrdp-egfx` would add one to
+/// these edges for the destination and leave the surface).
+///
+/// At an odd size the decoded picture is one pixel smaller (VideoToolbox
+/// crops 4:2:0 in steps of 2: a 1023x719 frame decodes as 1022x718), and
+/// FreeRDP 3.30 drops a frame with a rectangle outside the decoded picture
+/// (`areRectsValid`, "outside of bounding frame", every frame at
+/// `/size:1023x719`). So the last column or row of an odd size is not painted.
 fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
     let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
         left,
+    let (width, height) = (width & !1, height & !1);
         top,
         right,
         bottom,
@@ -7453,19 +7460,31 @@ mod tests {
             (r[0].left, r[0].top, r[0].right, r[0].bottom),
             (0, 0, 1280, 720)
         );
-        for (w, h) in [(1280u16, 720u16), (1023, 767), (1281, 721)] {
+        for (w, h) in [(1280u16, 720u16), (1023, 767), (1281, 721), (1024, 719)] {
             let mut grid = refine::TileGrid::new(u32::from(w), u32::from(h));
             grid.mark_all();
             let r = avc420_regions(&Regions::Tiles(grid), w, h);
-            assert_eq!(r.iter().map(|r| r.right).max(), Some(w), "{w}x{h}");
-            assert_eq!(r.iter().map(|r| r.bottom).max(), Some(h), "{w}x{h}");
+            // An odd size decodes one pixel smaller: the edges stop at the
+            // even part (FreeRDP drops a frame with a rectangle outside it).
+            let (ew, eh) = (w & !1, h & !1);
+            assert_eq!(r.iter().map(|r| r.right).max(), Some(ew), "{w}x{h}");
+            assert_eq!(r.iter().map(|r| r.bottom).max(), Some(eh), "{w}x{h}");
             assert!(r.iter().all(|r| r.right > r.left && r.bottom > r.top));
-            // Every pixel is in exactly one rectangle.
+            // Every pixel of the even part is in exactly one rectangle.
             let area: u32 = r
                 .iter()
                 .map(|r| u32::from(r.right - r.left) * u32::from(r.bottom - r.top))
                 .sum();
-            assert_eq!(area, u32::from(w) * u32::from(h), "{w}x{h}");
+            assert_eq!(area, u32::from(ew) * u32::from(eh), "{w}x{h}");
+        }
+        // Whole frame at odd sizes: even edges; at even sizes the full frame.
+        for (w, h, ew, eh) in [
+            (1023u16, 719u16, 1022u16, 718u16),
+            (1023, 720, 1022, 720),
+            (1024, 719, 1024, 718),
+        ] {
+            let r = avc420_regions(&Regions::Whole, w, h);
+            assert_eq!((r[0].right, r[0].bottom), (ew, eh), "{w}x{h}");
         }
         // A grid of another size than the frame goes whole.
         let mut grid = refine::TileGrid::new(640, 480);
