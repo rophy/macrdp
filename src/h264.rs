@@ -387,6 +387,12 @@ struct ConnectionContext {
     /// connection epoch, which also serves as the arm-delay baseline).
     blank_recovery_attempts: u32,
     last_blank_recovery_at: Instant,
+    /// Start of the blank detector's evidence for the current surface: the
+    /// connection start ([`ConnectionContext::start_clocks`]), and again after
+    /// a live resize, which gives the client a new surface
+    /// ([`ConnectionContext::restart_blank_detector`]). The arm delay and the
+    /// connect-time wait count from here.
+    blank_window_start: Instant,
     /// Kernel-measured TCP RTT (ms) for this connection, sampled at accept by
     /// the vendored server (divergence 15) and frozen here at connection setup.
     /// 0 = unknown. Drives the blank-detector RTT gate ([`blank_rtt_gate`]) and
@@ -452,6 +458,20 @@ impl ConnectionContext {
         self.last_floor_fps_pass = now;
         self.last_nonzero_qoe_at = now;
         self.last_blank_recovery_at = now;
+        self.blank_window_start = now;
+    }
+
+    /// A live resize gave the client a new surface (resize_with_monitors:
+    /// DeleteSurface, ResetGraphics, CreateSurface): what the blank detector
+    /// learned about the old surface (zero/nonzero reports, the
+    /// `presented_clean` latch, attempts) says nothing about the new one, so
+    /// it starts again as at connection start.
+    fn restart_blank_detector(&mut self, now: Instant) {
+        self.qoe = QoeEvidence::default();
+        self.last_nonzero_qoe_at = now;
+        self.blank_recovery_attempts = 0;
+        self.last_blank_recovery_at = now;
+        self.blank_window_start = now;
     }
 }
 
@@ -2486,7 +2506,7 @@ impl Gfx {
                         ctx.qoe,
                         ctx.egfx_acks_seen,
                         ctx.acks_suspended,
-                        now.saturating_duration_since(ctx.epoch),
+                        now.saturating_duration_since(ctx.blank_window_start),
                         now.saturating_duration_since(ctx.last_nonzero_qoe_at),
                         now.saturating_duration_since(ctx.last_blank_recovery_at),
                         ctx.blank_recovery_attempts,
@@ -3847,6 +3867,7 @@ impl Gfx {
             ctx.window.lock().unwrap().reset();
             // A refinement frame still being compressed is for the old surface.
             ctx.refine.lock().unwrap().drop_jobs();
+            ctx.restart_blank_detector(Instant::now());
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
     }
@@ -4351,6 +4372,7 @@ impl GfxServerFactory for Gfx {
             last_nonzero_qoe_at: Instant::now(),
             blank_recovery_attempts: 0,
             last_blank_recovery_at: Instant::now(),
+            blank_window_start: Instant::now(),
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
@@ -6750,7 +6772,7 @@ mod tests {
 
     /// Every connection-start clock, so a test can't pass by checking only the
     /// one it happened to remember.
-    fn clocks(ctx: &ConnectionContext) -> [Instant; 11] {
+    fn clocks(ctx: &ConnectionContext) -> [Instant; 12] {
         [
             ctx.epoch,
             ctx.last_ack_at,
@@ -6763,6 +6785,7 @@ mod tests {
             ctx.last_floor_fps_pass,
             ctx.last_nonzero_qoe_at,
             ctx.last_blank_recovery_at,
+            ctx.blank_window_start,
         ]
     }
 
@@ -6820,7 +6843,38 @@ mod tests {
         .on_ready(&avc_ready());
 
         let guard = gfx.ctx.lock().unwrap();
-        assert_eq!(clocks(guard.as_ref().unwrap()), [started; 11]);
+        assert_eq!(clocks(guard.as_ref().unwrap()), [started; 12]);
+    }
+
+    /// A live resize starts the blank detector again for the new surface
+    /// (final review, parked R46 item): the old surface's reports, the
+    /// `presented_clean` latch and the attempts are gone, and the arm delay
+    /// counts from the resize.
+    #[test]
+    fn a_live_resize_restarts_the_blank_detector() {
+        let gfx = gfx_with_context();
+        let started = Instant::now() - Duration::from_secs(60);
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.start_clocks(started);
+            for v in [0, 5, 0, 7, 9, 3] {
+                ctx.qoe.record(v);
+            }
+            ctx.qoe.presented_clean = true;
+            ctx.blank_recovery_attempts = 1;
+        }
+        let resized = Instant::now();
+        gfx.reset_for_live_resize();
+        let guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        assert_eq!(ctx.qoe, QoeEvidence::default());
+        assert_eq!(ctx.blank_recovery_attempts, 0);
+        assert!(ctx.blank_window_start >= resized);
+        assert!(ctx.last_nonzero_qoe_at >= resized);
+        assert!(ctx.last_blank_recovery_at >= resized);
+        // The connection clocks stay (frame time stamps, ack grace).
+        assert_eq!(ctx.epoch, started);
     }
 
     /// `Gfx::hold_legacy` across the connection states (R36 review 2, 3, 10).
@@ -6878,7 +6932,7 @@ mod tests {
         let guard = gfx.ctx.lock().unwrap();
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
-        assert_eq!(clocks(ctx), [built; 11]);
+        assert_eq!(clocks(ctx), [built; 12]);
     }
 
     #[test]
