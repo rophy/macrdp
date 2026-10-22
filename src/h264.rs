@@ -1924,7 +1924,8 @@ fn is_wire_to_surface1(m: &ironrdp_dvc::DvcMessage) -> bool {
 /// (`areRectsValid`, "outside of bounding frame", every frame at
 /// `/size:1023x719`). So the last column or row of an odd size is not painted.
 fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Region> {
-    let (width, height) = (width & !1, height & !1);
+    // The edges stop at the even part; the tile grid is of the real size.
+    let (right_edge, bottom_edge) = (width & !1, height & !1);
     let region = |left: u16, top: u16, right: u16, bottom: u16| Avc420Region {
         left,
         top,
@@ -1938,13 +1939,13 @@ fn avc420_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Regio
             .rects()
             .into_iter()
             .map(|r| {
-                let right = (r.x + r.w).min(width);
-                let bottom = (r.y + r.h).min(height);
+                let right = (r.x + r.w).min(right_edge);
+                let bottom = (r.y + r.h).min(bottom_edge);
                 region(r.x, r.y, right, bottom)
             })
             .filter(|r| r.right > r.left && r.bottom > r.top)
             .collect(),
-        _ => vec![region(0, 0, width, height)],
+        _ => vec![region(0, 0, right_edge, bottom_edge)],
     }
 }
 
@@ -7478,6 +7479,37 @@ mod tests {
                 .map(|r| u32::from(r.right - r.left) * u32::from(r.bottom - r.top))
                 .sum();
             assert_eq!(area, u32::from(ew) * u32::from(eh), "{w}x{h}");
+        }
+        // Changed tiles at an odd size stay tiles (not one whole-frame rect,
+        // which would overwrite lossless refined tiles): one tile in the
+        // middle and the bottom-right corner tile.
+        for (w, h) in [(1023u16, 719u16), (1023, 720), (1024, 719), (1280, 720)] {
+            let mut grid = refine::TileGrid::new(u32::from(w), u32::from(h));
+            grid.mark_all();
+            let (cols, rows) = grid.cols_rows();
+            let keep = [(cols / 2, rows / 2), (cols - 1, rows - 1)];
+            for row in 0..rows {
+                for col in 0..cols {
+                    if !keep.contains(&(col, row)) {
+                        grid.unset(col, row);
+                    }
+                }
+            }
+            let mid = grid.tile_rect(cols / 2, rows / 2);
+            let last = grid.tile_rect(cols - 1, rows - 1);
+            let r = avc420_regions(&Regions::Tiles(grid), w, h);
+            let got: Vec<_> = r
+                .iter()
+                .map(|r| (r.left, r.top, r.right, r.bottom))
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    (mid.x, mid.y, mid.x + mid.w, mid.y + mid.h),
+                    (last.x, last.y, w & !1, h & !1)
+                ],
+                "{w}x{h}"
+            );
         }
         // Whole frame at odd sizes: even edges; at even sizes the full frame.
         for (w, h, ew, eh) in [
