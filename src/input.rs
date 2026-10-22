@@ -719,8 +719,9 @@ pub fn set_ctrl_as_cmd(on: bool) {
 /// left `left_down` stuck, so every move on the next connection posted as
 /// `LeftMouseDragged`.
 ///
-/// **Who raises it matters.** `RdpServerInputHandler` has only
-/// `keyboard`/`mouse`, so the connection edge has to come from the server, and
+/// **Who raises it matters.** The connection START has no
+/// `RdpServerInputHandler` callback (only `keyboard`/`mouse` and, at the end,
+/// `connection_ended`), so it has to come from the server, and
 /// it is raised (vendored `ironrdp-server` divergence 24) once at the top of
 /// `run_connection` / `serve_negotiated` — the two places that each call
 /// `accept_finalize` exactly once, with reactivations looping *inside* it. Two

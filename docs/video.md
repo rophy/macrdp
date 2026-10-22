@@ -47,7 +47,7 @@ How it behaves:
 
 *(Implementation detail — skip unless you're profiling CPU or porting the encoder.)*
 
-VideoToolbox, given a BGRA source, emits **video-range** YUV (luma 16–235). `mstsc` reads AVC420 luma as **full-range**, so that looks washed out (see **Color** above). The fix is to hand VideoToolbox a YUV buffer that's already full-range, which means doing the BGRA → full-range BT.709 NV12 (`420f`) color conversion ourselves, once per captured frame, on the capture thread.
+VideoToolbox, given a BGRA source, emits **video-range** YUV (luma 16–235). `mstsc` reads AVC420 luma as **full-range**, so that looks washed out (see **Color** above). (The environment variable `MACRDP_H264_FULL_RANGE=0` turns the full-range conversion off, for debugging.) The fix is to hand VideoToolbox a YUV buffer that's already full-range, which means doing the BGRA → full-range BT.709 NV12 (`420f`) color conversion ourselves, once per captured frame, on the capture thread.
 
 That conversion is a real per-frame cost, so it's done with **vImage** (Apple's Accelerate framework), which runs the RGB→Y'CbCr math on the CPU's vector units (NEON on Apple Silicon). A scalar reference implementation (a plain Rust loop) is kept as well: it's the fallback for any frame vImage declines (e.g. odd dimensions), the oracle the vImage path is unit-tested against, and the baseline below. Both produce identical output (within ±1 rounding).
 

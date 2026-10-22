@@ -221,3 +221,8 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     the code sspi builds from the SSPI error (not an NTSTATUS value), and mstsc
     showed error 0x904 instead of asking for the password again. Other errors
     keep the sspi code. Drop on a pin bump past cddbe5f7.
+    Needs a client that sends an NTLM MIC (mstsc does; R49 wrong-password
+    check): sspi's candidate match (`complete_authenticate.rs`) tests only the
+    MIC, so without one a wrong password matches there and fails later with
+    another error kind (e.g. `MessageAltered`), which keeps the sspi code and
+    gets no password re-prompt.

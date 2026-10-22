@@ -10,6 +10,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --bind 0.0.0.0:3390       Listen address (3390 by default; 3389 needs root)
 --username NAME           Defaults to $USER
 --password PASS           Skip the interactive prompt (visible in `ps`)
+--version                 Print the version and exit
 --password-file PATH      Read the password from a file (mode 600, owned by
                           you; otherwise refused). Not visible in `ps`.
                           One trailing newline is stripped. Config key
@@ -470,7 +471,7 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 |---|---|---|---|
 | `port` (3389) | `--bind 0.0.0.0:<port>` | `BIND` | Default `127.0.0.1:3390` (loopback only) |
 | `username` | `--username` | `USERNAME` | A macOS account name; default the login user |
-| `password` | `--password-file`, `--keychain` or the prompt | `USE_KEYCHAIN=1` | The macOS password of that account, not an RDP-only password (`--skip-auth --password` only for tests) |
+| `password` | `--password-file`, `--keychain` or the prompt | `PASSWORD_FILE` (with `USE_KEYCHAIN=0`) or `USE_KEYCHAIN=1` | The macOS password of that account, not an RDP-only password (`--skip-auth --password` only for tests) |
 | `width`, `height` | `--width`, `--height` | `EXTRA_FLAGS` | Default: the client's requested size |
 | `frame_rate` | `--fps` | `EXTRA_FLAGS` | Default 60 with H.264 (the default), 15 with `--no-h264` |
 | `bitrate_mbps` | `--bitrate` | `BITRATE` | H.264 ceiling, default automatic from the session size (22 Mbps at 1280x720@60); adaptive below it by default, `--no-adaptive-bitrate` (`ADAPTIVE_BITRATE=0`) for a fixed rate |

@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(26)/(36) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(24)/(25)/(26)/(27)-(32)/(34)-(36) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -14,8 +14,8 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     treat that as the reason this fork exists; it's superseded locally by (2).
 
 (2) Cross-batch audio-lag tracker (NOT upstreamed): replaces the per-batch cap
-    with a cumulative buffer-depth model (`audio_shipped_ms` vs wall-clock
-    `audio_clock_start`) so slow drift from many small client pauses is caught,
+    with a cumulative buffer-depth model (now `AudioLagModel::shipped_ms` vs
+    wall-clock, see (35)) so slow drift from many small client pauses is caught,
     not just one big stall. Drops oldest waves when the projected client buffer
     would exceed `MAX_LAG_MS` (200). The model + the Wave dispatch itself now
     live task-local in the dedicated `dispatch_audio` task in `client_loop`
@@ -32,9 +32,11 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     `dispatch_display`),
     wall-clock outruns `audio_shipped_ms` and the (2) model would read it as
     "client starving" and ship the whole stale backlog late, bloating the
-    buffer and compounding each stall. Fix: if deficit
-    (`real_elapsed - audio_shipped`) > 300 ms, resync `audio_shipped_ms` to
-    live so the backlog is dropped to one `MAX_LAG_MS` of the freshest waves.
+    buffer and compounding each stall. Fix: resync the shipped total to live
+    when the client queue ran empty, so the backlog is dropped to one
+    `MAX_LAG_MS` of the freshest waves. Since (35) `AudioLagModel::catch_up`
+    resyncs at any deficit above 0 ms; 300 ms (`RESYNC_DEFICIT_MS`) only gates
+    the writer-stall log.
 
 (4) Per-batch dispatch priority (NOT upstreamed): in `dispatch_server_events`,
     stably partition the drained batch into THREE priority tiers —
@@ -2124,10 +2126,12 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
       an old connection from clearing the new one.
     - `ConnectionHandler::on_client_session(&ClientSession)`: default no-op,
       called once per served connection in `client_accepted` (not on a
-      reactivation) with `supports_heartbeat`.
+      reactivation) with `supports_heartbeat` (and, since (32),
+      `supports_error_info`).
     Ported from macrdp-v1's IronRDP fork (rophy/IronRDP cd5ac8f4, 639fce30,
     63b3f96d, 6864c807, f1abf7cc; relicensed by the author), reshaped for this
-    vendor copy. macrdp's `src/keep_awake.rs` uses all four.
+    vendor copy. macrdp's `src/keep_awake.rs` uses the first three;
+    `on_client_session` is implemented in `src/session.rs`.
 
 (31) Audio only for a client that wants it (NOT upstreamed; added 2026-10-21;
     pairs with `vendor/ironrdp-acceptor` divergence (31)). `client_accepted`
@@ -2144,7 +2148,8 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     added 2026-10-21). Ends the connection after a Server Set Error Info PDU
     with the given code (MS-RDPBCGR 2.2.5.1.1), sent only to a client that set
     `RNS_UD_CS_SUPPORT_ERRINFO_PDU` (3.3.5.7.1; flags from acceptor divergence
-    (30)). macrdp's idle timeout sends it with ERRINFO_IDLE_TIMEOUT.
+    (30)), reported to the application as `ClientSession::supports_error_info`.
+    macrdp's idle timeout sends it with ERRINFO_IDLE_TIMEOUT.
     `discard_stale_eviction_events` now also drops queued `Disconnect` events
     and runs at the top of `run_connection` too, so an event meant for a
     connection that ended cannot end the next one. Upstream has a similar
