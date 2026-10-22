@@ -2356,9 +2356,15 @@ impl Gfx {
         let force_keyframe = 'ctx_step: {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
+                self.latest_dropped.store(false, Ordering::Relaxed);
                 return Ok(false); // no active connection
             };
             if !ctx.is_ready {
+                // Nothing to send again on a channel that is not (or no longer)
+                // ready: else a frame dropped before the EGFX close made the
+                // capture loop re-submit every frame interval for the rest of
+                // the connection (final review M2).
+                self.latest_dropped.store(false, Ordering::Relaxed);
                 return Ok(false); // channel not negotiated yet (or non-EGFX client)
             }
             // Arm the keyframe BEFORE the throttle check so a large change that
@@ -3161,25 +3167,6 @@ impl Gfx {
         }
     }
 
-    /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
-    /// once per capture from `submit_bgra` while holding the ctx lock; rate-limited to
-    /// one step per `adaptive_interval`. Detects congestion from the client's frame-ack
-    /// lag (fast, leads the watchdog) and the shared retransmit counter (late), and
-    /// per interval:
-    /// - **bitrate:** multiplicative-decrease toward `adaptive_floor_bps` on any loss,
-    ///   else additive-increase toward the `bitrate_bps` ceiling;
-    /// - **IDR backoff:** stretch the periodic keyframe interval (suppress the
-    ///   periodic IDR) when congestion starts, restore it + force one recovery IDR
-    ///   when the link is fully recovered (clean + back at the ceiling).
-    ///
-    /// Returns the encoder adjustments to apply this frame; may also set
-    /// `ctx.need_keyframe`. A no-op (`AdaptiveActions::default()`) unless
-    /// `--adaptive-bitrate` is set — so with the feature off the path stays
-    /// byte-identical. With it on, the bitrate AIMD runs on BOTH transports (P3): the
-    /// `shipped − acked` ack-lag signal works on TCP too (FrameAcknowledge flows
-    /// there and the unbounded ship channel lets `shipped` advance, so the lag
-    /// reflects the real backlog). IDR backoff stays UDP-only — on TCP the periodic
-    /// keyframe is cheap insurance and not worth the false-suppress risk.
     /// A capture was dropped to bound the frames in flight and nothing newer was
     /// encoded since: the caller should re-submit its newest frame shortly.
     pub fn latest_dropped(&self) -> bool {
@@ -3265,6 +3252,25 @@ impl Gfx {
         actions
     }
 
+    /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
+    /// once per capture from `submit_bgra` while holding the ctx lock; rate-limited to
+    /// one step per `adaptive_interval`. Detects congestion from the client's frame-ack
+    /// lag (fast, leads the watchdog) and the shared retransmit counter (late), and
+    /// per interval:
+    /// - **bitrate:** multiplicative-decrease toward `adaptive_floor_bps` on any loss,
+    ///   else additive-increase toward the `bitrate_bps` ceiling;
+    /// - **IDR backoff:** stretch the periodic keyframe interval (suppress the
+    ///   periodic IDR) when congestion starts, restore it + force one recovery IDR
+    ///   when the link is fully recovered (clean + back at the ceiling).
+    ///
+    /// Returns the encoder adjustments to apply this frame; may also set
+    /// `ctx.need_keyframe`. A no-op (`AdaptiveActions::default()`) unless
+    /// `--adaptive-bitrate` is set — so with the feature off the path stays
+    /// byte-identical. With it on, the bitrate AIMD runs on BOTH transports (P3): the
+    /// `shipped − acked` ack-lag signal works on TCP too (FrameAcknowledge flows
+    /// there and the unbounded ship channel lets `shipped` advance, so the lag
+    /// reflects the real backlog). IDR backoff stays UDP-only — on TCP the periodic
+    /// keyframe is cheap insurance and not worth the false-suppress risk.
     fn adaptive_bitrate_step(&self, ctx: &mut ConnectionContext) -> AdaptiveActions {
         let mut actions = AdaptiveActions::default();
         if !self.adaptive_enabled {
@@ -4780,6 +4786,9 @@ impl GraphicsPipelineHandler for GfxHandler {
             ctx.need_keyframe = true;
             // Frames sent on the closed channel are never acknowledged.
             ctx.window.lock().unwrap().reset();
+            // The client no longer shows our tiles: no refinement is pending
+            // or in flight for the closed channel (final review M3).
+            ctx.refine.lock().unwrap().give_up();
         } else {
             debug!("EGFX on_close: graphics channel closed (no active context)");
         }
@@ -6954,6 +6963,47 @@ mod tests {
         assert!(is_live(&second));
         assert!(!gfx.ctx.lock().unwrap().as_ref().unwrap().is_ready);
         assert!(gfx.staged.lock().unwrap().is_none());
+    }
+
+    /// A frame dropped just before the EGFX channel closed is not sent again
+    /// on a channel that is not ready (final review M2), and the close clears
+    /// the refinement state (M3).
+    #[test]
+    fn a_closed_channel_has_nothing_to_resend_or_refine() {
+        let gfx = gfx_with_context();
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.client_supports_avc = true;
+            let mut grid = refine::TileGrid::new(64, 64);
+            grid.mark_all();
+            ctx.refine
+                .lock()
+                .unwrap()
+                .on_shipped(&Regions::Tiles(grid), Instant::now());
+        }
+        let handler = || GfxHandler {
+            ctx: gfx.ctx.clone(),
+        };
+        handler().on_ready(&avc_ready());
+        gfx.latest_dropped.store(true, Ordering::Relaxed);
+        handler().on_close();
+        let refine_due = gfx
+            .ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .refine
+            .lock()
+            .unwrap()
+            .due();
+        assert!(refine_due.is_none());
+        let frame = vec![0u8; 64 * 64 * 4];
+        assert!(!gfx
+            .submit_bgra(&frame, 64 * 4, false, None, (64, 64), None)
+            .unwrap());
+        assert!(!gfx.latest_dropped());
     }
 
     /// `Gfx::hold_legacy` across the connection states (R36 review 2, 3, 10).
