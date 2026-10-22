@@ -1745,8 +1745,13 @@ impl ViewPairing {
 /// MS-RDPEGFX 2.2.4.4.1 reads them, and an even width: FreeRDP converts each
 /// AVC444 rectangle two pixels at a time and asserts an even width
 /// (`sse41_YUV444ToRGB_8u_P3AC4R_BGRX`, the client aborted on a 31-pixel
-/// edge tile). Tiles start at multiples of 32, so only the right edge of an
-/// odd-width frame loses its last column.
+/// edge tile). Tile edges are at multiples of 32 only when the width is a
+/// multiple of 32 (they are `c * width / cols`): at 1023 they are 0, 33, 66,
+/// 99, ..., and FreeRDP 3.30 `/size:1023x767 /gfx:AVC444` aborted on the
+/// first frame with tiles (R50). So each tile rectangle starts at an even
+/// column and ends at an even column (one more pixel of the encoded frame on
+/// either side); only the right edge of an odd-width frame loses its last
+/// column.
 ///
 /// The whole frame is exact (the WireToSurface1 of an AVC444 frame is written
 /// by [`avc444_wire_to_surface`], whose destination rectangle is exclusive
@@ -1771,9 +1776,10 @@ fn avc444_regions(regions: &Regions, width: u16, height: u16) -> Vec<Avc420Regio
             .rects()
             .into_iter()
             .map(|r| {
-                let right = (r.x + r.w).min(right_edge);
+                let left = r.x & !1;
+                let right = (r.x + r.w).saturating_add(1) & !1;
                 let bottom = (r.y + r.h).min(height.saturating_sub(1));
-                region(r.x, r.y, right, bottom)
+                region(left, r.y, right.min(right_edge), bottom)
             })
             .filter(|r| r.right > r.left && r.bottom > r.top)
             .collect(),
@@ -7332,6 +7338,34 @@ mod tests {
             .all(|r| (r.right - r.left) % 2 == 0 && r.right > r.left));
         assert_eq!(r.iter().map(|r| r.right).max(), Some(1280));
         assert_eq!(r.iter().map(|r| r.bottom).max(), Some(720));
+        // A width that is not a multiple of 32 has tile edges at odd columns
+        // (1023: 0, 33, 66, 99, ...): every rectangle still starts and ends at
+        // an even column, and rectangles of one tile row do not overlap.
+        let mut grid = refine::TileGrid::new(1023, 720);
+        grid.mark_all();
+        let keep = [(1, 0), (3, 0), (5, 1), (30, 2), (31, 3)];
+        let (cols, rows) = grid.cols_rows();
+        for row in 0..rows {
+            for col in 0..cols {
+                if !keep.contains(&(col, row)) {
+                    grid.unset(col, row);
+                }
+            }
+        }
+        let r = avc444_regions(&Regions::Tiles(grid), 1023, 720);
+        assert!(!r.is_empty());
+        for a in &r {
+            assert_eq!(a.left % 2, 0, "{a:?}");
+            assert_eq!(a.right % 2, 0, "{a:?}");
+            assert!(a.right > a.left && a.right <= 1022, "{a:?}");
+        }
+        for (i, a) in r.iter().enumerate() {
+            for b in &r[i + 1..] {
+                let overlap =
+                    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+                assert!(!overlap, "{a:?} {b:?}");
+            }
+        }
     }
 
     /// The WireToSurface1 we write decodes as an AVC444 command whose
