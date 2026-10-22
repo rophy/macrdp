@@ -21,7 +21,7 @@ pub struct MacInputHandler {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     desktop_size: crate::capture::SharedDesktopSize,
     /// Records mouse-button-down timestamps so the H.264 path can lower its
-    /// keyframe threshold briefly after a click. `None` unless `--enable-h264`.
+    /// keyframe threshold briefly after a click. `None` with `--no-h264`.
     click_signal: Option<crate::capture::ClickSignal>,
     /// Told about each keyboard and mouse event (Wi-Fi keep-awake).
     session: crate::session::SessionInput,

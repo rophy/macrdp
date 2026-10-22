@@ -311,7 +311,7 @@ pub struct CaptureDisplay {
     /// serving the size resolved at startup. Serving the client's exact
     /// resolution means the client never rescales the decoded video —
     /// client-side rescaling on mstsc costs typing latency and, with
-    /// `--enable-h264`, audio desync. Enabled by default on the
+    /// H.264, audio desync. Enabled by default on the
     /// mirror-primary path when no explicit `--width`/`--height`/`--hidpi`
     /// was given; `--no-client-resolution` opts out.
     ///
@@ -356,7 +356,7 @@ pub struct CaptureDisplay {
     /// counter that drives the `--detach-primary` session-transition
     /// watcher. `None` disables the wrap entirely (zero overhead).
     pub session_tracker: Option<SessionTracker>,
-    /// EGFX/H.264 frame sink (macOS-only, opt-in via `--enable-h264`). When
+    /// EGFX/H.264 frame sink (macOS-only, on unless `--no-h264`). When
     /// `Some`, every captured SCK frame is submitted to the H.264 encoder; once
     /// EGFX has negotiated, the legacy BitmapUpdate path is suppressed and the
     /// display is served entirely over EGFX.
@@ -555,7 +555,7 @@ impl RdpServerDisplay for CaptureDisplay {
     /// Debounced by the capture loop via `pending_resize` so a window drag
     /// (many PDUs/sec) produces one resize, not one per tick. Both codec
     /// paths ride the same core deactivation-reactivation; on the EGFX
-    /// (`--enable-h264`) path the capture loop additionally resets the
+    /// (H.264) path the capture loop additionally resets the
     /// per-connection surface/encoder state first so the post-reactivation
     /// rebuild starts from scratch at the new size — see
     /// `Gfx::reset_for_live_resize`'s doc comment for why (a channel-level
@@ -966,7 +966,7 @@ mod macos {
         /// watch) still animate — just at ~15 fps (the identity-gate variant
         /// froze them entirely; see the cursor-animation feedback note).
         last_cursor_poll: Option<Instant>,
-        /// EGFX/H.264 frame sink; `None` unless `--enable-h264`.
+        /// EGFX/H.264 frame sink; `None` with `--no-h264`.
         gfx: Option<crate::h264::Gfx>,
         /// On-demand-keyframe tuning (`--keyframe-on-change`). When disabled, no
         /// dirty-area work is done for keyframe decisions.

@@ -25,7 +25,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --width  / --height       # override autodetected display size
 --hidpi                   # capture the primary display at backing (Retina) pixels
                           #   instead of logical points (~4x pixels; crisp; best
-                          #   with --enable-h264). Ignored with --width/--height
+                          #   with H.264, the default). Ignored with --width/--height
                           #   or --virtual-display. macOS-only. Also disables live
                           #   client-driven resize (a resized client window is
                           #   silently ignored) — resize needs the client-resolution
@@ -236,7 +236,7 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   frames; 2 s on a UDP tunnel
                           #   when 0; H.264 only)
 --flush-frames N          # trailing skip-P-frames re-sent after each change to drain
-                          #   mstsc's presentation buffer (default 4; 0 disables; --enable-h264)
+                          #   mstsc's presentation buffer (default 4; 0 disables; H.264 only)
 --enable-aac              # Compress RDPSND audio as AAC-LC (WAVE_FORMAT_AAC_MS)
                           #   instead of raw PCM; ~11x less bandwidth. PCM fallback is
                           #   automatic for clients without AAC decode. Adds ~40-50 ms
@@ -377,8 +377,8 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   the ceiling that follows the median queueing delay of the
                           #   last 300 ms / 1 s (down above 100 ms, up after 3+ s below
                           #   50 ms). On the UDP tunnel:
-                          #   Congestion-responsive H.264 rate control (only with
-                          #   --enable-h264): an
+                          #   Congestion-responsive H.264 rate control (H.264
+                          #   only): an
                           #   AIMD controller reads the STANDING QUEUE DELAY — each
                           #   frame's ship→ack round trip minus the windowed-minimum
                           #   RTT, EWMA-smoothed — plus reliable-tunnel retransmits,
@@ -396,8 +396,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   Under congestion it also stretches the periodic IDR
                           #   (UDP tunnel only) to avoid injecting a big keyframe
                           #   into a congested pipe. So --bitrate is a CEILING, not a
-                          #   fixed target: set it high (e.g. 8) and it backs off
-                          #   only when the link strains.
+                          #   fixed target, and it backs off only when the link
+                          #   strains. The automatic ceiling (22 Mbps at 1280x720@60)
+                          #   is the best default; a lower --bitrate caps quality.
                           #   P2b frame-rate floor: once bitrate is pinned at the floor
                           #   AND still congested (quality cuts exhausted), it caps the
                           #   effective fps (default 10) to shed packet load — on the
@@ -425,7 +426,7 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
                           #   retransmit counts, the old behaviour). macOS-only.
 --enable-lossy-audio      # EXPERIMENTAL, opt-in (default OFF; ENABLE_LOSSY_AUDIO=1
                           #   in config.env). Implies --enable-udp-multitransport;
-                          #   needs --enable-aac + --enable-h264. Stream RDPSND audio
+                          #   needs --enable-aac + H.264 (not with --no-h264). Stream RDPSND audio
                           #   over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-
                           #   resilient audio path. AAC Wave2 data rides a lossy
                           #   RDPEUDP flow (deliver-on-arrival, no retransmit) and

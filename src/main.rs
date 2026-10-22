@@ -216,7 +216,7 @@ struct Args {
     /// instead of logical points — e.g. 3024×1964 instead of 1512×982 — so
     /// clients render crisp native pixels instead of upscaling a point-density
     /// frame. Off by default: it's ~4× the pixels (heavier on legacy/slow
-    /// links), and the win is biggest with --enable-h264 (compresses cleanly,
+    /// links), and the win is biggest with H.264 (the default; compresses cleanly,
     /// the client downscales sharply). Ignored when --width/--height are set or
     /// with --virtual-display (already an explicit resolution). macOS-only.
     #[arg(long)]
@@ -763,7 +763,7 @@ struct Args {
     adaptive_bitrate_compat: bool,
 
     /// EXPERIMENTAL, opt-in (default OFF; implies --enable-udp-multitransport,
-    /// requires --enable-aac and --enable-h264). Stream RDPSND audio over a LOSSY
+    /// requires --enable-aac and H.264, which is on unless --no-h264). Stream RDPSND audio over a LOSSY
     /// UDP/DTLS tunnel with 1+1 redundancy instead of TCP — the loss-resilient audio
     /// path. The MS-RDPEA format handshake runs on a reliable DVC over TCP; AAC Wave2
     /// data is Soft-Synced onto a lossy (UdpFecL) RDPEUDP flow (deliver-on-arrival, no
@@ -782,7 +782,7 @@ struct Args {
     /// (e.g. mstsc full-screen on a 1920×1080 monitor) and serves the session
     /// at exactly that size, so the client presents the video 1:1 instead of
     /// rescaling it (client-side rescaling on mstsc costs typing latency and,
-    /// with --enable-h264, contributes to audio drift). Applies when mirroring
+    /// with H.264, contributes to audio drift). Applies when mirroring
     /// the primary display without --width/--height/--hidpi, and on
     /// --virtual-display (where the virtual display is re-moded to the
     /// client's size — --width/--height are its initial size, not a pin).
@@ -2725,7 +2725,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ),
         ("HEALTHCHECK_FAILURES", "MACRDP_HEALTHCHECK_FAILURES"),
         // Blank recovery (the mstsc reconnect-blank auto-heal, needs
-        // --enable-h264) + the auto-reconnect cookie. Env-driven like the
+        // H.264, on by default) + the auto-reconnect cookie. Env-driven like the
         // guard (read in h264.rs per connection / main.rs at server build,
         // both after this bridge runs). BLANK_RECOVERY=0 is the ask that
         // motivated bridging: disabling the detector for an overlay-link
@@ -3563,7 +3563,7 @@ async fn async_main() -> Result<()> {
     // 0 = unknown.
     let link_rtt_ms = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
+    // EGFX/H.264 video pipeline (macOS-only; on by default, --no-h264 turns it off). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
     // H.264 bitrate ceiling: --bitrate, else automatic from the desktop size.
@@ -3916,8 +3916,8 @@ async fn async_main() -> Result<()> {
                 enable_aac = args.enable_aac,
                 enable_h264 = args.enable_h264,
                 "--enable-lossy-audio needs --enable-aac (MS-RDPEA requires AAC for the lossy DVC) \
-                 AND --enable-h264 (the lossy-audio Soft-Sync rides the EGFX dispatch path); without \
-                 both, audio stays on TCP"
+                 AND H.264 (the lossy-audio Soft-Sync rides the EGFX dispatch path; H.264 is on by \
+                 default, remove --no-h264 / ENABLE_H264=0); without both, audio stays on TCP"
             );
         }
     }

@@ -24,7 +24,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --hidpi                   Capture the primary display at backing (Retina) pixel
                           resolution instead of logical points (e.g. 3024×1964
                           vs 1512×982) for crisp native pixels. ~4× the pixels;
-                          best with --enable-h264. Ignored with --width/--height
+                          best with H.264 (the default). Ignored with --width/--height
                           or --virtual-display. See [video.md](video.md). macOS-only.
 --no-client-resolution    Serve the Mac's native size instead of adopting the
                           resolution the client requests at connect. By default,
@@ -127,7 +127,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           still forced when the client needs one; fractional
                           values OK.
 --keyframe-on-change      Force on-change H.264 keyframes (OFF by default; only
-                          with --enable-h264): an IDR on large changes (window-
+                          with H.264): an IDR on large changes (window-
                           to-front, scroll, app launch) and briefly after a click.
                           The flush-burst already covers this,
                           so enable it only if big updates lag. See [video.md](video.md).
@@ -338,7 +338,7 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           (MACRDP_EGFX_FRAME_WINDOW=0 turns it off).
                           (--adaptive-bitrate is still accepted; it is a no-op.)
 --enable-lossy-audio      EXPERIMENTAL, opt-in (implies --enable-udp-multitransport;
-                          needs --enable-aac + --enable-h264). Stream RDPSND audio
+                          needs --enable-aac + H.264, not with --no-h264). Stream RDPSND audio
                           over a LOSSY UDP/DTLS tunnel instead of TCP — the loss-
                           resilient audio path. AAC Wave2 data rides a lossy
                           RDPEUDP flow (deliver-on-arrival, no retransmit) and each
@@ -486,7 +486,7 @@ against a macOS account (PAM), so the client logs in with that account's passwor
 | `cert_path`, `key_path` | `--cert`, `--key` | `TLS_CERT`, `TLS_KEY` | Default: self-signed in `--cert-dir` |
 | `log_level` | `RUST_LOG` (env), `-v` | `RUST_LOG` in the plist `EnvironmentVariables` | Log file: `--log-dir` (`LOG_DIR`) |
 | `show_cursor`, `cursor_channel` | none | | The capture leaves the pointer out; it goes as pointer updates (`--cursor-scale` sets its size) |
-| `skip_unchanged` | none | | No key; on a static screen H.264 still sends `--keyframe-interval` keyframes and `--flush-frames` |
+| `skip_unchanged` | none | | No key; always on: a static screen sends almost nothing (no periodic keyframe over TCP by default; `--flush-frames` only right after a change) |
 | `[audio] enabled` | none | | Audio goes to a client that asks for it (play here); `--enable-aac` for AAC |
 | `[clipboard]` | `--no-rich-clipboard`, `--no-lazy-paste` | `RICH_CLIPBOARD=0` | Clipboard and file copy are always on; no file size limit (up to 10 000 files per copy) |
 | `--perf` (CLI) | `--stats-endpoint` | `STATS_ENDPOINT` | Live JSON on 127.0.0.1 (`MACRDP_STATS_PORT`) instead of a log summary |
