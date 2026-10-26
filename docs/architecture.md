@@ -20,7 +20,8 @@ src/input.rs      RDP scancodes/mouse PDUs → CGEvent synthesis (US ANSI by
                   default; non-US via src/keyboard_layout.rs),
                   per-side modifier state with NX_DEVICE bits, Caps Lock
                   toggle, AX-driven symbolic-hotkey workarounds
-                  (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight,
+                  (Cmd+Tab app cycle, Cmd+` window cycle, Spotlight (also
+                  Option+Space with --alt-space-spotlight),
                   screencapture) since WindowServer's symbolic-hotkey
                   dispatcher won't fire for CGEventPost. The Cmd+Tab cycle
                   (also Option+Tab with --alt-tab-switch), and the Cmd+`

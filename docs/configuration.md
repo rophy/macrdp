@@ -12,9 +12,11 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
 --password PASS           Skip the interactive prompt (visible in `ps`)
 --version                 Print the version and exit
 --password-file PATH      Read the password from a file (mode 600, owned by
-                          you; otherwise refused). Not visible in `ps`.
+                          you, no ACL; otherwise refused). Not visible in `ps`.
                           One trailing newline is stripped. Config key
-                          PASSWORD_FILE (set USE_KEYCHAIN=0 with it)
+                          PASSWORD_FILE (set USE_KEYCHAIN=0 with it; a
+                          config.env made by the menu-bar app has
+                          USE_KEYCHAIN=1, so change it to 0)
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
 -v, --verbose             Show all the noisy logs the default filter hides
@@ -67,6 +69,10 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           --alt-tab-switch, for clients that forward Alt+` but
                           gate Win-key combos. Option+Shift+` cycles backward.
                           macOS-only.
+--alt-space-spotlight     Also accept Option+Space (Alt+Space from the client)
+                          as the Spotlight trigger, in addition to Cmd+Space.
+                          Off by default. For macOS clients, whose own Spotlight
+                          takes Cmd+Space first. macOS-only.
 --app-switcher-hud        Show a visual app-switcher overlay (icon row, like
                           macOS's native Cmd+Tab) on the remote during Cmd+Tab /
                           Option+Tab. Off by default. macrdp spawns a small helper

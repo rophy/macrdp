@@ -745,6 +745,17 @@ pub fn set_alt_backtick_switch(on: bool) {
     ALT_BACKTICK_SWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When true, Option+Space opens Spotlight like Cmd+Space, for macOS clients
+/// whose own OS takes Cmd+Space before the RDP client sees it. Opt-in via
+/// `--alt-space-spotlight`; off by default so Option+Space still types a
+/// non-breaking space.
+static ALT_SPACE_SPOTLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_alt_space_spotlight(on: bool) {
+    ALT_SPACE_SPOTLIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// When true, drive the `macrdphud` overlay helper so the remote client sees a
 /// visual app switcher during Cmd+Tab / Option+Tab. Opt-in via
 /// `--app-switcher-hud`; off by default. The switch itself works the same either
@@ -1955,6 +1966,17 @@ mod macos {
                 && vk == VK_GRAVE
             {
                 ax_cycle_windows_of_front(shift);
+                return true;
+            }
+
+            if super::ALT_SPACE_SPOTLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+                && opt
+                && !cmd
+                && !ctrl
+                && !shift
+                && vk == VK_SPACE
+            {
+                invoke_spotlight();
                 return true;
             }
 

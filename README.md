@@ -48,6 +48,18 @@ Details and the path to closing the gaps: [docs/production-readiness-roadmap.md]
 
 ## Quick start
 
+**With Homebrew** (Apple Silicon, macOS 14+), installing the same notarized build as the releases:
+
+```bash
+brew tap clintcan/tap
+brew trust clintcan/tap    # current Homebrew asks you to trust third-party taps
+brew install --cask macrdp
+```
+
+Then open **macrdpController** from /Applications: it stores your Mac password in the Keychain and starts the server at login. After `brew upgrade`, restart the server with `launchctl kickstart -k gui/$UID/com.clintcan.macrdp`. It's a cask rather than a formula on purpose: only the signed app carries the entitlement USB redirection needs, and it keeps your permission grants across upgrades.
+
+**From source:**
+
 ```bash
 cargo build --release
 codesign -s - --force target/release/macrdp   # ad-hoc sign so TCC grants persist
@@ -84,7 +96,7 @@ macrdp reimplements the macOS symbolic hotkeys in user space (WindowServer won't
 | **Ctrl+Alt+G** | Gather windows stranded off the virtual display (headless `--capture-primary`/`--detach-primary` modes) |
 | **Ctrl+Alt+Shift+R** | On-demand A/V resync — repaint a stale/idle-blanked screen (forced keyframe) and re-sync drifted audio, without disconnecting. Handy for mstsc after hours idle. |
 
-Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` accept **Option+Tab** / **Option+\`** as the same triggers; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents; `--ctrl-as-cmd` instead swaps the modifier keys themselves (Ctrl = Cmd, Alt = Option, Win = Control) for every key and app.
+Optional flags: `--alt-tab-switch` / `--alt-backtick-switch` / `--alt-space-spotlight` accept **Option+Tab** / **Option+\`** / **Option+Space** as the same triggers; `--app-switcher-hud` draws a visible switcher overlay; `--map-ctrl-to-cmd` remaps Windows **Ctrl+C/V/X/…** editing shortcuts to their **Cmd** equivalents; `--ctrl-as-cmd` instead swaps the modifier keys themselves (Ctrl = Cmd, Alt = Option, Win = Control) for every key and app.
 
 > **mstsc tip:** if **Cmd+Tab** seems ignored, set **Local Resources → Keyboard → "Apply Windows key combinations"** to **"On the remote computer"** (or go full-screen) — the windowed default eats **Win+Tab** locally as Task View.
 

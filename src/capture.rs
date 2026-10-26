@@ -432,6 +432,25 @@ pub struct CaptureDisplay {
         Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
 }
 
+/// Which of ScreenCaptureKit's displays to mirror when no virtual display is
+/// set: the main display, which is the one input maps the mouse onto
+/// (`CGDisplay::main()`), falling back to the first. SCK doesn't list the main
+/// display first on every multi-monitor Mac, and mirroring another one put the
+/// picture on one monitor and the mouse on a different one (#205). Pure, so
+/// it's unit-tested on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mirror_display_index(display_ids: &[u32], main_id: u32) -> Option<usize> {
+    if display_ids.is_empty() {
+        return None;
+    }
+    Some(
+        display_ids
+            .iter()
+            .position(|&id| id == main_id)
+            .unwrap_or(0),
+    )
+}
+
 /// Look up the primary display's pixel dimensions via ScreenCaptureKit.
 ///
 /// Returns `None` on non-macOS targets so the caller can fall back to a stub
@@ -448,7 +467,11 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
             anyhow!("AsyncSCShareableContent::get failed (Screen Recording permission?): {e:?}")
         })?;
         let displays = content.displays();
-        let display = displays.first().context("no displays available")?;
+        let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+        let main_id = core_graphics::display::CGDisplay::main().id;
+        let display = mirror_display_index(&ids, main_id)
+            .map(|i| &displays[i])
+            .context("no displays available")?;
         let w = u16::try_from(display.width()).context("display width > u16")?;
         let h = u16::try_from(display.height()).context("display height > u16")?;
         Ok(Some((w, h)))
@@ -488,6 +511,23 @@ fn adopt_client_size(
     }
 }
 
+/// Clamp a client-requested size to `--max-client-size`, per dimension.
+///
+/// The acceptor clamps the size it negotiates in Demand Active, but
+/// `request_initial_size` receives the client's Confirm Active echo, which a
+/// client can fill with its own requested size instead (mstsc asking for
+/// 3840x2160 was observed doing so, issue #211). The echo is client-controlled,
+/// so the ceiling has to be applied here too, before anything is sized from it.
+fn cap_client_size(client: DesktopSize, max: Option<DesktopSize>) -> DesktopSize {
+    match max {
+        Some(max) => DesktopSize {
+            width: client.width.min(max.width),
+            height: client.height.min(max.height),
+        },
+        None => client,
+    }
+}
+
 #[async_trait::async_trait]
 impl RdpServerDisplay for CaptureDisplay {
     async fn size(&mut self) -> DesktopSize {
@@ -523,6 +563,7 @@ impl RdpServerDisplay for CaptureDisplay {
             return DesktopSize { width, height };
         }
 
+        let client_size = cap_client_size(client_size, self.max_client_size);
         if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
             tracing::info!(
                 client_w = adopted.width,
@@ -582,7 +623,7 @@ impl RdpServerDisplay for CaptureDisplay {
         };
 
         let (w, h) = monitor.dimensions();
-        let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
+        let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
             tracing::warn!(
                 w,
                 h,
@@ -591,15 +632,9 @@ impl RdpServerDisplay for CaptureDisplay {
             return;
         };
 
-        if let Some(max) = self.max_client_size {
-            width = width.min(max.width);
-            height = height.min(max.height);
-        }
-
+        let requested = cap_client_size(DesktopSize { width, height }, self.max_client_size);
         let (cur_w, cur_h) = self.desktop_size.get();
-        let Some(adopted) =
-            adopt_client_size(resizable, (cur_w, cur_h), DesktopSize { width, height })
-        else {
+        let Some(adopted) = adopt_client_size(resizable, (cur_w, cur_h), requested) else {
             return; // no-op: unchanged, or outside the protocol-legal band
         };
 
@@ -1126,7 +1161,22 @@ mod macos {
                                 .join(", ")
                         )
                     })?,
-                None => displays.first().context("no displays available")?,
+                None => {
+                    // Mirror mode: follow the main display, as input does.
+                    let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+                    let main_id = core_graphics::display::CGDisplay::main().id;
+                    let index = super::mirror_display_index(&ids, main_id)
+                        .context("no displays available")?;
+                    if ids.len() > 1 {
+                        tracing::info!(
+                            mirrored = ids[index],
+                            main = main_id,
+                            sck_displays = ?ids,
+                            "multiple displays: mirroring the main display"
+                        );
+                    }
+                    &displays[index]
+                }
             };
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
@@ -2013,6 +2063,20 @@ mod stub {
 mod tests {
     use super::*;
 
+    /// #205: mirror the main display even when SCK lists another first.
+    #[test]
+    fn mirror_display_prefers_the_main_display() {
+        // Main display listed second: pick it, not the first.
+        assert_eq!(mirror_display_index(&[3, 1, 7], 1), Some(1));
+        // Main listed first, or the only display: unchanged from before.
+        assert_eq!(mirror_display_index(&[1, 3], 1), Some(0));
+        assert_eq!(mirror_display_index(&[1], 1), Some(0));
+        // Main not in SCK's list at all: fall back to the first, as before.
+        assert_eq!(mirror_display_index(&[3, 7], 1), Some(0));
+        // No displays: nothing to mirror.
+        assert_eq!(mirror_display_index(&[], 1), None);
+    }
+
     #[test]
     fn shared_desktop_size_roundtrips() {
         let size = SharedDesktopSize::new(1512, 982);
@@ -2171,6 +2235,24 @@ mod tests {
                 width: 200,
                 height: 8192
             })
+        );
+    }
+
+    #[test]
+    fn cap_client_size_applies_the_operator_maximum() {
+        let size = |width, height| DesktopSize { width, height };
+        let max = Some(size(1920, 1080));
+        // Issue #211: a client echoing 3840x2160 under a 1920x1080 cap.
+        assert_eq!(cap_client_size(size(3840, 2160), max), size(1920, 1080));
+        // Per dimension: a smaller side is kept.
+        assert_eq!(cap_client_size(size(1280, 2160), max), size(1280, 1080));
+        assert_eq!(cap_client_size(size(1280, 720), max), size(1280, 720));
+        // No cap: unchanged.
+        assert_eq!(cap_client_size(size(3840, 2160), None), size(3840, 2160));
+        // Served at the cap already, the oversized echo is not adopted.
+        assert_eq!(
+            adopt_client_size(true, (1920, 1080), cap_client_size(size(3840, 2160), max)),
+            None
         );
     }
 

@@ -840,6 +840,13 @@ struct Args {
     #[arg(long = "alt-backtick-switch")]
     alt_backtick_switch: bool,
 
+    /// Also accept Option+Space (Alt+Space from the client) as the Spotlight
+    /// trigger, in addition to Cmd+Space. Off by default. For macOS clients,
+    /// whose own Spotlight takes Cmd+Space before the RDP client sees it. When
+    /// off, Option+Space types a non-breaking space. macOS-only.
+    #[arg(long = "alt-space-spotlight")]
+    alt_space_spotlight: bool,
+
     /// Show a visual app-switcher overlay (icon row) on the remote during Cmd+Tab
     /// / Option+Tab, like macOS's native switcher. Off by default. macrdp spawns a
     /// small helper process that draws a real on-screen panel; ScreenCaptureKit
@@ -1066,7 +1073,8 @@ const MAX_PASSWORD_FILE_BYTES: usize = 4096;
 
 /// Read the password from `--password-file`. The file must belong to the
 /// user that runs macrdp and must give no access to group or others (mode
-/// 0600 or 0400), as ssh requires for private keys; otherwise it is refused.
+/// 0600 or 0400), as ssh requires for private keys, and on macOS must have no
+/// access control list; otherwise it is refused.
 /// One trailing `\n` (or `\r\n`) is stripped; an empty password is an error.
 /// The bytes are read into one buffer of a fixed size that is never
 /// reallocated, so no unzeroized copy of the password is left on the heap.
@@ -1096,6 +1104,16 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let euid = unsafe { libc::geteuid() };
     check_password_file_access(meta.mode(), meta.uid(), euid)
         .with_context(|| format!("password file {}", path.display()))?;
+    // A macOS ACL can grant access that the mode bits do not show, for
+    // example one inherited from the parent folder.
+    #[cfg(target_os = "macos")]
+    if has_extended_acl(&file).with_context(|| format!("password file {}", path.display()))? {
+        return Err(anyhow!(
+            "password file {} has an access control list; remove it with `chmod -N {}`",
+            path.display(),
+            path.display()
+        ));
+    }
 
     let mut buf = Zeroizing::new(vec![0u8; MAX_PASSWORD_FILE_BYTES + 1]);
     let mut len = 0;
@@ -1136,6 +1154,34 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         return Err(anyhow!("password file {} is empty", path.display()));
     }
     Ok(s)
+}
+
+/// Whether the open file has an extended access control list (any entry).
+#[cfg(target_os = "macos")]
+fn has_extended_acl(file: &fs::File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // <sys/acl.h>; the libc crate does not declare these.
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: the fd stays open while `file` is borrowed; a non-null result is
+    // freed once below.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let err = std::io::Error::last_os_error();
+        // ENOENT: no ACL. ENOTSUP: the file system has no ACLs.
+        return match err.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTSUP) => Ok(false),
+            _ => Err(err).context("reading its access control list"),
+        };
+    }
+    // SAFETY: `acl` came from acl_get_fd_np and is not used after this.
+    unsafe { acl_free(acl) };
+    Ok(true)
 }
 
 /// The access rule for `--password-file`: owned by `euid` and no permission
@@ -1784,6 +1830,9 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // is most likely redundant (an app would see each Shift change twice;
     // nothing at the lock screen acts on that). It is kept because this
     // path has not been re-tested with one post.
+    // it wakes the field harmlessly. Posted as FlagsChanged on both event
+    // sources, as live-tested; the lock screen ignores the doubled tap that
+    // `input.rs::post_flags_changed` now avoids for apps.
     const VK_SHIFT: u16 = 0x38;
     let post_flags = |flags: CGEventFlags| {
         for src in [&source, &source_hid] {
@@ -2585,6 +2634,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     }
     if on("ALT_BACKTICK_SWITCH", false) {
         argv.push("--alt-backtick-switch".into());
+    }
+    if on("ALT_SPACE_SPOTLIGHT", false) {
+        argv.push("--alt-space-spotlight".into());
     }
     if on("APP_SWITCHER_HUD", false) {
         argv.push("--app-switcher-hud".into());
@@ -3505,6 +3557,7 @@ async fn async_main() -> Result<()> {
     crate::input::set_unminimize_on_switch(args.unminimize_on_switch);
     crate::input::set_alt_tab_switch(args.alt_tab_switch);
     crate::input::set_alt_backtick_switch(args.alt_backtick_switch);
+    crate::input::set_alt_space_spotlight(args.alt_space_spotlight);
     crate::input::set_app_switcher_hud(args.app_switcher_hud);
     crate::input::set_map_ctrl_to_cmd(args.map_ctrl_to_cmd);
     crate::input::set_ctrl_as_cmd(args.ctrl_as_cmd);
@@ -4451,6 +4504,34 @@ mod config_tests {
         fs::remove_file(&p).ok();
         assert!(e.contains("chmod 600"), "{e}");
         assert!(!e.contains("s3cret"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn password_file_refuses_an_acl() {
+        let p = write_pw("pwf-acl", "s3cret\n");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let e = format!("{:#}", read_password_file(&p).unwrap_err());
+        // Without the ACL the same file is accepted.
+        let status = std::process::Command::new("chmod")
+            .arg("-N")
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ok = read_password_file(&p);
+        fs::remove_file(&p).ok();
+        assert!(
+            e.contains("access control list") && e.contains("chmod -N"),
+            "{e}"
+        );
+        assert!(!e.contains("s3cret"));
+        assert_eq!(ok.unwrap().as_str(), "s3cret");
     }
 
     #[test]
